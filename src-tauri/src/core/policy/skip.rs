@@ -25,6 +25,7 @@ use crate::config::Profile;
 use crate::core::policy::kind::Class;
 use crate::core::policy::shortedge::needs_resize;
 use crate::core::policy::SkipReason;
+use crate::engines::audio::Route;
 use crate::store::MediaKind;
 
 /// AVIF 单边像素上限。超过它 libavif 直接拒绝编码。
@@ -123,12 +124,7 @@ fn is_target_video_codec(codec: Option<&str>) -> bool {
     matches!(codec, Some("hevc") | Some("h265") | Some("av1"))
 }
 
-/// 已经是我们要输出的音频编码。`aac_latm` 是另一种封装语法，同属 AAC。
-fn is_target_audio_codec(codec: Option<&str>) -> bool {
-    matches!(codec, Some("aac") | Some("aac_latm"))
-}
-
-/// 这段音频重编码后还能不能变小。
+/// 这段音频**重编码**后还能不能变小。只对 [`Route::Encode`] 有意义。
 ///
 /// AAC-LC 是 CBR，**产物大小只取决于目标码率与时长，与源码率无关**。实测同一
 /// 段 120 s 素材转 128k，六个不同源码率的产物全都是 1897 KB：
@@ -202,15 +198,18 @@ pub fn decide(p: &Probed, cfg: &Profile) -> Option<SkipReason> {
             }
         }
         MediaKind::Audio => {
-            // 已经是 AAC 且已经在 m4a 容器里，那就没有任何事情可做了。
-            // 若容器不对（比如 .aac 裸流），仍要走一趟「只换容器」的流程。
-            if cfg.audio.copy_if_aac
-                && is_target_audio_codec(p.codec.as_deref())
-                && matches!(p.ext.as_str(), "m4a" | "m4b")
-            {
-                return Some(SkipReason::AlreadyOptimal);
-            }
-            if cfg.output.skip_no_gain && !audio_can_shrink(p, cfg) {
+            if Route::for_codec(p.codec.as_deref(), cfg) == Route::Remux {
+                // 已经是 AAC 且已经在 m4a 容器里，那就没有任何事情可做了。
+                // 容器不对（比如 .aac 裸流）则仍要走一趟「只换容器」。
+                //
+                // 这条路**不能**再去问 `audio_can_shrink`：那个函数算的是「重编成
+                // 128k 之后有多大」，而这个文件根本不会被重编，只会原样搬进 m4a。
+                // 拿重编的预测去否决一次换容器，等于让「容器不对就走一趟」这句话
+                // 在最常见的码率上永远不成立。
+                if matches!(p.ext.as_str(), "m4a" | "m4b") {
+                    return Some(SkipReason::AlreadyOptimal);
+                }
+            } else if cfg.output.skip_no_gain && !audio_can_shrink(p, cfg) {
                 return Some(SkipReason::NoGain);
             }
         }
@@ -415,6 +414,36 @@ mod tests {
         assert_eq!(decide(&raw_aac, &cfg), None);
     }
 
+    #[test]
+    fn a_remuxable_aac_is_not_judged_by_the_re_encode_prediction() {
+        // 上面那句「裸流仍要换容器」曾经是句空话：紧跟着的 audio_can_shrink 按
+        // 「重编成 128k 有多大」预测，而 128k 的 AAC 重编后当然不变小，于是每一个
+        // 常见码率的裸流都在这里被判成 NoGain，那条路一次也没走到过。
+        //
+        // 它根本不会被重编，只会原样搬进 m4a——预测器管不着它。
+        let cfg = Profile::default();
+        for kbps in [64, 128, 320] {
+            let p = Probed {
+                ext: "aac".into(),
+                codec: Some("aac".into()),
+                duration_us: Some(120 * 1_000_000),
+                ..Probed::new(Class::Audio, "aac", (kbps as u64 * 1000 / 8) * 120)
+            };
+            assert_eq!(decide(&p, &cfg), None, "{kbps}k 裸 AAC 该去换容器");
+        }
+
+        // 关掉 copy_if_aac 就回到重编那条路，预测器重新说了算。
+        let mut no_copy = Profile::default();
+        no_copy.audio.copy_if_aac = false;
+        let p = Probed {
+            ext: "aac".into(),
+            codec: Some("aac".into()),
+            duration_us: Some(120 * 1_000_000),
+            ..Probed::new(Class::Audio, "aac", (64 * 1000 / 8) * 120)
+        };
+        assert_eq!(decide(&p, &no_copy), Some(SkipReason::NoGain));
+    }
+
     /// 120 s 素材，源码率 kbps → 文件字节数。
     fn mp3(kbps: u32) -> Probed {
         Probed {
@@ -428,7 +457,7 @@ mod tests {
     fn audio_below_the_target_bitrate_is_not_worth_encoding() {
         // 实测：120 s 素材转 128k，产物恒为 1897 KB，与源码率无关。低码率源
         // 只会变大——48k 涨 170%、64k 涨 102%、96k 涨 35%、128k 涨 1.1%。
-        let cfg = Profile::default(); // 目标 128 kbps，min_gain 5%
+        let cfg = Profile::default(); // 目标 128 kbps，min_gain 20%
         for kbps in [48, 64, 96, 128] {
             assert_eq!(
                 decide(&mp3(kbps), &cfg),
@@ -436,8 +465,9 @@ mod tests {
                 "{kbps}k 源转 128k 只会变大或持平，不该排进队列"
             );
         }
-        // 160k 实测省 19%，过得了 5% 的收益线。
-        assert_eq!(decide(&mp3(160), &cfg), None);
+        // 160k 只省 19%，够不着 20% 的收益线——门槛从 5 抬到 20 之后它落到了另一侧。
+        assert_eq!(decide(&mp3(160), &cfg), Some(SkipReason::NoGain));
+        // 192k 省 33%，仍然值得压。
         assert_eq!(decide(&mp3(192), &cfg), None);
     }
 
@@ -489,9 +519,10 @@ mod tests {
 
     #[test]
     fn no_gain_uses_the_configured_threshold() {
-        let cfg = Profile::default(); // min_gain_percent = 5
-        assert!(!no_gain(1000, 949, &cfg), "省了 5.1%，达标");
-        assert!(no_gain(1000, 950, &cfg), "刚好省 5%，不达标（门槛是「至少」）");
+        let cfg = Profile::default(); // min_gain_percent = 20
+        assert!(!no_gain(1000, 799, &cfg), "省了 20.1%，达标");
+        assert!(no_gain(1000, 800, &cfg), "刚好省 20%，不达标（门槛是「至少」）");
+        assert!(no_gain(1000, 949, &cfg), "省 5% 在新门槛下不再算收益");
         assert!(no_gain(1000, 999, &cfg));
         assert!(no_gain(1000, 2130, &cfg), "ADR-010 §5 的 WebP 反向膨胀");
     }

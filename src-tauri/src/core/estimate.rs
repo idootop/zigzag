@@ -43,6 +43,7 @@ use ts_rs::TS;
 use crate::config::{Lane, Profile};
 use crate::core::policy::shortedge::fit_short_edge;
 use crate::core::policy::skip::Probed;
+use crate::engines::audio::Route;
 use crate::store::MediaKind;
 
 // ---------------------------------------------------------------- 标定常数
@@ -234,6 +235,18 @@ fn video(p: &Probed, cfg: &Profile) -> ItemEstimate {
 }
 
 fn audio(p: &Probed, cfg: &Profile) -> ItemEstimate {
+    // 只换容器的那条路不重编，体积几乎原样（实测 99.3%）。按码率×时长去估它，
+    // 会在总览里报出一份根本不会发生的收益——AAC 源越多，这个数字错得越离谱。
+    if Route::for_codec(p.codec.as_deref(), cfg) == Route::Remux {
+        let bytes = p.size_bytes as f64;
+        return ItemEstimate {
+            out_bytes: Range::new(bytes * 0.99, bytes, bytes),
+            // 搬位流不解码，是纯 I/O，快到不值得按时长算。
+            seconds: Range::scaled(0.2, 3.0),
+            lane: Lane::Cpu,
+        };
+    }
+
     let secs = p.duration_us.unwrap_or(0) as f64 / 1e6;
     if secs <= 0.0 {
         return ItemEstimate {

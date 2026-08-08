@@ -50,7 +50,7 @@ pub enum Route {
 }
 
 /// 一次压缩的结果。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Report {
     pub src_size: u64,
     pub outcome: Outcome,

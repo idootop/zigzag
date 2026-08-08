@@ -99,6 +99,18 @@ pub struct VideoProfile {
     pub hw_quality: u8,
     /// 跳过 HDR 源。v1 默认开启——转码会丢 BT.2020/PQ 元数据导致画面发灰（R4）。
     pub skip_hdr: bool,
+    /// VMAF 质量门禁下限（0~100）。低于此分的产物直接丢弃、保留原文件。`0` = 关闭。
+    ///
+    /// 默认 80：这是一条**兜底线，不是画质目标**。
+    ///
+    /// 默认档（短边 1080 / 30fps / x265 medium / CRF 24）在四组真实素材上实测
+    /// 96.13~99.04，离 80 有十几分余量；连 CRF 32 都还在 89.86~93.24（基准 9）。
+    /// 换句话说 80 分之下基本只剩「编码器出了岔子」那一类——参数写错、素材极端难压、
+    /// 硬编掉档。日常调 CRF 不会撞到它。
+    ///
+    /// 想让门禁真正参与画质决策（比如卡住 CRF 32 那一档）需要 95 左右；这里选 80 是
+    /// 刻意把它退成安全网，把「压多狠」的决定权交回给 CRF。
+    pub vmaf_min: u8,
 }
 
 impl Default for VideoProfile {
@@ -113,6 +125,7 @@ impl Default for VideoProfile {
             lane: Lane::Cpu,
             hw_quality: 55,
             skip_hdr: true,
+            vmaf_min: 80,
         }
     }
 }
@@ -217,7 +230,12 @@ pub struct OutputProfile {
     pub mode: OutputMode,
     /// 产物比原文件大时保留原文件（§5.5 no-gain 兜底）。
     pub skip_no_gain: bool,
-    /// 产物至少要省这么多才算数（百分比）。低于此值视为无收益。
+    /// 产物至少要省这么多才算数（百分比）。低于此值视为无收益，原文件留着。
+    ///
+    /// 默认 20，即**产物最多只能是原文件的 80%**。改写一个归档文件是有代价的——
+    /// 时间、一次读写、以及「文件不再是原来那个」这件事本身，省下 5% 抵不掉。
+    /// 门槛抬到 20% 之后被留下的典型是：160k MP3 转 128k（省 19%）、已经压过一轮的
+    /// JPEG、以及只换容器的 AAC（省 0.7%，那条路另有豁免，见 `Staged::gain_gate`）。
     pub min_gain_percent: u8,
     /// 小于此体积的文件直接跳过（KB）。收益不抵开销与风险（§5.4）。
     pub min_file_kb: u32,
@@ -231,7 +249,7 @@ impl Default for OutputProfile {
         Self {
             mode: OutputMode::Mirror,
             skip_no_gain: true,
-            min_gain_percent: 5,
+            min_gain_percent: 20,
             min_file_kb: 100,
             include_raw: false,
         }
@@ -290,6 +308,7 @@ impl Profile {
         clamp_u8("image.animated_crf", &mut self.image.animated_crf, 1, 63);
         clamp_u8("video.crf", &mut self.video.crf, 1, 51);
         clamp_u8("video.hw_quality", &mut self.video.hw_quality, 1, 100);
+        clamp_u8("video.vmaf_min", &mut self.video.vmaf_min, 0, 100);
         clamp_u8("output.min_gain_percent", &mut self.output.min_gain_percent, 0, 99);
 
         (self, fixes)
@@ -405,6 +424,8 @@ mod tests {
         assert_eq!(p.image.chroma, Chroma::Yuv444, "D-25");
         assert_eq!(p.video.bit_depth, BitDepth::Eight, "D-13/D-20");
         assert_eq!(p.video.lane, Lane::Cpu, "D-24：默认软编，硬编体积约 2 倍");
+        assert_eq!(p.video.vmaf_min, 80, "兜底线：默认档实测 96.13~99.04，离它十几分");
+        assert_eq!(p.output.min_gain_percent, 20, "产物最多是原文件的 80%");
         assert_eq!(p.audio.bitrate_kbps, 128, "D-11");
         assert_eq!(p.output.mode, OutputMode::Mirror, "P1");
     }

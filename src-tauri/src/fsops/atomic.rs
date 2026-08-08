@@ -34,7 +34,11 @@ use crate::core::policy::skip::no_gain;
 use crate::error::{Result, ZzError};
 
 /// 提交的结果。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// 三个变体只有 `Written` 会改动目标位置，另外两个都是「产物已丢弃、原文件留着」，
+/// 区别只在于**为什么**丢弃——这个区别要给用户看：体积没降下来该调 CRF，
+/// 画质不达标该调的是别的旋钮。
+#[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
     /// 产物已经在目标位置了。
     Written { size: u64 },
@@ -43,6 +47,11 @@ pub enum Outcome {
     /// 镜像模式下调用方通常接着调 [`super::preserve`] 把原文件放过去，
     /// 保持输出目录的树结构完整。
     NoGain { dst_size: u64 },
+    /// VMAF 低于门禁，产物**已删除**，目标位置没被碰过。
+    ///
+    /// 由视频管线构造，[`Staged::commit`] 不会产生这个值：打分要跑两遍解码，
+    /// 属于「值不值得压」的判断，和体积闸门同级，而不是「产物完不完整」的校验。
+    LowQuality { vmaf: f64 },
 }
 
 /// 保证临时文件名在同一进程内唯一。
@@ -63,6 +72,8 @@ pub struct Staged {
     /// rename 成功后置真，Drop 就不再去删那个路径——它此刻要么已经不存在，
     /// 要么是别人新建的同名临时文件。
     renamed: bool,
+    /// 是否用「至少省下 `min_gain_percent`」这把尺子量这次产物。见 [`Staged::gain_gate`]。
+    gain_gate: bool,
 }
 
 impl Staged {
@@ -79,7 +90,23 @@ impl Staged {
         let tmp = dir.join(format!(".{stem}.zz-{}-{seq}.tmp", std::process::id()));
         // 先建出来占位，Drop 才有东西可删。
         std::fs::File::create(&tmp)?;
-        Ok(Self { tmp, dst, times: None, renamed: false })
+        Ok(Self { tmp, dst, times: None, renamed: false, gain_gate: true })
+    }
+
+    /// 关掉体积闸门（默认开）。**只有「换容器」那一类操作该关它。**
+    ///
+    /// 闸门问的是「省下的空间值不值得改写这个文件」，前提是这次操作的目的就是省
+    /// 空间。换容器不是：AAC 源只搬位流不重编（D-18），省下的只有 ADTS 帧头，
+    /// 实测 979112→972146（99.3%）、328093→325682（99.3%），永远够不着 5% 的门槛。
+    /// 拿闸门去量它，等于让这条路**永远**落不了地——那不如一开始就别提供。
+    ///
+    /// 它的价值也确实不在体积：容器统一成 m4a 之后 Finder 能预览、能进音乐 app，
+    /// 而这正是选 m4a 而不是 Opus 的全部理由（D-70）。
+    ///
+    /// 关掉之后仍然拦「产物比源还大」——把归档盘变大是这个工具的反面。
+    pub fn gain_gate(mut self, on: bool) -> Self {
+        self.gain_gate = on;
+        self
     }
 
     /// 让产物继承源文件的修改时间与创建时间（D-56）。
@@ -153,7 +180,13 @@ impl Staged {
         }
         verify(&self.tmp)?;
 
-        if no_gain(src_size, size, cfg) {
+        // 闸门关掉时只剩「不许变大」这一条底线，见 [`Staged::gain_gate`]。
+        let reject = if self.gain_gate {
+            no_gain(src_size, size, cfg)
+        } else {
+            cfg.output.skip_no_gain && size > src_size
+        };
+        if reject {
             // 这里不需要显式删——Drop 会做，而且 Drop 在 panic 路径上也做。
             return Ok(Outcome::NoGain { dst_size: size });
         }
@@ -260,6 +293,35 @@ mod tests {
         assert_eq!(out, Outcome::NoGain { dst_size: 990 });
         assert!(!dst.exists(), "无收益时不能产生目标文件");
         assert!(leftovers(&dir).is_empty(), "产物必须被丢弃干净");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_gateless_commit_keeps_a_barely_smaller_product_but_still_refuses_a_bigger_one() {
+        // 换容器就是这个形状：只省下 ADTS 帧头（实测 99.3%），够不着 5% 的门槛，
+        // 但它的价值本来就不在体积。变大则仍然要拦——见 `Staged::gain_gate`。
+        let dir = temp_dir("atomic-gateless");
+
+        let kept = dir.join("kept.m4a");
+        let staged = Staged::new(&kept).unwrap().gain_gate(false);
+        staged.write_all(&vec![0u8; 993]).unwrap();
+        assert_eq!(
+            staged.commit(1000, &Profile::default(), ok).unwrap(),
+            Outcome::Written { size: 993 },
+            "只省 0.7% 也该落地：这次提交的意义不是省空间"
+        );
+
+        let grown = dir.join("grown.m4a");
+        let staged = Staged::new(&grown).unwrap().gain_gate(false);
+        staged.write_all(&vec![0u8; 1001]).unwrap();
+        assert_eq!(
+            staged.commit(1000, &Profile::default(), ok).unwrap(),
+            Outcome::NoGain { dst_size: 1001 },
+            "闸门关了也不许把归档盘撑大"
+        );
+        assert!(!grown.exists());
+
+        assert_eq!(leftovers(&dir), ["kept.m4a"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

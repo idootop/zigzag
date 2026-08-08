@@ -67,17 +67,10 @@ fn set<T: std::str::FromStr>(slot: &mut Option<T>, value: &str) {
     }
 }
 
-/// sidecar 二进制的解析结果，只探测一次。
 static FFMPEG: OnceLock<Option<PathBuf>> = OnceLock::new();
 static FFPROBE: OnceLock<Option<PathBuf>> = OnceLock::new();
 
-/// 定位 ffmpeg。优先用随应用打包的 sidecar，实在找不到才回落到 PATH。
-///
-/// **回落到 PATH 是能力降级，不只是路径不同。** 随包的是 9.0，带 `libaom-av1`
-/// 与 `webp_anim`；而机器上装的很可能是别的版本（本机 Homebrew 上是 8.1.2，
-/// 两样都没有），动图那条路会直接报 "Unknown encoder"。所以 sidecar 的搜索
-/// 范围要覆盖到所有会真的跑代码的场景，别让开发期悄悄用着一个能力不同的
-/// 二进制去验证结论。
+/// 定位随应用打包的 sidecar。找不到就报缺工具，让问题在启动时暴露。
 pub fn ffmpeg_path() -> Result<&'static Path> {
     resolve(&FFMPEG, "ffmpeg")
 }
@@ -88,33 +81,19 @@ pub fn ffprobe_path() -> Result<&'static Path> {
 
 fn resolve(cell: &'static OnceLock<Option<PathBuf>>, name: &'static str) -> Result<&'static Path> {
     cell.get_or_init(|| {
-        if let Ok(exe) = std::env::current_exe() {
-            // 1) 与可执行文件同级：打包后的 `.app/Contents/MacOS/`，
-            //    以及 `cargo tauri dev` 的 `target/debug/`（构建脚本会拷过去）。
-            // 2) 再上一级：单元测试跑的是 `target/debug/deps/xxx-<hash>`，
-            //    sidecar 在它的父目录。少了这一条，测试就会在 PATH 上那个
-            //    能力不同的 ffmpeg 上跑，结论不作数。
-            let dirs = exe.parent().into_iter().flat_map(|d| [Some(d), d.parent()]);
-            for dir in dirs.flatten() {
-                let p = dir.join(name);
-                if p.is_file() {
-                    return Some(p);
-                }
-            }
-        }
-        which(name)
+        let exe = std::env::current_exe().ok()?;
+        let dir = exe.parent()?;
+        // 同级：打包后的 `.app/Contents/MacOS/` 与 `cargo tauri dev` 的 `target/debug/`；
+        // 上一级：单测跑在 `target/debug/deps/`。
+        let found = [Some(dir), dir.parent()]
+            .into_iter()
+            .flatten()
+            .map(|d| d.join(name))
+            .find(|p| p.is_file());
+        found
     })
     .as_deref()
     .ok_or(ZzError::ToolNotFound(name))
-}
-
-/// 极简 PATH 查找，避免为一个功能引入 `which` crate。
-fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|dir| {
-        let p = dir.join(name);
-        p.is_file().then_some(p)
-    })
 }
 
 /// 跑一次 ffmpeg，逐条把进度交给回调。
@@ -202,6 +181,20 @@ pub fn run_sync(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// 产物自检：从头到尾解一遍，任何一个坏包都算失败。
+///
+/// **`-xerror` 是这条命令的全部意义。** 没有它，ffmpeg 遇到损坏包只会往 stderr
+/// 打一行 `corrupt input packet` 然后接着跑完，最后照样 exit 0。
+///
+/// 也不能退化成「用 ffprobe 读个头」：实测把一个 20 s 的 mp4 截断到 900 KB，
+/// ffprobe 依然 exit 0 并报出完整的 20.07 s 时长（faststart 把 moov 放在文件开头，
+/// 头是好的），而这条命令 exit 183。代价是 77× 实时——1080p HEVC 解一遍 0.26 s，
+/// 约为那次编码耗时的 4.5%（基准 9）。
+pub fn verify_decodable(path: &Path) -> Result<()> {
+    let t = |v: &str| v.to_string();
+    run_sync(&[t("-xerror"), t("-i"), path.to_string_lossy().into_owned(), t("-f"), t("null"), t("-")])
+}
+
 /// 跑 ffprobe 拿 JSON。
 pub async fn probe(path: &Path) -> Result<serde_json::Value> {
     let exe = ffprobe_path()?;
@@ -242,21 +235,12 @@ speed=3.87x
 progress=continue";
 
     #[test]
-    fn the_resolved_ffmpeg_can_actually_do_the_job() {
-        // 动图那条路要 `libaom-av1`（编码）与 `webp_anim`（解复用），两样都是
-        // 随包 9.0 才有的。解析顺序一旦回落到机器上装的那个版本，动图会在
-        // 运行期报 "Unknown encoder"——而单测如果也跟着回落，就永远看不见
-        // 这个问题。这条测试把「用的到底是哪个二进制」钉死（D-59）。
+    fn resolves_to_the_bundled_sidecar() {
+        // 代码里写死的编码器清单、以及所有基准结论，都只对随包这一份成立（D-59）。
         let Ok(exe) = ffmpeg_path() else { return };
-        let has = |flag: &str, needle: &str| {
-            std::process::Command::new(exe)
-                .args(["-hide_banner", flag])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).contains(needle))
-                .unwrap_or(false)
-        };
-        assert!(has("-encoders", "libaom-av1"), "{}：没有 libaom-av1", exe.display());
-        assert!(has("-demuxers", "webp_anim"), "{}：没有 webp_anim", exe.display());
+        let out = std::process::Command::new(exe).arg("-version").output().unwrap();
+        let v = String::from_utf8_lossy(&out.stdout);
+        assert!(v.contains("ffmpeg version 9."), "用的不是随包 9.0：{}", exe.display());
     }
 
     #[test]

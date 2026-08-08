@@ -3,6 +3,8 @@
 //! 这样约束的目的是让核心逻辑能被普通单元测试直接调用，不必起 WebView，
 //! 也方便日后换个壳（CLI / 服务）复用。UI 相关的一切都在 `commands/` 里。
 
+pub mod audio;
 pub mod estimate;
 pub mod image;
 pub mod policy;
+pub mod video;
