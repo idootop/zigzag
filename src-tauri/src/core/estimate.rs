@@ -62,7 +62,7 @@ const HW_SPEEDUP: f64 = 8.0;
 const HW_SIZE_FACTOR: f64 = 2.0;
 
 /// AVIF q85 产物 ÷ 源（已按输出像素归一）。
-const IMG_RATIO_BULKY: f64 = 0.15; // png / bmp / tiff：几乎没压过
+const IMG_RATIO_BULKY: f64 = 0.15; // png：几乎没压过
 const IMG_RATIO_LOSSY: f64 = 0.75; // jpg / webp / heic：已经压过一轮
 const IMG_SPREAD: f64 = 2.0; // 上下各一倍——基准里就是这个离散度
 

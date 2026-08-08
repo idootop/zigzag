@@ -170,6 +170,30 @@ where
     Ok(())
 }
 
+/// 同步跑一次 ffmpeg，不报进度。
+///
+/// 给动图这类「小而快、进度没有意义」的活儿用：一个几百 KB 的 GIF 通常一两秒
+/// 就完事，为它铺一套异步进度管道纯属自找麻烦。长任务（视频）走
+/// [`run_with_progress`]。
+pub fn run_sync(args: &[String]) -> Result<()> {
+    let exe = ffmpeg_path()?;
+    let out = std::process::Command::new(exe)
+        .arg("-nostdin")
+        .arg("-hide_banner")
+        .args(["-loglevel", "error"])
+        .args(args)
+        .stdin(Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        return Err(ZzError::ToolFailed {
+            tool: "ffmpeg",
+            code: out.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// 跑 ffprobe 拿 JSON。
 pub async fn probe(path: &Path) -> Result<serde_json::Value> {
     let exe = ffprobe_path()?;

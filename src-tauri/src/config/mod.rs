@@ -39,10 +39,10 @@ pub struct ImageProfile {
     pub speed: u8,
     /// 动图（GIF/APNG/动画 WebP）→ 动画 AVIF 的 CRF。默认 32（D-27）。
     pub animated_crf: u8,
-    /// 保留 EXIF / ICC。关掉能再省几 KB，但归档场景几乎总是要留。
+    /// 保留拍摄参数（EXIF / XMP，含 GPS 位置）。默认保留——归档的意义就在于
+    /// 这些信息，关掉只省几 KB。ICC 不受这个开关管：它是像素的解释方式，
+    /// 丢了整张图会偏色。
     pub keep_metadata: bool,
-    /// 单独剥离 GPS（`keep_metadata` 为真时才有意义）。
-    pub strip_gps: bool,
 }
 
 impl Default for ImageProfile {
@@ -55,7 +55,6 @@ impl Default for ImageProfile {
             speed: 7,
             animated_crf: 32,
             keep_metadata: true,
-            strip_gps: false,
         }
     }
 }

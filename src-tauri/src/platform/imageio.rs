@@ -140,7 +140,7 @@ unsafe fn drawing_space(img: &CGImage) -> (CFRetained<CGColorSpace>, Option<Vec<
     if let Some(space) = own {
         if CGColorSpace::model(Some(&space)) == CGColorSpaceModel::RGB {
             let icc = if is_plain_srgb(&space) {
-                // D-54：CoreGraphics **一定**会给出一个色彩空间，没有「无 profile」
+                // D-58：CoreGraphics **一定**会给出一个色彩空间，没有「无 profile」
                 // 这个状态。文件里本来什么都没有时，它合成一份 3144 字节的通用
                 // sRGB。原样带走等于给每张无 profile 的图白搭 3 KB，而 sRGB 用
                 // CP=1/TC=13 表达是 0 字节且完全等价（D-49）。丢掉，交给 CICP。
@@ -262,7 +262,7 @@ mod tests {
 
     #[test]
     fn drops_the_synthesized_srgb_profile() {
-        // D-54：CG 对没有 profile 的文件也会合成一份 3144 B 的通用 sRGB。
+        // D-58：CG 对没有 profile 的文件也会合成一份 3144 B 的通用 sRGB。
         // 带走它就是每张图白搭 3 KB，而 CP=1/TC=13 是 0 字节的等价表达。
         for name in ["plain.jpg", "shot.png", "photo.heic"] {
             let Some(p) = fixture(name) else { continue };

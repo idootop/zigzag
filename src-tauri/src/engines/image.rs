@@ -105,6 +105,9 @@ pub fn decode(path: &Path) -> Result<Decoded> {
     // 元数据取不到不算失败——一张没有 ICC 的 PNG 是完全正常的。
     let icc = decoder.icc_profile().ok().flatten().filter(|v| !v.is_empty());
     let mut exif = decoder.exif_metadata().ok().flatten().filter(|v| !v.is_empty());
+    // D-55：版权、作者、Lightroom 的修图记录都住在 XMP 里，丢了用户不会立刻发现，
+    // 发现时源文件已经没了。
+    let xmp = decoder.xmp_metadata().ok().flatten().filter(|v| !v.is_empty());
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
 
     let mut img =
@@ -133,7 +136,28 @@ pub fn decode(path: &Path) -> Result<Decoded> {
         Rgba8::with_opaque(w, h, pixels, true)?
     };
 
-    Ok(Decoded { image, meta: Metadata { icc, exif, xmp: None }, baked_orientation: orientation })
+    Ok(Decoded { image, meta: Metadata { icc, exif, xmp }, baked_orientation: orientation })
+}
+
+/// 把 EXIF 朝向烘焙进像素。
+///
+/// 主路径在 `DynamicImage` 上直接做，这个函数是给 ImageIO 兜底路径用的——
+/// 那边拿到的是裸 RGBA 缓冲区。两条路径必须落到同一份旋转实现上（D-53），
+/// 否则「主路径转正了、兜底路径转歪了」这种 bug 只会在特定格式上出现。
+pub fn apply_orientation(img: Rgba8, orientation: Orientation) -> Result<Rgba8> {
+    if orientation == Orientation::NoTransforms {
+        return Ok(img);
+    }
+    let Rgba8 { width, height, pixels, opaque } = img;
+    let buf = image::RgbaImage::from_raw(width, height, pixels)
+        .ok_or_else(|| ZzError::Other("像素缓冲区长度对不上".into()))?;
+    let mut dynamic = image::DynamicImage::ImageRgba8(buf);
+    dynamic.apply_orientation(orientation);
+
+    // 90°/270° 旋转会交换长宽，尺寸得重新取而不能沿用入参。
+    let (w, h) = (dynamic.width(), dynamic.height());
+    // 旋转与镜像只搬像素、不改动 alpha 的取值，所以 opaque 可以直接沿用。
+    Rgba8::with_opaque(w, h, dynamic.into_rgba8().into_raw(), opaque)
 }
 
 // ---------------------------------------------------------------- 缩放
@@ -202,6 +226,28 @@ pub struct Metadata {
     pub icc: Option<Vec<u8>>,
     pub exif: Option<Vec<u8>>,
     pub xmp: Option<Vec<u8>>,
+}
+
+impl Metadata {
+    /// 按用户配置裁剪元数据。**编码前必须调用一次**（D-57）。
+    ///
+    /// 「保留元数据」这个开关在界面上早就有了，此前却没有任何代码读它——
+    /// 用户关掉开关，拍摄参数照样跟着产物走，属于静默失效。
+    ///
+    /// 只有两种结果：**整段原样照搬**，或者**整段丢掉**。中间态一个都不做。
+    /// 理由是 EXIF 是一棵内含绝对偏移的 TIFF 树，MakerNote 里还嵌着指回原
+    /// chunk 的偏移且没有通用解析器认得（D-54）——任何「只改一点点」的编辑都
+    /// 有把厂商段静默写废的风险，而原样搬运的风险恒等于零。归档工具的第一
+    /// 要务是别把原始信息弄坏，省那几十 KB 不值得拿这个换。
+    ///
+    /// ICC 不受开关管，永远保留：它不是「元数据」而是**像素的解释方式**，
+    /// 丢了整张图会偏色。界面上那个开关说的是拍摄参数与作者信息，不含色彩。
+    pub fn apply_policy(&mut self, p: &ImageProfile) {
+        if !p.keep_metadata {
+            self.exif = None;
+            self.xmp = None;
+        }
+    }
 }
 
 /// 编码成 AVIF 字节流。
@@ -406,6 +452,52 @@ mod tests {
         let p = temp_dir(tag).join("f.jpg");
         std::fs::write(&p, bytes).unwrap();
         p
+    }
+
+    // ---- 元数据策略（D-57）----
+
+    /// 真机素材。没有就跳过——CI 上没有这些文件不该让测试变红。
+    fn real(name: &str) -> Option<std::path::PathBuf> {
+        let p = std::path::PathBuf::from("/private/tmp/zzimg").join(name);
+        p.exists().then_some(p)
+    }
+
+    /// 这段 EXIF 里还有没有 GPS 段。用独立解析器判定，不复用被测代码的结论。
+    fn has_gps(tiff: &[u8]) -> bool {
+        let Ok(x) = exif::Reader::new().read_raw(tiff.to_vec()) else { return false };
+        let found = x.fields().any(|f| matches!(f.tag.0, exif::Context::Gps));
+        found
+    }
+
+    fn profile(keep: bool) -> ImageProfile {
+        ImageProfile { keep_metadata: keep, ..Default::default() }
+    }
+
+    #[test]
+    fn dropping_metadata_keeps_the_color_profile() {
+        // ICC 是像素的解释方式，不是「拍摄信息」。跟着 EXIF 一起丢会让整张图偏色。
+        let mut m = Metadata {
+            icc: Some(b"fake-icc".to_vec()),
+            exif: Some(b"II*\0".to_vec()),
+            xmp: Some(b"<x:xmpmeta/>".to_vec()),
+        };
+        m.apply_policy(&profile(false));
+        assert_eq!(m.icc.as_deref(), Some(b"fake-icc".as_slice()));
+        assert!(m.exif.is_none() && m.xmp.is_none());
+    }
+
+    #[test]
+    fn keeping_metadata_copies_it_byte_for_byte() {
+        // D-61：保留 = 一个字节都不动。任何「只改一点点」都可能把 MakerNote
+        // 写废，而那是没有解析器能验、用户也发现不了的损坏。
+        let Some(p) = real("iphone.jpg") else { return };
+        let mut m = decode(&p).unwrap().meta;
+        let before = m.exif.clone().expect("素材得带 EXIF，否则这条测试是空跑");
+        assert!(has_gps(&before), "素材得带 GPS，否则下面那条断言是空跑");
+
+        m.apply_policy(&profile(true));
+        assert_eq!(m.exif.as_deref(), Some(before.as_slice()), "保留时不许改动任何字节");
+        assert!(has_gps(&before), "位置信息跟着「保留元数据」走，没有单独的开关");
     }
 
     #[test]

@@ -23,10 +23,8 @@ speed: number,
  */
 animated_crf: number, 
 /**
- * 保留 EXIF / ICC。关掉能再省几 KB，但归档场景几乎总是要留。
+ * 保留拍摄参数（EXIF / XMP，含 GPS 位置）。默认保留——归档的意义就在于
+ * 这些信息，关掉只省几 KB。ICC 不受这个开关管：它是像素的解释方式，
+ * 丢了整张图会偏色。
  */
-keep_metadata: boolean, 
-/**
- * 单独剥离 GPS（`keep_metadata` 为真时才有意义）。
- */
-strip_gps: boolean, };
+keep_metadata: boolean, };

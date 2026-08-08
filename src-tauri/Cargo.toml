@@ -34,8 +34,9 @@ jwalk = "0.9.0"
 libc = "0.2.189"
 imagesize = "0.15.0"
 libavif-sys = { version = "0.17.0", default-features = false, features = ["codec-aom"] }
-# 只开归档盘里真实存在的格式（D-52）。TGA / PNM / DDS / QOI / farbfeld 这些是
-# 设计与游戏工具链的中间产物，照片库里不会有；EXR / HDR 是浮点高动态格式，同理。
+# 只开手机与相机高频产出的四种格式（D-52 / D-60）。TIFF / BMP 已出局；
+# TGA / PNM / DDS / QOI / farbfeld 是设计与游戏工具链的中间产物，照片库里不会有；
+# EXR / HDR 是浮点高动态格式，同理。
 # 默认 features 还会拖进 ravif（AVIF 编码走 libavif，用不上）。
 # HEIC / RAW / AVIF 的解码另走 ImageIO（D-14），不在这里。
 image = { version = "0.25.10", default-features = false, features = [
@@ -43,8 +44,6 @@ image = { version = "0.25.10", default-features = false, features = [
     "png",
     "gif",
     "webp",
-    "tiff",
-    "bmp",
 ] }
 fast_image_resize = "6.1.0"
 kamadak-exif = "0.6.1"

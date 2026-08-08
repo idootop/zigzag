@@ -58,6 +58,8 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 pub struct Staged {
     tmp: PathBuf,
     dst: PathBuf,
+    /// 要继承给产物的源文件时间戳（D-56）。
+    times: Option<std::fs::FileTimes>,
     /// rename 成功后置真，Drop 就不再去删那个路径——它此刻要么已经不存在，
     /// 要么是别人新建的同名临时文件。
     renamed: bool,
@@ -77,7 +79,41 @@ impl Staged {
         let tmp = dir.join(format!(".{stem}.zz-{}-{seq}.tmp", std::process::id()));
         // 先建出来占位，Drop 才有东西可删。
         std::fs::File::create(&tmp)?;
-        Ok(Self { tmp, dst, renamed: false })
+        Ok(Self { tmp, dst, times: None, renamed: false })
+    }
+
+    /// 让产物继承源文件的修改时间与创建时间（D-56）。
+    ///
+    /// 归档盘是**按时间浏览**的：相册、Finder 的「日期」列、按年份分的目录，
+    /// 靠的都是 mtime。压完一遍如果全变成「今天」，十年的照片就在时间轴上塌成
+    /// 一天——这是不可逆的信息损失，而且用户往往在删掉原文件之后才发现。
+    ///
+    /// EXIF 里的拍摄时间是另一回事：它只在有 EXIF 的文件里有，截图、微信存图、
+    /// 老 PNG 都没有，靠它补不回来。
+    ///
+    /// 读不到源文件属性就静默跳过——为了时间戳让一个已经编好的产物失败不划算。
+    /// 时间戳继承失败最坏是排序不对，产物本身仍然完整。
+    pub fn inherit_times_from(mut self, src: &Path) -> Self {
+        self.times = std::fs::metadata(src).ok().map(|m| {
+            let mut t = std::fs::FileTimes::new();
+            if let Ok(v) = m.modified() {
+                t = t.set_modified(v);
+            }
+            // 访问时间一并带上：不带的话它会停在临时文件被创建的那一刻，
+            // 与 mtime 差出十年，看着像是被人动过。
+            if let Ok(v) = m.accessed() {
+                t = t.set_accessed(v);
+            }
+            // birthtime 是 APFS 的原生字段，clonefile 那条路径本来就保留它，
+            // 重编码这条路径不跟上就会两条路径行为不一致。
+            #[cfg(target_os = "macos")]
+            if let Ok(v) = m.created() {
+                use std::os::macos::fs::FileTimesExt;
+                t = t.set_created(v);
+            }
+            t
+        });
+        self
     }
 
     /// 编码器该往这里写。
@@ -120,6 +156,20 @@ impl Staged {
         if no_gain(src_size, size, cfg) {
             // 这里不需要显式删——Drop 会做，而且 Drop 在 panic 路径上也做。
             return Ok(Outcome::NoGain { dst_size: size });
+        }
+
+        // 时间戳要在 rename **之前**打到临时文件上：写内容本身会把 mtime 刷成
+        // 当前时刻，所以只能等内容写完再设；而 rename 不动文件自身的时间戳，
+        // 设完再改名，目标位置一出现就已经是正确的时间。
+        if let Some(times) = self.times {
+            match std::fs::File::options().write(true).open(&self.tmp) {
+                Ok(f) => {
+                    if let Err(e) = f.set_times(times) {
+                        tracing::debug!(%e, "继承源时间戳失败，产物仍然有效");
+                    }
+                }
+                Err(e) => tracing::debug!(%e, "为设时间戳重开临时文件失败"),
+            }
         }
 
         std::fs::rename(&self.tmp, &self.dst)?;
@@ -286,6 +336,43 @@ mod tests {
         let dir = temp_dir("atomic-samedir");
         let staged = Staged::new(dir.join("out.avif")).unwrap();
         assert_eq!(staged.path().parent().unwrap(), dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn output_inherits_the_source_timestamps() {
+        // D-56：归档盘按时间浏览，产物全变成「今天」等于把时间轴压平。
+        let dir = temp_dir("atomic-mtime");
+        let src = dir.join("src.jpg");
+        std::fs::write(&src, b"source").unwrap();
+        // 十年前。用一个确定的时刻，避免拿「现在减去 N」跟系统时钟赛跑。
+        let then = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_300_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(then))
+            .unwrap();
+
+        let dst = dir.join("out.avif");
+        let staged = Staged::new(&dst).unwrap().inherit_times_from(&src);
+        staged.write_all(b"new content").unwrap();
+        staged.commit(1000, &Profile::default(), ok).unwrap();
+
+        let got = std::fs::metadata(&dst).unwrap().modified().unwrap();
+        assert_eq!(got, then, "产物的 mtime 没有跟着源走");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_source_does_not_fail_the_commit() {
+        // 时间戳继承是锦上添花，绝不能因为它让一个已经编好的产物落不了地。
+        let dir = temp_dir("atomic-mtime-missing");
+        let dst = dir.join("out.avif");
+        let staged = Staged::new(&dst).unwrap().inherit_times_from(&dir.join("不存在.jpg"));
+        staged.write_all(b"content").unwrap();
+        assert!(staged.commit(1000, &Profile::default(), ok).is_ok());
+        assert!(dst.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

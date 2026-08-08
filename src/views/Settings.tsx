@@ -114,19 +114,11 @@ export function Settings() {
             onChange={(animated_crf) => set("image", { animated_crf })}
           />
           <SwitchRow
-            label="保留 EXIF / ICC"
-            hint="归档场景通常要留：拍摄时间、镜头信息、色彩空间都在里面"
+            label="保留拍摄信息"
+            hint="拍摄时间、镜头参数、GPS 位置。色彩空间不受此开关影响，始终保留"
             checked={profile.image.keep_metadata}
             onChange={(keep_metadata) => set("image", { keep_metadata })}
           />
-          {profile.image.keep_metadata && (
-            <SwitchRow
-              label="剥离 GPS"
-              hint="保留其他元数据，只去掉拍摄位置"
-              checked={profile.image.strip_gps}
-              onChange={(strip_gps) => set("image", { strip_gps })}
-            />
-          )}
         </Section>
 
         {/* ── 视频 ─────────────────────────────────────────────── */}

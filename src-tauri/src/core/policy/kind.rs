@@ -13,7 +13,7 @@ use crate::store::MediaKind;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Class {
-    /// 常规图片：JPEG / PNG / BMP / TIFF / WebP / GIF …… 走 AVIF。
+    /// 常规图片：JPEG / PNG / WebP / GIF。走 AVIF。
     Image,
     /// 已是现代高效格式（HEIC / HEIF / AVIF / JXL）。
     /// 不是不能处理——需要缩放时照压，见 [`super::skip`]。
@@ -36,11 +36,12 @@ impl Class {
 
 /// 常规图片。GIF 也在内——D-27 之后动图走动画 AVIF，不再是排除项。
 ///
-/// 只列归档盘里真实会出现的格式（D-52）。TGA / PNM / DDS / QOI 这类是设计与
-/// 游戏工具链的中间产物，照片库里遇不到；ICO 即使遇到也在「跳过小文件」门槛下。
+/// 只列手机与相机高频产出的格式（D-60）。TIFF / BMP 出局：前者是扫描与设计
+/// 工具链的中间产物，后者是上世纪的未压缩格式，归档照片库里都不成量级，
+/// 为它们背两个解码器和一套 TIFF 元数据重建代码不划算。TGA / PNM / DDS / QOI
+/// 同理；ICO 即使遇到也在「跳过小文件」门槛下。
 /// 不认识的扩展名一律当非媒体忽略，这是安全的一侧。
-const IMAGE: &[&str] =
-    &["jpg", "jpeg", "jpe", "jfif", "png", "apng", "bmp", "gif", "tif", "tiff", "webp"];
+const IMAGE: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "png", "apng", "gif", "webp"];
 
 const MODERN_IMAGE: &[&str] = &["heic", "heif", "hif", "avif", "avifs", "jxl"];
 
@@ -182,6 +183,14 @@ mod tests {
     #[test]
     fn non_media_is_none() {
         for p in ["/a/b.txt", "/a/b.pdf", "/a/b.zip", "/a/README", "/a/.gitignore"] {
+            assert_eq!(c(p), None, "{p}");
+        }
+    }
+
+    #[test]
+    fn tiff_and_bmp_are_out_of_scope() {
+        // D-60：不在支持范围内 = 当成非媒体忽略，绝不是「识别了但压不了」。
+        for p in ["/a/scan.tif", "/a/scan.tiff", "/a/old.bmp", "/a/OLD.BMP"] {
             assert_eq!(c(p), None, "{p}");
         }
     }
