@@ -29,9 +29,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 thiserror = "2.0.20"
 tauri-plugin-shell = "2.3.5"
 tauri-plugin-dialog = "2.7.2"
-# 类型导出用 ts-rs 而非 tauri-specta：后者支持 Tauri 2 的版本只有 2.0.0-rc.25，
-# crates.io 上的稳定版 1.0.2 仍是 Tauri 1 的线，会把 webkit2gtk 拖进依赖图并冲突。
 ts-rs = "12.0.1"
+jwalk = "0.9.0"
+libc = "0.2.189"
+imagesize = "0.15.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"

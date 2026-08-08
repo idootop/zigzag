@@ -4,7 +4,7 @@
 //! 每个命令都薄：取参数 → 调核心 → 回结果。有逻辑就说明放错层了。
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use ts_rs::TS;
@@ -13,12 +13,17 @@ use crate::config::{preset::Preset, Profile};
 use crate::error::Result;
 use crate::store::{repo::JobProgress, Db};
 
+pub mod scan;
+
 pub struct AppState {
-    pub db: Db,
+    /// `Arc` 是因为扫描任务要把它带进后台线程；同一个连接，不是副本。
+    pub db: Arc<Db>,
     /// 当前生效的配置。任务创建时会快照一份进库，之后改这里不影响在跑的任务。
     pub profile: Mutex<Profile>,
     pub settings_path: PathBuf,
     pub log_path: PathBuf,
+    /// 正在跑的扫描，同一时刻至多一个。
+    pub scan: Mutex<scan::ScanHandle>,
 }
 
 /// 保存配置的结果。越界值会被钳到合法范围而不是报错，

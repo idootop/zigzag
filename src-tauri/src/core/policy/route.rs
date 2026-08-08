@@ -9,6 +9,7 @@
 //! 必须有个统一的落点**——将来若再加规则也只改这一处。
 
 use crate::config::Lane;
+use crate::core::policy::SkipReason;
 
 /// 路由所需的视频元信息，由 ffprobe 填充。
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -39,25 +40,6 @@ pub enum Decision {
     Encode(Lane),
     /// 跳过，附带面向用户的原因。
     Skip(SkipReason),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SkipReason {
-    Hdr,
-}
-
-impl SkipReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SkipReason::Hdr => "hdr_unsupported",
-        }
-    }
-
-    pub fn message(self) -> &'static str {
-        match self {
-            SkipReason::Hdr => "HDR 视频暂不处理，转码会丢失色彩元数据",
-        }
-    }
 }
 
 /// 决定一个视频怎么处理。

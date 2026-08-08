@@ -10,7 +10,8 @@ use std::path::Path;
 
 use crate::store::MediaKind;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Class {
     /// 常规图片：JPEG / PNG / BMP / TIFF / WebP / GIF …… 走 AVIF。
     Image,

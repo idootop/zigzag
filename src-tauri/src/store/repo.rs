@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use ts_rs::TS;
 
@@ -27,7 +27,7 @@ pub struct NewItem {
     pub kind: MediaKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, TS)]
 #[ts(export, export_to = "../../src/lib/bindings/")]
 #[serde(rename_all = "snake_case")]
 pub enum MediaKind {
@@ -218,6 +218,45 @@ impl Db {
         Ok(())
     }
 
+    /// 取缓存的探测结果。`size`/`mtime` 任一对不上就算未命中——
+    /// 源文件被改过，旧的探测结果就是错的。
+    pub fn probe_cache_get(
+        &self,
+        path: &str,
+        size: u64,
+        mtime: i64,
+    ) -> Result<Option<crate::core::policy::skip::Probed>> {
+        let conn = self.lock();
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT probe_json FROM probe_cache WHERE path=?1 AND size=?2 AND mtime=?3",
+                params![path, size as i64, mtime],
+                |r| r.get(0),
+            )
+            .optional()?;
+        // 解析失败当作未命中：结构体加过字段、或者上次写坏了，重探一次就好，
+        // 为此报错会让整个扫描停在一条脏缓存上。
+        Ok(json.and_then(|j| serde_json::from_str(&j).ok()))
+    }
+
+    pub fn probe_cache_put(
+        &self,
+        path: &str,
+        size: u64,
+        mtime: i64,
+        probed: &crate::core::policy::skip::Probed,
+    ) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO probe_cache (path, size, mtime, probe_json, probed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(path) DO UPDATE SET
+               size=excluded.size, mtime=excluded.mtime,
+               probe_json=excluded.probe_json, probed_at=excluded.probed_at",
+            params![path, size as i64, mtime, serde_json::to_string(probed)?, now()],
+        )?;
+        Ok(())
+    }
+
     pub fn skip_item(&self, item_id: i64, reason: &str) -> Result<()> {
         self.lock().execute(
             "UPDATE items SET status='skipped', skip_reason=?2 WHERE id=?1",
@@ -341,6 +380,45 @@ mod tests {
             .unwrap();
         let restored: Profile = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, profile, "任务必须记住创建时的参数，之后改设置不影响它");
+    }
+
+    #[test]
+    fn probe_cache_hits_only_when_size_and_mtime_match() {
+        use crate::core::policy::{kind::Class, skip::Probed};
+        let db = Db::open_in_memory().unwrap();
+        let mut p = Probed::new(Class::Video, "mp4", 1000);
+        p.width = 1920;
+        p.height = 1080;
+        db.probe_cache_put("/a.mp4", 1000, 42, &p).unwrap();
+
+        assert_eq!(db.probe_cache_get("/a.mp4", 1000, 42).unwrap(), Some(p));
+        // 源被改动过，缓存必须失效——否则会拿着旧尺寸做决策。
+        assert_eq!(db.probe_cache_get("/a.mp4", 1000, 43).unwrap(), None);
+        assert_eq!(db.probe_cache_get("/a.mp4", 999, 42).unwrap(), None);
+        assert_eq!(db.probe_cache_get("/b.mp4", 1000, 42).unwrap(), None);
+    }
+
+    #[test]
+    fn reprobing_the_same_path_overwrites_instead_of_failing() {
+        use crate::core::policy::{kind::Class, skip::Probed};
+        let db = Db::open_in_memory().unwrap();
+        db.probe_cache_put("/a.mp4", 1, 1, &Probed::new(Class::Video, "mp4", 1)).unwrap();
+        let newer = Probed::new(Class::Video, "mp4", 2);
+        db.probe_cache_put("/a.mp4", 2, 2, &newer).unwrap();
+        assert_eq!(db.probe_cache_get("/a.mp4", 2, 2).unwrap(), Some(newer));
+    }
+
+    #[test]
+    fn corrupted_cache_row_is_a_miss_not_an_error() {
+        let db = Db::open_in_memory().unwrap();
+        db.lock()
+            .execute(
+                "INSERT INTO probe_cache (path,size,mtime,probe_json,probed_at)
+                 VALUES ('/a.mp4',1,1,'{{{ not json',0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.probe_cache_get("/a.mp4", 1, 1).unwrap(), None, "脏缓存不能让扫描停摆");
     }
 
     #[test]

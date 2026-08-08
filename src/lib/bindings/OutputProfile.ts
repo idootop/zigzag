@@ -13,4 +13,13 @@ skip_no_gain: boolean,
 /**
  * 产物至少要省这么多才算数（百分比）。低于此值视为无收益。
  */
-min_gain_percent: number, };
+min_gain_percent: number, 
+/**
+ * 小于此体积的文件直接跳过（KB）。收益不抵开销与风险（§5.4）。
+ */
+min_file_kb: number, 
+/**
+ * 处理 RAW。默认关——转码 RAW 等于不可逆地销毁底片（R5），
+ * 这是排除清单里唯一「开了就可能毁数据」的一项，所以单独给开关而不是藏起来。
+ */
+include_raw: boolean, };

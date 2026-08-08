@@ -207,7 +207,7 @@ mod tests {
             [],
         )
         .unwrap();
-        let mut insert = || {
+        let insert = || {
             conn.execute(
                 "INSERT INTO items (job_id,src_path,src_size,src_mtime,kind,status)
                  VALUES (1,'/a.jpg',10,0,'image','pending')",

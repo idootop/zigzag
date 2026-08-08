@@ -19,9 +19,10 @@ pub mod engines;
 pub mod error;
 pub mod logging;
 pub mod platform;
+pub mod scan;
 pub mod store;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tauri::Manager;
 
@@ -50,6 +51,10 @@ pub fn run() {
             commands::check_tools,
             commands::job_progress,
             commands::log_path,
+            commands::scan::scan_start,
+            commands::scan::scan_cancel,
+            commands::scan::check_access,
+            commands::scan::open_privacy_settings,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 启动失败");
@@ -73,5 +78,11 @@ fn build_state(
     db.recover_interrupted()?;
 
     tracing::info!(data_dir = %dir.display(), "状态就绪");
-    Ok(AppState { db, profile: Mutex::new(profile), settings_path, log_path })
+    Ok(AppState {
+        db: Arc::new(db),
+        profile: Mutex::new(profile),
+        settings_path,
+        log_path,
+        scan: Mutex::new(Default::default()),
+    })
 }

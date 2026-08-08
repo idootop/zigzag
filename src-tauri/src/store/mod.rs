@@ -3,4 +3,4 @@
 pub mod repo;
 pub mod schema;
 
-pub use repo::Db;
+pub use repo::{Db, JobProgress, MediaKind, NewItem};
