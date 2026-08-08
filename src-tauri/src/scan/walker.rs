@@ -176,6 +176,7 @@ fn walk_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::fs;
 
     struct Tmp(PathBuf);
@@ -192,16 +193,16 @@ mod tests {
         Tmp(dir)
     }
 
-    fn write(root: &PathBuf, rel: &str, bytes: usize) -> PathBuf {
+    fn write(root: &Path, rel: &str, bytes: usize) -> PathBuf {
         let p = root.join(rel);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(&p, vec![0u8; bytes]).unwrap();
         p
     }
 
-    fn run(root: &PathBuf) -> (Vec<Found>, ScanStats) {
+    fn run(root: &Path) -> (Vec<Found>, ScanStats) {
         let mut out = Vec::new();
-        let opts = ScanOptions { roots: vec![root.clone()], parallelism: 1, batch_size: 4 };
+        let opts = ScanOptions { roots: vec![root.to_path_buf()], parallelism: 1, batch_size: 4 };
         let stats = scan(&opts, &AtomicBool::new(false), |b| out.extend(b));
         out.sort_by(|a, b| a.path.cmp(&b.path));
         (out, stats)

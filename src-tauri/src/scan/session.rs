@@ -202,6 +202,7 @@ fn walk_parallelism(roots: &[PathBuf]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::fs;
 
     struct Tmp(PathBuf);
@@ -219,7 +220,7 @@ mod tests {
     }
 
     /// 写一个尺寸真实可读的 PNG 头 + 填充，让预估拿得到宽高。
-    fn png(root: &PathBuf, rel: &str, w: u32, h: u32, pad: usize) {
+    fn png(root: &Path, rel: &str, w: u32, h: u32, pad: usize) {
         let mut b = Vec::from(*b"\x89PNG\r\n\x1a\n");
         b.extend_from_slice(&13u32.to_be_bytes());
         b.extend_from_slice(b"IHDR");

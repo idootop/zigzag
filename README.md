@@ -16,7 +16,7 @@
 
 > [!NOTE]
 > **本项目仍在开发中，暂未发布可用版本，敬请期待。**
-> 架构设计与 M0 骨架已完成，正在进行 M1（扫描与分析）。完整设计文档、决议记录与任务清单见 [PROGRESS.md](PROGRESS.md)。
+> M0（骨架）、M1（扫描与分析）、M2（图片管线）已完成，正在进行 M3（视频与音频管线）。完整设计文档、决议记录与任务清单见 [PROGRESS.md](PROGRESS.md)。
 
 ---
 
@@ -53,7 +53,7 @@ Zigzag 的目标是让归档整理变成一个可预期、可中断、可回滚�
 
 | 类型 | 目标格式 | 关键参数 |
 |---|---|---|
-| **图片** | AVIF | 短边上限 1080、质量 85、4:4:4 色度；一律有损；保留 EXIF 与 ICC，旋转信息烘焙进像素 |
+| **图片** | AVIF | 短边上限 1080、质量 85、4:4:4 色度；一律有损；EXIF / XMP 原样照搬，ICC 始终保留，旋转信息烘焙进像素 |
 | **视频** | HEVC（x265） | 短边上限 1080、帧率上限 30、CRF 24、8-bit；默认软编，硬件编码作为「极速」预设可选 |
 | **音频** | AAC-LC（`.m4a`） | 码率上限 128 kbps，继承源采样率；AAC 源仅更换容器，不重新编码 |
 
@@ -68,7 +68,7 @@ Zigzag 的目标是让归档整理变成一个可预期、可中断、可回滚�
 基于 **Tauri 2 + Rust**，安装包约 15 MB，空载内存占用约 80 MB。大规模目录遍历与哈希计算采用 `jwalk` + `rayon` + `blake3`。
 
 - **前端** — React 19、Vite、TypeScript、Tailwind 4、shadcn/ui、TanStack Virtual
-- **后端** — Rust、tokio、rusqlite（WAL 模式）、image、fast_image_resize、ravif
+- **后端** — Rust、tokio、rusqlite（WAL 模式）、image、fast_image_resize、libavif
 - **编解码** — ffmpeg / ffprobe sidecar，macOS 平台叠加 ImageIO 与 VideoToolbox
 
 v1 优先支持 macOS（Apple Silicon）。核心逻辑与平台相关代码已分层解耦，后续扩展至其他平台无需重构。
@@ -78,9 +78,9 @@ v1 优先支持 macOS（Apple Silicon）。核心逻辑与平台相关代码已�
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
 | M0 | 项目骨架：Tauri 脚手架、ffmpeg sidecar、SQLite、IPC | ✅ 已完成 |
-| M1 | 扫描与分析（Dry-run） | 进行中 |
-| M2 | 图片管线 | 待开始 |
-| M3 | 视频与音频管线 | 待开始 |
+| M1 | 扫描与分析（Dry-run） | ✅ 已完成 |
+| M2 | 图片管线 | ✅ 已完成 |
+| M3 | 视频与音频管线 | 进行中 |
 | M4 | 持久化与崩溃恢复 | 待开始 |
 | M5 | 重复文件清理 | 待开始 |
 | M6 | 界面打磨与规模压测 | 待开始 |

@@ -162,6 +162,17 @@ pub fn apply_orientation(img: Rgba8, orientation: Orientation) -> Result<Rgba8> 
 
 // ---------------------------------------------------------------- 缩放
 
+/// AV1 的单边硬上限。
+///
+/// 实测（本机 libaom，8 像素宽的竖条）：65535 与 65536 都编得出来，65537 起
+/// libavif 只回一句 "Encoding of color planes failed"——没有尺寸、没有原因。
+/// 所以在进编码器之前先自己挡一道，把话说清楚。
+///
+/// 这个限制拦住的是拼接出来的超长截图和全景图，正常照片够不着。挡下来的文件
+/// 会被记成失败并**原样留着**，不去强行按长边压——用户设的是短边上限，
+/// 悄悄按另一条边缩是改了他没同意的规则。
+pub const AV1_MAX_DIM: u32 = 65536;
+
 /// 按短边上限缩放；已经不超过上限就原样返回。
 ///
 /// 缩放规则复用 [`fit_short_edge`]，与「设置」里的实时换算预览是同一个函数，
@@ -252,6 +263,13 @@ impl Metadata {
 
 /// 编码成 AVIF 字节流。
 pub fn encode_avif(img: &Rgba8, p: &AvifParams, meta: &Metadata) -> Result<Vec<u8>> {
+    if img.width > AV1_MAX_DIM || img.height > AV1_MAX_DIM {
+        return Err(ZzError::Other(format!(
+            "尺寸超出 AV1 上限：{}×{}，单边最多 {AV1_MAX_DIM} 像素",
+            img.width, img.height
+        )));
+    }
+
     let format = match p.chroma {
         Chroma::Yuv420 => sys::AVIF_PIXEL_FORMAT_YUV420,
         Chroma::Yuv444 => sys::AVIF_PIXEL_FORMAT_YUV444,
@@ -508,6 +526,18 @@ mod tests {
     }
 
     #[test]
+    fn refuses_dimensions_beyond_the_av1_limit() {
+        // 实测：65536 编得出来，65537 起 libavif 只回一句
+        // "Encoding of color planes failed"，既没有尺寸也没有原因。
+        // 这道闸就是为了把那句话换成能看懂的（D-63）。
+        let w = 8u32;
+        let tall = |h: u32| Rgba8::new(w, h, vec![128; (w * h * 4) as usize]).unwrap();
+        let e = encode_avif(&tall(AV1_MAX_DIM + 1), &params(), &Metadata::default()).unwrap_err();
+        assert!(e.to_string().contains("65536"), "错误里得写清上限: {e}");
+        assert!(encode_avif(&tall(AV1_MAX_DIM), &params(), &Metadata::default()).is_ok());
+    }
+
+    #[test]
     fn detects_opacity() {
         assert!(gradient(4, 4, 255).opaque);
         assert!(!gradient(4, 4, 128).opaque);
@@ -683,3 +713,4 @@ mod tests {
         assert_eq!(p.chroma, Chroma::Yuv444);
     }
 }
+

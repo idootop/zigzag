@@ -71,9 +71,13 @@ fn set<T: std::str::FromStr>(slot: &mut Option<T>, value: &str) {
 static FFMPEG: OnceLock<Option<PathBuf>> = OnceLock::new();
 static FFPROBE: OnceLock<Option<PathBuf>> = OnceLock::new();
 
-/// 定位 ffmpeg。优先用随应用打包的 sidecar，开发期回落到 PATH。
+/// 定位 ffmpeg。优先用随应用打包的 sidecar，实在找不到才回落到 PATH。
 ///
-/// 打包后 sidecar 位于 `.app/Contents/MacOS/` 下，与主程序同级。
+/// **回落到 PATH 是能力降级，不只是路径不同。** 随包的是 9.0，带 `libaom-av1`
+/// 与 `webp_anim`；而机器上装的很可能是别的版本（本机 Homebrew 上是 8.1.2，
+/// 两样都没有），动图那条路会直接报 "Unknown encoder"。所以 sidecar 的搜索
+/// 范围要覆盖到所有会真的跑代码的场景，别让开发期悄悄用着一个能力不同的
+/// 二进制去验证结论。
 pub fn ffmpeg_path() -> Result<&'static Path> {
     resolve(&FFMPEG, "ffmpeg")
 }
@@ -84,16 +88,20 @@ pub fn ffprobe_path() -> Result<&'static Path> {
 
 fn resolve(cell: &'static OnceLock<Option<PathBuf>>, name: &'static str) -> Result<&'static Path> {
     cell.get_or_init(|| {
-        // 1) 与当前可执行文件同级（打包后的 sidecar）
         if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
+            // 1) 与可执行文件同级：打包后的 `.app/Contents/MacOS/`，
+            //    以及 `cargo tauri dev` 的 `target/debug/`（构建脚本会拷过去）。
+            // 2) 再上一级：单元测试跑的是 `target/debug/deps/xxx-<hash>`，
+            //    sidecar 在它的父目录。少了这一条，测试就会在 PATH 上那个
+            //    能力不同的 ffmpeg 上跑，结论不作数。
+            let dirs = exe.parent().into_iter().flat_map(|d| [Some(d), d.parent()]);
+            for dir in dirs.flatten() {
                 let p = dir.join(name);
                 if p.is_file() {
                     return Some(p);
                 }
             }
         }
-        // 2) PATH（开发期）
         which(name)
     })
     .as_deref()
@@ -232,6 +240,24 @@ dup_frames=0
 drop_frames=0
 speed=3.87x
 progress=continue";
+
+    #[test]
+    fn the_resolved_ffmpeg_can_actually_do_the_job() {
+        // 动图那条路要 `libaom-av1`（编码）与 `webp_anim`（解复用），两样都是
+        // 随包 9.0 才有的。解析顺序一旦回落到机器上装的那个版本，动图会在
+        // 运行期报 "Unknown encoder"——而单测如果也跟着回落，就永远看不见
+        // 这个问题。这条测试把「用的到底是哪个二进制」钉死（D-59）。
+        let Ok(exe) = ffmpeg_path() else { return };
+        let has = |flag: &str, needle: &str| {
+            std::process::Command::new(exe)
+                .args(["-hide_banner", flag])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).contains(needle))
+                .unwrap_or(false)
+        };
+        assert!(has("-encoders", "libaom-av1"), "{}：没有 libaom-av1", exe.display());
+        assert!(has("-demuxers", "webp_anim"), "{}：没有 webp_anim", exe.display());
+    }
 
     #[test]
     fn parses_a_real_progress_block() {

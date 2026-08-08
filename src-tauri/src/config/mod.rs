@@ -12,7 +12,7 @@ use ts_rs::TS;
 pub mod preset;
 
 /// 一次任务的完整配置快照。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../src/lib/bindings/")]
 #[serde(default)]
 pub struct Profile {
@@ -249,17 +249,6 @@ pub enum OutputMode {
 }
 
 // ---------------------------------------------------------------- 校验
-
-impl Default for Profile {
-    fn default() -> Self {
-        Self {
-            image: ImageProfile::default(),
-            video: VideoProfile::default(),
-            audio: AudioProfile::default(),
-            output: OutputProfile::default(),
-        }
-    }
-}
 
 impl Profile {
     /// 把越界值钳回合法区间，返回被修正项的说明。

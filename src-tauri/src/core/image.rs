@@ -132,12 +132,27 @@ fn animate(src: &Path, out: &Path, cfg: &Profile) -> Result<(u32, u32)> {
     if w == 0 || h == 0 {
         return Err(ZzError::Other("缩放后尺寸为 0".into()));
     }
+    // 和静态图同一道闸（`encode_avif` 里那个）：底下都是 libaom，限制一样，
+    // 只是这条路走的是子进程，够不到那个检查。
+    if w > enc::AV1_MAX_DIM || h > enc::AV1_MAX_DIM {
+        return Err(ZzError::Other(format!(
+            "尺寸超出 AV1 上限：{w}×{h}，单边最多 {} 像素",
+            enc::AV1_MAX_DIM
+        )));
+    }
 
     let s = |v: &str| v.to_string();
     let args = vec![
         s("-y"),
         s("-i"),
         src.to_string_lossy().into_owned(),
+        // 保持源的逐帧时长，别转成恒定帧率。ffmpeg 默认按最短帧间隔铺成 CFR：
+        // 一个 6 帧、延时 50ms/1000ms 混排的 GIF 会被复制成 63 帧（实测
+        // 2794 B），而 vfr 保留原本的 6 帧、时长同样是 3.15s、只要 1282 B。
+        // 恒定延时的素材上两者输出完全一致，所以这个参数没有代价。
+        // 顺带还挡掉一种伪造：单帧 GIF 在 CFR 下会被摊成 10 帧的「动画」。
+        s("-fps_mode"),
+        s("vfr"),
         s("-vf"),
         format!("scale={w}:{h}:flags=lanczos"),
         s("-c:v"),
@@ -248,7 +263,7 @@ mod tests {
         let dst = d.join("out.avif");
 
         let r = compress(&src, &dst, &cfg(720)).unwrap();
-        assert!(!r.used_fallback, "JPEG 该走主路径");
+        assert_eq!(r.route, Route::Still, "JPEG 该走主路径");
         assert_eq!(r.width.min(r.height), 720, "短边应当正好落在上限上");
         let Outcome::Written { size } = r.outcome else { panic!("应当有收益: {:?}", r.outcome) };
         assert!(size < r.src_size);
@@ -265,9 +280,90 @@ mod tests {
         let dst = d.join("out.avif");
 
         let r = compress(&src, &dst, &cfg(720)).unwrap();
-        assert!(r.used_fallback, "HEIC 必须走 ImageIO 兜底");
+        assert_eq!(r.route, Route::StillViaImageIo, "HEIC 必须走 ImageIO 兜底");
         assert_eq!(r.width.min(r.height), 720);
         assert!(dst.exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn detects_animation_only_where_it_exists() {
+        // 判错方向不同后果不同：动图被当静态图只剩首帧（信息丢失），
+        // 静态图被当动图只是绕了一圈 ffmpeg（no-gain 闸门兜底）。
+        for name in ["anim.gif", "anim.png", "anim.webp", "still.gif"] {
+            let Some(p) = real(name) else { continue };
+            assert!(is_animated(&p), "{name} 该被认成动图");
+        }
+        for name in ["iphone.jpg", "shot.png", "a.webp"] {
+            let Some(p) = real(name) else { continue };
+            assert!(!is_animated(&p), "{name} 是静态图，不该走 ffmpeg");
+        }
+    }
+
+    #[test]
+    fn compresses_animations_end_to_end() {
+        // 三种动图容器各走一遍：GIF 走 gif 解复用器，APNG 走 apng，
+        // 动画 WebP 走 webp_anim——最后一个只有随包的 ffmpeg 9.0 才有。
+        for name in ["anim.gif", "anim.png", "anim.webp"] {
+            let Some(src) = real(name) else { continue };
+            let d = dir(&format!("anim-{name}"));
+            let dst = d.join("out.avif");
+
+            let s = imagesize::size(&src).unwrap();
+            let expect = 240.min(s.width.min(s.height) as u32); // 素材本来就小于上限的不许放大
+
+            let r = compress(&src, &dst, &cfg(240)).unwrap();
+            assert_eq!(r.route, Route::Animated, "{name}");
+            assert_eq!(r.width.min(r.height), expect, "{name} 尺寸不对");
+            let Outcome::Written { size } = r.outcome else { panic!("{name} 应当有收益") };
+            assert!(size < r.src_size, "{name}");
+
+            // 产物得真是动图，且一帧都没少——丢帧不会报错，只会让动画变快。
+            let want = if name == "anim.gif" { 10 } else { 8 };
+            assert_eq!(anim_frames(&dst), Some(want), "{name} 帧数不对");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn a_variable_delay_gif_keeps_its_frame_count() {
+        // 真实的 GIF 逐帧延时基本都不一样。ffmpeg 默认会按最短的那一帧把整段
+        // 铺成恒定帧率，6 帧变 63 帧、体积翻倍——时长看着是对的，所以这个问题
+        // 只能靠数帧数发现（D-62）。
+        let Some(src) = real("vardelay.gif") else { return };
+        let d = dir("vardelay");
+        let dst = d.join("out.avif");
+        compress(&src, &dst, &cfg(0)).unwrap();
+
+        // 用 ffprobe 数：`image` crate 这边没开 avif feature，解不了自家产物。
+        // v:0 是封面静图，v:1 才是动画轨。
+        assert_eq!(anim_frames(&dst), Some(6), "帧数被恒定帧率转换改掉了");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 数一个 AVIF 里动画轨的帧数。不是动图就返回 `None`。
+    fn anim_frames(p: &Path) -> Option<usize> {
+        let exe = crate::engines::ffmpeg::ffprobe_path().ok()?;
+        let out = std::process::Command::new(exe)
+            .args(["-v", "error", "-select_streams", "v:1", "-count_frames"])
+            .args(["-show_entries", "stream=nb_read_frames", "-of", "csv=p=0"])
+            .arg(p)
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    }
+
+    #[test]
+    fn a_single_frame_gif_is_caught_by_the_no_gain_gate() {
+        // 单帧 GIF 走动图路径会变大（实测 586 → 1519 B）。这里不去数帧数
+        // 提前分流，靠的就是闸门——所以闸门必须真的拦得住。
+        let Some(src) = real("still.gif") else { return };
+        let d = dir("still-gif");
+        let dst = d.join("out.avif");
+
+        let r = compress(&src, &dst, &cfg(0)).unwrap();
+        assert!(matches!(r.outcome, Outcome::NoGain { .. }), "闸门没拦住: {:?}", r.outcome);
+        assert!(!dst.exists(), "无收益时目标位置不该出现文件");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -326,6 +422,37 @@ mod tests {
     }
 
     #[test]
+    fn handles_the_odd_pixel_formats() {
+        // 归档盘里这几种都不罕见：Lightroom 导的 16-bit、扫描件的灰度、
+        // 抠图留下的 alpha、印刷稿的 CMYK。它们的共同点是不走 RGB8 主路，
+        // 中间表示只要漏了一种就整类文件压不了——而这在日常素材上测不出来。
+        for name in ["deep16.png", "gray.png", "alpha.png", "cmyk.jpg", "one.png"] {
+            let Some(src) = real(name) else { continue };
+            let d = dir(&format!("odd-{name}"));
+            let dst = d.join("out.avif");
+
+            let s = imagesize::size(&src).unwrap();
+            let r = compress(&src, &dst, &cfg(0)).expect(name);
+            assert_eq!((r.width, r.height), (s.width as u32, s.height as u32), "{name} 尺寸变了");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn handles_a_very_tall_screenshot() {
+        // 长截图的短边小于上限，所以完全不缩放，直接以 750×30000 进编码器。
+        // 40:1 的长宽比是网页长截图的常态，不是臆想出来的边界。
+        let Some(src) = real("tall.png") else { return };
+        let d = dir("tall");
+        let dst = d.join("out.avif");
+
+        let r = compress(&src, &dst, &cfg(1080)).unwrap();
+        assert_eq!((r.width, r.height), (750, 30000), "短边没超上限，不该动它");
+        assert!(matches!(r.outcome, Outcome::Written { .. }), "{:?}", r.outcome);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn an_already_small_image_is_not_upscaled() {
         let Some(src) = real("plain.jpg") else { return };
         let d = dir("small");
@@ -337,3 +464,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
