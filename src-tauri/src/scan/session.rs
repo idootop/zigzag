@@ -60,7 +60,17 @@ pub async fn run(
     mut on_progress: impl FnMut(ScanProgress),
 ) -> ScanReport {
     let parallelism = walk_parallelism(&roots);
-    tracing::info!(roots = roots.len(), parallelism, "开始扫描");
+    // 日志里写字面量会骗人：0 在 jwalk 里是「放开跑」而不是「不并行」，
+    // 排查时看到「并行度=0」会往完全相反的方向去猜。
+    tracing::info!(
+        roots = roots.len(),
+        parallelism = match parallelism {
+            0 => "rayon 默认池".to_string(),
+            1 => "串行".to_string(),
+            n => format!("{n} 线程"),
+        },
+        "开始扫描"
+    );
 
     let opts = ScanOptions { roots: roots.clone(), parallelism, batch_size: 512 };
     let (tx, mut rx) = mpsc::channel::<Vec<Found>>(CHANNEL_BATCHES);

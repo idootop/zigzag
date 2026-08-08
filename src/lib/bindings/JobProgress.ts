@@ -2,13 +2,15 @@
 
 /**
  * 任务面板要展示的汇总。一次查询算完，避免前端拉全表自己数。
+ * `#[ts(type = "number")]` 的理由见 [`crate::scan::report`] 的模块文档：
+ * IPC 走 JSON，u64 到前端就是 `number`，声明成 `bigint` 会在运行时炸。
  */
-export type JobProgress = { total: bigint, done: bigint, failed: bigint, skipped: bigint, pending: bigint, running: bigint, 
+export type JobProgress = { total: number, done: number, failed: number, skipped: number, pending: number, running: number, 
 /**
  * 已完成条目的源文件总字节。
  */
-src_bytes: bigint, 
+src_bytes: number, 
 /**
  * 对应的输出总字节，两者相减即为已省下的空间。
  */
-dst_bytes: bigint, };
+dst_bytes: number, };

@@ -1,0 +1,351 @@
+/**
+ * 扫描报告（§9 UI #2）。
+ *
+ * 「这一屏是决定用户是否信任这个工具的关键」。所以版面顺序就是信任建立的
+ * 顺序，从上往下依次回答四个问题：
+ *
+ * 1. **能省多少？** —— 头条数字，外加上下界。只报一个光秃秃的「418 MB」是在
+ *    假装精确；预估本身就有正负一倍的不确定度，把范围写出来反而更可信。
+ * 2. **要跑多久？** —— 分 CPU 与媒体引擎两条队列显示。两者是独立硅片、并行
+ *    执行，总耗时取较慢的一条而不是相加（D-07 / D-42）。
+ * 3. **动了我哪些东西？** —— 按类型、按目录两个维度铺开。
+ * 4. **什么没动，为什么？** —— 跳过项按原因分组单独列，绝不悄悄混进总数里。
+ *    「1,204 个文件已是最优」比一个虚高的总数有用得多。
+ */
+import { ArrowLeft, FileQuestion, Film, Image, Music, Zap } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+import { Separator } from "@/components/ui/separator";
+import { cn, formatBytes, formatCount, formatEta, formatEtaShort, formatSaving } from "@/lib/utils";
+import type { KindGroup, MediaKind, Range, ScanReport } from "@/lib/ipc";
+import { useScan } from "@/store/scan";
+
+const KIND_META: Record<MediaKind, { label: string; icon: typeof Image }> = {
+  image: { label: "图片", icon: Image },
+  video: { label: "视频", icon: Film },
+  audio: { label: "音频", icon: Music },
+};
+
+export function Report({ report }: { report: ScanReport }) {
+  const reset = useScan((s) => s.reset);
+  const nothingToDo = report.planned_files === 0;
+
+  return (
+    <div className="flex h-full flex-col">
+      <header className="flex shrink-0 items-center gap-3 border-b border-border px-4 py-2.5">
+        <Button variant="ghost" size="sm" onClick={reset} className="-ml-2 gap-1.5">
+          <ArrowLeft className="size-4" />
+          重新选择
+        </Button>
+        <div className="flex-1" />
+        {/* 压缩执行是 M2。摆个禁用的按钮把流程说清楚，但不画能点的假入口。 */}
+        <Button size="sm" disabled title="压缩执行将在下一步接入">
+          开始压缩
+        </Button>
+      </header>
+
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <div className="mx-auto flex w-full max-w-3xl flex-col gap-7 p-6">
+          {report.cancelled && (
+            <Note tone="warn">扫描已取消，下面是取消前已经看过的部分。</Note>
+          )}
+
+          {nothingToDo ? <NothingToDo report={report} /> : <Headline report={report} />}
+
+          {!nothingToDo && (
+            <>
+              <Section title="按类型">
+                <KindTable groups={report.groups} />
+              </Section>
+
+              <Section title="耗时" hint="两条队列并行，总耗时取较慢的一条">
+                <Lanes report={report} />
+              </Section>
+            </>
+          )}
+
+          {report.dirs.length > 0 && (
+            <Section title="空间分布" hint="按目录，含跳过的文件">
+              <Dirs report={report} />
+            </Section>
+          )}
+
+          {report.skipped.length > 0 && (
+            <Section
+              title="不处理"
+              hint={`${formatCount(report.skipped_files)} 个 · ${formatBytes(report.skipped_bytes)}`}
+            >
+              <Skipped report={report} />
+            </Section>
+          )}
+
+          <Footnotes report={report} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** 头条：能省多少。 */
+function Headline({ report }: { report: ScanReport }) {
+  const saved = report.saved_bytes;
+  return (
+    <div className="flex flex-col items-center gap-1 pt-4 text-center">
+      <span className="text-sm text-muted-foreground">预计可省</span>
+      <span className="text-5xl font-semibold tracking-tight text-good">
+        {formatBytes(saved.mid)}
+      </span>
+      <span className="text-sm text-muted-foreground">
+        {formatBytes(saved.low)} ~ {formatBytes(saved.high)}
+      </span>
+
+      <div className="mt-5 grid w-full grid-cols-3 gap-px overflow-hidden rounded-lg border border-border bg-border">
+        <Stat label="待处理" value={`${formatCount(report.planned_files)} 个`} sub={formatBytes(report.planned_bytes)} />
+        <Stat
+          label="压缩后"
+          value={formatBytes(report.out_bytes.mid)}
+          sub={`约为原来的 ${Math.round((report.out_bytes.mid / Math.max(report.planned_bytes, 1)) * 100)}%`}
+        />
+        <Stat label="预计耗时" value={formatEta(report.seconds.mid)} sub={rangeEta(report.seconds)} />
+      </div>
+    </div>
+  );
+}
+
+function rangeEta(r: Range): string {
+  return `${formatEtaShort(r.low)} ~ ${formatEtaShort(r.high)}`;
+}
+
+function Stat({ label, value, sub }: { label: string; value: string; sub?: string }) {
+  return (
+    <div className="flex flex-col gap-0.5 bg-card px-3 py-3">
+      <span className="text-xs text-muted-foreground">{label}</span>
+      <span className="text-base font-medium">{value}</span>
+      {sub && <span className="truncate text-xs text-muted-foreground">{sub}</span>}
+    </div>
+  );
+}
+
+/** 一个文件都不用动时的说法。此时报头条数字（省 0 B）只会让人以为工具坏了。 */
+function NothingToDo({ report }: { report: ScanReport }) {
+  const found = report.media_found > 0;
+  return (
+    <div className="flex flex-col items-center gap-2 py-8 text-center">
+      <FileQuestion className="size-8 text-muted-foreground" strokeWidth={1.5} />
+      <p className="text-base font-medium">没有需要压缩的文件</p>
+      <p className="max-w-sm text-sm text-muted-foreground">
+        {found
+          ? `扫到 ${formatCount(report.media_found)} 个媒体文件，但按当前设置它们都不需要处理，原因见下方。`
+          : `在 ${formatCount(report.files_seen)} 个文件里没找到可处理的媒体文件。`}
+      </p>
+    </div>
+  );
+}
+
+/** 按类型：每行一条「源 → 产物」的条，绿色段就是省下来的部分。 */
+function KindTable({ groups }: { groups: KindGroup[] }) {
+  const max = Math.max(...groups.map((g) => g.src_bytes), 1);
+  return (
+    <div className="flex flex-col gap-3">
+      {groups.map((g) => {
+        const meta = KIND_META[g.kind];
+        const Icon = meta.icon;
+        return (
+          <div key={g.kind} className="flex flex-col gap-1.5">
+            <div className="flex items-baseline gap-2 text-sm">
+              <Icon className="size-4 shrink-0 self-center text-muted-foreground" strokeWidth={1.75} />
+              <span className="font-medium">{meta.label}</span>
+              <span className="text-muted-foreground">{formatCount(g.files)} 个</span>
+              <div className="flex-1" />
+              <span className="tabular-nums text-muted-foreground">
+                {formatBytes(g.src_bytes)} → {formatBytes(g.out_bytes.mid)}
+              </span>
+              <span className="w-10 text-right font-medium tabular-nums text-good">
+                {formatSaving(g.src_bytes, g.out_bytes.mid)}
+              </span>
+            </div>
+            {/* 外层宽度 = 该类型占最大类型的比例，内层实心段 = 压完还剩的部分。 */}
+            <div className="h-2 w-full">
+              <div
+                className="flex h-full overflow-hidden rounded-full bg-good/25"
+                style={{ width: `${(g.src_bytes / max) * 100}%` }}
+              >
+                <div
+                  className="h-full rounded-full bg-primary/70"
+                  style={{ width: `${Math.min(100, (g.out_bytes.mid / Math.max(g.src_bytes, 1)) * 100)}%` }}
+                />
+              </div>
+            </div>
+          </div>
+        );
+      })}
+      <p className="text-xs text-muted-foreground">
+        <span className="mr-1 inline-block size-2 rounded-full bg-primary/70 align-middle" />
+        压缩后保留
+        <span className="mr-1 ml-3 inline-block size-2 rounded-full bg-good/25 align-middle" />
+        释放出来
+      </p>
+    </div>
+  );
+}
+
+/** 两条队列。 */
+function Lanes({ report }: { report: ScanReport }) {
+  const cpu = report.cpu_seconds.mid;
+  const hw = report.hw_seconds.mid;
+  const max = Math.max(cpu, hw, 1);
+  return (
+    <div className="flex flex-col gap-3">
+      <Lane label="CPU 编码" hint="x265 / AVIF / AAC" seconds={cpu} ratio={cpu / max} tone="primary" />
+      <Lane
+        label="媒体引擎"
+        hint="VideoToolbox 硬件编码"
+        seconds={hw}
+        ratio={hw / max}
+        tone="good"
+        idle={hw <= 0}
+      />
+      <p className="text-xs text-muted-foreground">
+        总计 {formatEta(report.seconds.mid)}
+        {hw > 0 && cpu > 0 && "：两条是各自独立的硅片，同时开工，所以不是相加"}
+        {hw <= 0 && "。本次没有文件走硬件编码——它只接手大文件（默认 1 GB 或 10 分钟以上）"}
+      </p>
+    </div>
+  );
+}
+
+function Lane({
+  label,
+  hint,
+  seconds,
+  ratio,
+  tone,
+  idle,
+}: {
+  label: string;
+  hint: string;
+  seconds: number;
+  ratio: number;
+  tone: "primary" | "good";
+  idle?: boolean;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-baseline gap-2 text-sm">
+        {tone === "good" ? (
+          <Zap className={cn("size-4 self-center", idle ? "text-muted-foreground/40" : "text-good")} strokeWidth={1.75} />
+        ) : (
+          <span className="size-4" />
+        )}
+        <span className={cn("font-medium", idle && "text-muted-foreground")}>{label}</span>
+        <span className="text-xs text-muted-foreground">{hint}</span>
+        <div className="flex-1" />
+        <span className={cn("tabular-nums", idle ? "text-muted-foreground" : "font-medium")}>
+          {idle ? "未使用" : formatEta(seconds)}
+        </span>
+      </div>
+      <div className="ml-6 h-2 overflow-hidden rounded-full bg-muted">
+        <div
+          className={cn("h-full rounded-full", tone === "good" ? "bg-good" : "bg-primary/70")}
+          style={{ width: `${Math.max(ratio * 100, idle ? 0 : 2)}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function Dirs({ report }: { report: ScanReport }) {
+  const max = Math.max(...report.dirs.map((d) => d.bytes), 1);
+  return (
+    <div className="flex flex-col gap-2">
+      {report.dirs.map((d) => (
+        <div key={d.path || d.name} className="flex items-center gap-3 text-sm">
+          <span className="w-36 shrink-0 truncate" title={d.path || d.name}>
+            {d.name}
+          </span>
+          <div className="h-2 flex-1 overflow-hidden rounded-full bg-muted">
+            <div className="h-full rounded-full bg-primary/50" style={{ width: `${(d.bytes / max) * 100}%` }} />
+          </div>
+          <span className="w-20 shrink-0 text-right tabular-nums text-muted-foreground">
+            {formatBytes(d.bytes)}
+          </span>
+          <span className="w-16 shrink-0 text-right tabular-nums text-xs text-muted-foreground">
+            {formatCount(d.files)} 个
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Skipped({ report }: { report: ScanReport }) {
+  return (
+    <div className="flex flex-col divide-y divide-border overflow-hidden rounded-lg border border-border">
+      {report.skipped.map((s) => (
+        // 原因在左、数量在右：用户扫这一栏是想知道「为什么没动它」，
+        // 数字是次要的。文案直接取自后端的 SkipReason::message，前端不另维护一份。
+        <div key={s.reason} className="flex items-baseline gap-3 bg-card px-3 py-2.5 text-sm">
+          <span className="min-w-0 flex-1 leading-snug">{s.message}</span>
+          <span className="shrink-0 tabular-nums text-xs text-muted-foreground">
+            {formatCount(s.files)} 个 · {formatBytes(s.bytes)}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** 扫描过程里那些「不影响结论但该说一声」的事。 */
+function Footnotes({ report }: { report: ScanReport }) {
+  const notes: string[] = [];
+  if (report.errors > 0) {
+    notes.push(`有 ${formatCount(report.errors)} 处读取失败，通常是权限不足或文件正被占用，这部分未计入。`);
+  }
+  if (report.hardlinks_skipped > 0) {
+    notes.push(`跳过了 ${formatCount(report.hardlinks_skipped)} 个硬链接副本，避免同一份数据被压两次。`);
+  }
+  if (notes.length === 0) return null;
+  return (
+    <>
+      <Separator />
+      <div className="flex flex-col gap-1 pb-2 text-xs text-muted-foreground">
+        {notes.map((n) => (
+          <p key={n}>{n}</p>
+        ))}
+      </div>
+    </>
+  );
+}
+
+function Section({
+  title,
+  hint,
+  children,
+}: {
+  title: string;
+  hint?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="flex flex-col gap-3">
+      <div className="flex items-baseline gap-2">
+        <h2 className="text-sm font-semibold">{title}</h2>
+        {hint && <span className="text-xs text-muted-foreground">{hint}</span>}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function Note({ tone, children }: { tone: "warn"; children: React.ReactNode }) {
+  return (
+    <div
+      className={cn(
+        "rounded-lg border px-3 py-2 text-sm",
+        tone === "warn" && "border-warn/30 bg-warn/10",
+      )}
+    >
+      {children}
+    </div>
+  );
+}

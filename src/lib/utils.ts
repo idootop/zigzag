@@ -42,3 +42,41 @@ export function formatDuration(seconds: number): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
+
+/**
+ * 预估耗时 → 「约 5 分钟」。
+ *
+ * 和 {@link formatDuration} 分开是因为两者说的不是一回事：`3:07` 精确到秒，
+ * 适合已经在跑的任务；而预估值本身就有正负一倍的不确定度（见 Range），
+ * 给到秒反而是在假装精确。
+ */
+export function formatEta(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "—";
+  if (seconds < 60) return "不到 1 分钟";
+  const m = Math.round(seconds / 60);
+  if (m < 60) return `约 ${m} 分钟`;
+  const h = Math.floor(m / 60);
+  const rest = m % 60;
+  return rest === 0 ? `约 ${h} 小时` : `约 ${h} 小时 ${rest} 分`;
+}
+
+/**
+ * {@link formatEta} 的紧凑写法：`5 分`、`2 时 10 分`。
+ *
+ * 专给「12 分 ~ 40 分」这种区间用——两头都带上「约」字反而更啰嗦，
+ * 区间本身已经把不确定性说清楚了。
+ */
+export function formatEtaShort(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "—";
+  if (seconds < 60) return "<1 分";
+  const m = Math.round(seconds / 60);
+  if (m < 60) return `${m} 分`;
+  const h = Math.floor(m / 60);
+  const rest = m % 60;
+  return rest === 0 ? `${h} 时` : `${h} 时 ${rest} 分`;
+}
+
+/** 文件数 → `1,234`。 */
+export function formatCount(n: number): string {
+  return Math.round(n).toLocaleString("zh-CN");
+}

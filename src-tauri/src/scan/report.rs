@@ -12,6 +12,16 @@
 //! 3. 耗时按两条队列分开报，总耗时取 max 而非和（D-42）。
 //!
 //! 这个模块是纯的：喂它探测结果，它吐报告。不碰磁盘、不认识 Tauri。
+//!
+//! ### 为什么每个 `u64` 都挂着 `#[ts(type = "number")]`
+//!
+//! ts-rs 默认把 `u64` 映射成 TS 的 `bigint`，但 **Tauri 的 IPC 走 JSON**，
+//! `serde_json` 把 u64 写成普通数字字面量（`"files":410`），前端 `JSON.parse`
+//! 拿到的是 `number`。声明成 `bigint` 就是在骗类型系统：`===` 恒假、
+//! 和数字一起做算术直接抛 `Cannot mix BigInt`，而且全都是运行时才炸。
+//!
+//! JSON 数字是 IEEE754 双精度，整数精确到 2^53 ≈ 9 PB，装得下任何真实硬盘的
+//! 字节数，所以 `number` 不只是权宜，它就是准确的。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -34,8 +44,8 @@ const TOP_DIRS: usize = 8;
 #[ts(export, export_to = "../../src/lib/bindings/")]
 pub struct KindGroup {
     pub kind: MediaKind,
-    pub files: u64,
-    pub src_bytes: u64,
+    #[ts(type = "number")] pub files: u64,
+    #[ts(type = "number")] pub src_bytes: u64,
     pub out_bytes: Range,
     pub seconds: Range,
 }
@@ -47,8 +57,8 @@ pub struct SkipGroup {
     pub reason: SkipReason,
     /// 面向用户的说明，直接取自 [`SkipReason::message`]，前端不必自己维护一份文案。
     pub message: String,
-    pub files: u64,
-    pub bytes: u64,
+    #[ts(type = "number")] pub files: u64,
+    #[ts(type = "number")] pub bytes: u64,
 }
 
 /// 按目录的体积分布。
@@ -58,19 +68,19 @@ pub struct DirGroup {
     /// 显示名。root 下的一级子目录名，直接躺在 root 里的文件归到 root 自己的名字。
     pub name: String,
     pub path: String,
-    pub files: u64,
-    pub bytes: u64,
+    #[ts(type = "number")] pub files: u64,
+    #[ts(type = "number")] pub bytes: u64,
 }
 
 /// 扫描期间的增量进度。发给前端的频率由调用方节流（~10 Hz，R10）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, TS)]
 #[ts(export, export_to = "../../src/lib/bindings/")]
 pub struct ScanProgress {
-    pub files_seen: u64,
-    pub media_found: u64,
+    #[ts(type = "number")] pub files_seen: u64,
+    #[ts(type = "number")] pub media_found: u64,
     /// 已完成探测的文件数。它才是进度条该跟的数——遍历比探测快得多。
-    pub analyzed: u64,
-    pub bytes: u64,
+    #[ts(type = "number")] pub analyzed: u64,
+    #[ts(type = "number")] pub bytes: u64,
     /// 正在处理的路径，给用户一点「它没卡死」的确证。
     pub current: String,
     pub done: bool,
@@ -82,17 +92,17 @@ pub struct ScanProgress {
 pub struct ScanReport {
     pub roots: Vec<String>,
     /// 遍历到的普通文件总数（含非媒体）。
-    pub files_seen: u64,
+    #[ts(type = "number")] pub files_seen: u64,
     /// 其中被认作媒体的。
-    pub media_found: u64,
+    #[ts(type = "number")] pub media_found: u64,
     /// 读目录 / 读属性失败的次数。数值大通常意味着权限不足（R16）。
-    pub errors: u64,
-    pub hardlinks_skipped: u64,
+    #[ts(type = "number")] pub errors: u64,
+    #[ts(type = "number")] pub hardlinks_skipped: u64,
     pub cancelled: bool,
 
     /// 将要处理的文件数与源字节。**不含跳过项**。
-    pub planned_files: u64,
-    pub planned_bytes: u64,
+    #[ts(type = "number")] pub planned_files: u64,
+    #[ts(type = "number")] pub planned_bytes: u64,
     pub out_bytes: Range,
     pub saved_bytes: Range,
     /// 墙钟总耗时预估：两条队列取较慢的一条（D-42）。
@@ -102,8 +112,8 @@ pub struct ScanReport {
 
     pub groups: Vec<KindGroup>,
     pub skipped: Vec<SkipGroup>,
-    pub skipped_files: u64,
-    pub skipped_bytes: u64,
+    #[ts(type = "number")] pub skipped_files: u64,
+    #[ts(type = "number")] pub skipped_bytes: u64,
     pub dirs: Vec<DirGroup>,
 }
 

@@ -8,13 +8,17 @@
  * 约定：组件里不要直接 `invoke("...")`，一律走这里，命令改名时 TS 会报错。
  */
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type { IpcError } from "./bindings/IpcError";
 import type { JobProgress } from "./bindings/JobProgress";
 import type { Preset } from "./bindings/Preset";
 import type { PresetInfo } from "./bindings/PresetInfo";
 import type { Profile } from "./bindings/Profile";
+import type { RootAccess } from "./bindings/RootAccess";
 import type { SaveResult } from "./bindings/SaveResult";
+import type { ScanProgress } from "./bindings/ScanProgress";
+import type { ScanReport } from "./bindings/ScanReport";
 import type { ToolStatus } from "./bindings/ToolStatus";
 
 export type {
@@ -23,9 +27,18 @@ export type {
   Preset,
   PresetInfo,
   Profile,
+  RootAccess,
   SaveResult,
+  ScanProgress,
+  ScanReport,
   ToolStatus,
 };
+export type { Access } from "./bindings/Access";
+export type { DirGroup } from "./bindings/DirGroup";
+export type { KindGroup } from "./bindings/KindGroup";
+export type { Range } from "./bindings/Range";
+export type { SkipGroup } from "./bindings/SkipGroup";
+export type { SkipReason } from "./bindings/SkipReason";
 export type { AudioProfile } from "./bindings/AudioProfile";
 export type { BitDepth } from "./bindings/BitDepth";
 export type { Chroma } from "./bindings/Chroma";
@@ -49,7 +62,47 @@ export const ipc = {
   checkTools: () => invoke<ToolStatus>("check_tools"),
   jobProgress: (jobId: number) => invoke<JobProgress>("job_progress", { jobId }),
   logPath: () => invoke<string>("log_path"),
+
+  /**
+   * 开始扫描。**立刻返回**，进度和结果都走事件（见 {@link onScan}）——
+   * 扫一块归档盘要几分钟，挂在 promise 上用户连取消都点不到。
+   */
+  scanStart: (roots: string[]) => invoke<void>("scan_start", { roots }),
+  scanCancel: () => invoke<void>("scan_cancel"),
+  /** 开扫前探权限：TCC 拒绝时只会读到 0 个文件，不先探就无从解释（R16）。 */
+  checkAccess: (paths: string[]) => invoke<RootAccess[]>("check_access", { paths }),
+  openPrivacySettings: () => invoke<void>("open_privacy_settings"),
 };
+
+/** 事件名与后端 `commands::scan` 里的常量一一对应，改名必须两边一起改。 */
+const SCAN_PROGRESS = "scan://progress";
+const SCAN_REPORT = "scan://report";
+
+/**
+ * 订阅一次扫描的全部事件，返回退订函数。
+ *
+ * 两个监听一起注册、一起退订：只退一半会留下一个孤儿监听器，下次扫描时
+ * 同一个回调被触发两次，进度就会莫名其妙地跳。
+ */
+export function onScan(handlers: {
+  progress: (p: ScanProgress) => void;
+  report: (r: ScanReport) => void;
+}): () => void {
+  const pending: Promise<UnlistenFn>[] = [
+    listen<ScanProgress>(SCAN_PROGRESS, (e) => handlers.progress(e.payload)),
+    listen<ScanReport>(SCAN_REPORT, (e) => handlers.report(e.payload)),
+  ];
+  let stopped = false;
+  // listen() 是异步的，退订可能在注册完成之前就被调用（用户点得快，或
+  // StrictMode 立刻重跑一次 effect），所以这里要记住「已经停了」。
+  void Promise.all(pending).then((fns) => {
+    if (stopped) fns.forEach((f) => f());
+  });
+  return () => {
+    stopped = true;
+    pending.forEach((p) => void p.then((f) => f()));
+  };
+}
 
 /**
  * 把 invoke 抛出的东西收敛成 IpcError。

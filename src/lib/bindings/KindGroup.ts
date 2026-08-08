@@ -5,4 +5,4 @@ import type { Range } from "./Range";
 /**
  * 按媒体类型的一组。
  */
-export type KindGroup = { kind: MediaKind, files: bigint, src_bytes: bigint, out_bytes: Range, seconds: Range, };
+export type KindGroup = { kind: MediaKind, files: number, src_bytes: number, out_bytes: Range, seconds: Range, };

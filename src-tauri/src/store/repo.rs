@@ -49,17 +49,19 @@ impl MediaKind {
 /// 任务面板要展示的汇总。一次查询算完，避免前端拉全表自己数。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, TS)]
 #[ts(export, export_to = "../../src/lib/bindings/")]
+/// `#[ts(type = "number")]` 的理由见 [`crate::scan::report`] 的模块文档：
+/// IPC 走 JSON，u64 到前端就是 `number`，声明成 `bigint` 会在运行时炸。
 pub struct JobProgress {
-    pub total: u64,
-    pub done: u64,
-    pub failed: u64,
-    pub skipped: u64,
-    pub pending: u64,
-    pub running: u64,
+    #[ts(type = "number")] pub total: u64,
+    #[ts(type = "number")] pub done: u64,
+    #[ts(type = "number")] pub failed: u64,
+    #[ts(type = "number")] pub skipped: u64,
+    #[ts(type = "number")] pub pending: u64,
+    #[ts(type = "number")] pub running: u64,
     /// 已完成条目的源文件总字节。
-    pub src_bytes: u64,
+    #[ts(type = "number")] pub src_bytes: u64,
     /// 对应的输出总字节，两者相减即为已省下的空间。
-    pub dst_bytes: u64,
+    #[ts(type = "number")] pub dst_bytes: u64,
 }
 
 impl Db {

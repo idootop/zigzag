@@ -11,20 +11,20 @@ export type ScanReport = { roots: Array<string>,
 /**
  * 遍历到的普通文件总数（含非媒体）。
  */
-files_seen: bigint, 
+files_seen: number, 
 /**
  * 其中被认作媒体的。
  */
-media_found: bigint, 
+media_found: number, 
 /**
  * 读目录 / 读属性失败的次数。数值大通常意味着权限不足（R16）。
  */
-errors: bigint, hardlinks_skipped: bigint, cancelled: boolean, 
+errors: number, hardlinks_skipped: number, cancelled: boolean, 
 /**
  * 将要处理的文件数与源字节。**不含跳过项**。
  */
-planned_files: bigint, planned_bytes: bigint, out_bytes: Range, saved_bytes: Range, 
+planned_files: number, planned_bytes: number, out_bytes: Range, saved_bytes: Range, 
 /**
  * 墙钟总耗时预估：两条队列取较慢的一条（D-42）。
  */
-seconds: Range, cpu_seconds: Range, hw_seconds: Range, groups: Array<KindGroup>, skipped: Array<SkipGroup>, skipped_files: bigint, skipped_bytes: bigint, dirs: Array<DirGroup>, };
+seconds: Range, cpu_seconds: Range, hw_seconds: Range, groups: Array<KindGroup>, skipped: Array<SkipGroup>, skipped_files: number, skipped_bytes: number, dirs: Array<DirGroup>, };

@@ -8,4 +8,4 @@ export type SkipGroup = { reason: SkipReason,
 /**
  * 面向用户的说明，直接取自 [`SkipReason::message`]，前端不必自己维护一份文案。
  */
-message: string, files: bigint, bytes: bigint, };
+message: string, files: number, bytes: number, };

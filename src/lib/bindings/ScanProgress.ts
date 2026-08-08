@@ -3,11 +3,11 @@
 /**
  * 扫描期间的增量进度。发给前端的频率由调用方节流（~10 Hz，R10）。
  */
-export type ScanProgress = { files_seen: bigint, media_found: bigint, 
+export type ScanProgress = { files_seen: number, media_found: number, 
 /**
  * 已完成探测的文件数。它才是进度条该跟的数——遍历比探测快得多。
  */
-analyzed: bigint, bytes: bigint, 
+analyzed: number, bytes: number, 
 /**
  * 正在处理的路径，给用户一点「它没卡死」的确证。
  */

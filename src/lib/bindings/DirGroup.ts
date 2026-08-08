@@ -7,4 +7,4 @@ export type DirGroup = {
 /**
  * 显示名。root 下的一级子目录名，直接躺在 root 里的文件归到 root 自己的名字。
  */
-name: string, path: string, files: bigint, bytes: bigint, };
+name: string, path: string, files: number, bytes: number, };

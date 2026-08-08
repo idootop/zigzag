@@ -128,6 +128,30 @@ fn is_target_audio_codec(codec: Option<&str>) -> bool {
     matches!(codec, Some("aac") | Some("aac_latm"))
 }
 
+/// 这段音频重编码后还能不能变小。
+///
+/// AAC-LC 是 CBR，**产物大小只取决于目标码率与时长，与源码率无关**。实测同一
+/// 段 120 s 素材转 128k，六个不同源码率的产物全都是 1897 KB：
+///
+/// | 源码率 kbps | 48 | 64 | 96 | 128 | 160 | 192 |
+/// |---|---|---|---|---|---|---|
+/// | 体积变化 | +170% | +102% | +35% | +1.1% | −19% | −33% |
+///
+/// 所以源码率低于目标码率时，压缩只会让文件变大——这在归档盘上不是边角
+/// 情况，早年的 128k MP3、播客和语音备忘录全都落在这一档。编一遍再靠
+/// 事后闸门丢弃当然也能得到正确结果，但白烧一次 CPU，报告里还会多出
+/// 一批注定省不下空间的文件。
+///
+/// 时长未知时返回 `true`：宁可编一趟交给事后闸门，也不误杀。
+fn audio_can_shrink(p: &Probed, cfg: &Profile) -> bool {
+    let Some(secs) = p.duration_us.map(|us| us as f64 / 1e6).filter(|s| *s > 0.0) else {
+        return true;
+    };
+    let predicted = cfg.audio.bitrate_kbps as f64 * 1000.0 / 8.0 * secs;
+    let required = p.size_bytes as f64 * (1.0 - cfg.output.min_gain_percent as f64 / 100.0);
+    predicted < required
+}
+
 /// 该跳过就返回原因，该处理返回 `None`。
 pub fn decide(p: &Probed, cfg: &Profile) -> Option<SkipReason> {
     let class = p.class;
@@ -185,6 +209,9 @@ pub fn decide(p: &Probed, cfg: &Profile) -> Option<SkipReason> {
                 && matches!(p.ext.as_str(), "m4a" | "m4b")
             {
                 return Some(SkipReason::AlreadyOptimal);
+            }
+            if cfg.output.skip_no_gain && !audio_can_shrink(p, cfg) {
+                return Some(SkipReason::NoGain);
             }
         }
     }
@@ -363,6 +390,57 @@ mod tests {
         // 裸 AAC 流仍要换进 m4a 容器才能好好预览。
         let raw_aac = Probed { ext: "aac".into(), codec: Some("aac".into()), ..audio() };
         assert_eq!(decide(&raw_aac, &cfg), None);
+    }
+
+    /// 120 s 素材，源码率 kbps → 文件字节数。
+    fn mp3(kbps: u32) -> Probed {
+        Probed {
+            codec: Some("mp3".into()),
+            duration_us: Some(120 * 1_000_000),
+            ..Probed::new(Class::Audio, "mp3", (kbps as u64 * 1000 / 8) * 120)
+        }
+    }
+
+    #[test]
+    fn audio_below_the_target_bitrate_is_not_worth_encoding() {
+        // 实测：120 s 素材转 128k，产物恒为 1897 KB，与源码率无关。低码率源
+        // 只会变大——48k 涨 170%、64k 涨 102%、96k 涨 35%、128k 涨 1.1%。
+        let cfg = Profile::default(); // 目标 128 kbps，min_gain 5%
+        for kbps in [48, 64, 96, 128] {
+            assert_eq!(
+                decide(&mp3(kbps), &cfg),
+                Some(SkipReason::NoGain),
+                "{kbps}k 源转 128k 只会变大或持平，不该排进队列"
+            );
+        }
+        // 160k 实测省 19%，过得了 5% 的收益线。
+        assert_eq!(decide(&mp3(160), &cfg), None);
+        assert_eq!(decide(&mp3(192), &cfg), None);
+    }
+
+    #[test]
+    fn the_gain_threshold_moves_with_the_target_bitrate() {
+        // 用户把目标调到 64k，那 96k 的源就重新变得值得压了。
+        let mut cfg = Profile::default();
+        cfg.audio.bitrate_kbps = 64;
+        assert_eq!(decide(&mp3(96), &cfg), None);
+        assert_eq!(decide(&mp3(64), &cfg), Some(SkipReason::NoGain));
+    }
+
+    #[test]
+    fn unknown_duration_falls_through_to_the_post_encode_gate() {
+        // 时长探不出来就没法预判，宁可编一趟也不误杀。
+        let cfg = Profile::default();
+        assert_eq!(decide(&Probed { duration_us: None, ..mp3(48) }, &cfg), None);
+        assert_eq!(decide(&Probed { duration_us: Some(0), ..mp3(48) }, &cfg), None);
+    }
+
+    #[test]
+    fn turning_off_the_no_gain_gate_also_turns_off_the_prediction() {
+        // 关掉「无收益就跳过」意味着用户要的是「照压不误」，预判不能自作主张。
+        let mut cfg = Profile::default();
+        cfg.output.skip_no_gain = false;
+        assert_eq!(decide(&mp3(48), &cfg), None);
     }
 
     #[test]
