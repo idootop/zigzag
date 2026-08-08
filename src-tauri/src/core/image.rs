@@ -243,9 +243,9 @@ mod tests {
         d
     }
 
-    fn real(name: &str) -> Option<std::path::PathBuf> {
-        let p = std::path::PathBuf::from("/private/tmp/zzimg").join(name);
-        p.exists().then_some(p)
+    /// 真机图片素材，见 PROGRESS.md「素材集」。缺了就炸——见 `testutil`。
+    fn real(name: &str) -> std::path::PathBuf {
+        crate::testutil::media(&format!("image/{name}"))
     }
 
     /// 短边上限调小到肯定能压出收益，避免测试被 no-gain 闸门挡掉。
@@ -257,8 +257,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "需要真实素材"]
     fn compresses_a_jpeg_end_to_end() {
-        let Some(src) = real("iphone.jpg") else { return };
+        let src = real("iphone.jpg");
         let d = dir("jpeg");
         let dst = d.join("out.avif");
 
@@ -272,10 +273,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "需要真实素材"]
     fn falls_back_to_imageio_for_heic() {
         // HEIC 是近几年 iPhone 的默认格式，`image` crate 不认——这条兜底路径
         // 断了等于半个归档盘处理不了。
-        let Some(src) = real("iphone.heic") else { return };
+        let src = real("iphone.heic");
         let d = dir("heic");
         let dst = d.join("out.avif");
 
@@ -287,25 +289,27 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "需要真实素材"]
     fn detects_animation_only_where_it_exists() {
         // 判错方向不同后果不同：动图被当静态图只剩首帧（信息丢失），
         // 静态图被当动图只是绕了一圈 ffmpeg（no-gain 闸门兜底）。
         for name in ["anim.gif", "anim.png", "anim.webp", "still.gif"] {
-            let Some(p) = real(name) else { continue };
+            let p = real(name);
             assert!(is_animated(&p), "{name} 该被认成动图");
         }
         for name in ["iphone.jpg", "shot.png", "a.webp"] {
-            let Some(p) = real(name) else { continue };
+            let p = real(name);
             assert!(!is_animated(&p), "{name} 是静态图，不该走 ffmpeg");
         }
     }
 
     #[test]
+    #[ignore = "需要真实素材"]
     fn compresses_animations_end_to_end() {
         // 三种动图容器各走一遍：GIF 走 gif 解复用器，APNG 走 apng，
         // 动画 WebP 走 webp_anim——最后一个只有随包的 ffmpeg 9.0 才有。
         for name in ["anim.gif", "anim.png", "anim.webp"] {
-            let Some(src) = real(name) else { continue };
+            let src = real(name);
             let d = dir(&format!("anim-{name}"));
             let dst = d.join("out.avif");
 
@@ -326,11 +330,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "需要真实素材"]
     fn a_variable_delay_gif_keeps_its_frame_count() {
         // 真实的 GIF 逐帧延时基本都不一样。ffmpeg 默认会按最短的那一帧把整段
         // 铺成恒定帧率，6 帧变 63 帧、体积翻倍——时长看着是对的，所以这个问题
         // 只能靠数帧数发现（D-62）。
-        let Some(src) = real("vardelay.gif") else { return };
+        let src = real("vardelay.gif");
         let d = dir("vardelay");
         let dst = d.join("out.avif");
         compress(&src, &dst, &cfg(0)).unwrap();
@@ -354,10 +359,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "需要真实素材"]
     fn a_single_frame_gif_is_caught_by_the_no_gain_gate() {
         // 单帧 GIF 走动图路径会变大（实测 586 → 1519 B）。这里不去数帧数
         // 提前分流，靠的就是闸门——所以闸门必须真的拦得住。
-        let Some(src) = real("still.gif") else { return };
+        let src = real("still.gif");
         let d = dir("still-gif");
         let dst = d.join("out.avif");
 
@@ -368,8 +374,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "需要真实素材"]
     fn output_keeps_the_source_timestamp() {
-        let Some(src) = real("iphone.jpg") else { return };
+        let src = real("iphone.jpg");
         let d = dir("mtime");
         let dst = d.join("out.avif");
         compress(&src, &dst, &cfg(720)).unwrap();
@@ -381,9 +388,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "需要真实素材"]
     fn metadata_policy_reaches_the_output() {
         // 端到端地验一次：策略接线断在管线里，单测 apply_policy 是看不出来的。
-        let Some(src) = real("iphone.jpg") else { return };
+        let src = real("iphone.jpg");
         let d = dir("meta");
 
         let read_exif = |p: &Path| {
@@ -409,8 +417,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "需要真实素材"]
     fn a_broken_file_fails_without_leaving_anything() {
-        let Some(src) = real("trunc.jpg") else { return };
+        let src = real("trunc.jpg");
         let d = dir("broken");
         let dst = d.join("out.avif");
 
@@ -422,12 +431,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "需要真实素材"]
     fn handles_the_odd_pixel_formats() {
         // 归档盘里这几种都不罕见：Lightroom 导的 16-bit、扫描件的灰度、
         // 抠图留下的 alpha、印刷稿的 CMYK。它们的共同点是不走 RGB8 主路，
         // 中间表示只要漏了一种就整类文件压不了——而这在日常素材上测不出来。
         for name in ["deep16.png", "gray.png", "alpha.png", "cmyk.jpg", "one.png"] {
-            let Some(src) = real(name) else { continue };
+            let src = real(name);
             let d = dir(&format!("odd-{name}"));
             let dst = d.join("out.avif");
 
@@ -439,10 +449,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "需要真实素材"]
     fn handles_a_very_tall_screenshot() {
         // 长截图的短边小于上限，所以完全不缩放，直接以 750×30000 进编码器。
         // 40:1 的长宽比是网页长截图的常态，不是臆想出来的边界。
-        let Some(src) = real("tall.png") else { return };
+        let src = real("tall.png");
         let d = dir("tall");
         let dst = d.join("out.avif");
 
@@ -453,8 +464,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "需要真实素材"]
     fn an_already_small_image_is_not_upscaled() {
-        let Some(src) = real("plain.jpg") else { return };
+        let src = real("plain.jpg");
         let d = dir("small");
         let dst = d.join("out.avif");
         let r = compress(&src, &dst, &cfg(4096)).unwrap();

@@ -231,15 +231,15 @@ fn exif_chunk(bytes: &[u8]) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    /// 实机素材。缺了就跳过——CI 上不该因为没有 iPhone 照片而失败。
-    fn fixture(name: &str) -> Option<std::path::PathBuf> {
-        let p = std::path::PathBuf::from("/private/tmp/zzimg").join(name);
-        p.exists().then_some(p)
+    /// 实机素材，见 PROGRESS.md「素材集」。缺了就炸——见 `testutil`。
+    fn fixture(name: &str) -> std::path::PathBuf {
+        crate::testutil::media(&format!("image/{name}"))
     }
 
     #[test]
+    #[ignore = "需要真实素材"]
     fn decodes_heic() {
-        let Some(p) = fixture("photo.heic") else { return };
+        let p = fixture("photo.heic");
         let raw = decode(&p).unwrap();
         assert!(raw.width > 0 && raw.height > 0);
         assert_eq!(raw.rgba.len(), raw.width as usize * raw.height as usize * 4);
@@ -248,10 +248,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "需要真实素材"]
     fn keeps_exif_from_heic() {
         // HEIF 家族的 EXIF 在 meta 盒的 Exif item 里，不是 JPEG 那种 APP1。
         // 这条断言真正验证的是 kamadak-exif 的 isobmff 分支被走到了。
-        let Some(p) = fixture("exif.heic") else { return };
+        let p = fixture("exif.heic");
         let exif = decode(&p).unwrap().exif.expect("拍摄参数不能在兜底路径上丢掉");
         assert!(
             exif.starts_with(b"II") || exif.starts_with(b"MM"),
@@ -261,27 +262,30 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "需要真实素材"]
     fn drops_the_synthesized_srgb_profile() {
         // D-58：CG 对没有 profile 的文件也会合成一份 3144 B 的通用 sRGB。
         // 带走它就是每张图白搭 3 KB，而 CP=1/TC=13 是 0 字节的等价表达。
         for name in ["plain.jpg", "shot.png", "photo.heic"] {
-            let Some(p) = fixture(name) else { continue };
+            let p = fixture(name);
             assert!(decode(&p).unwrap().icc.is_none(), "{name}：合成的 sRGB profile 不该带出来");
         }
     }
 
     #[test]
+    #[ignore = "需要真实素材"]
     fn keeps_a_wide_gamut_profile() {
         // 反面：真的广色域 profile 丢了就是肉眼可见的褪色，必须留住。
-        let Some(p) = fixture("p3.jpg") else { return };
+        let p = fixture("p3.jpg");
         let icc = decode(&p).unwrap().icc.expect("Display P3 的 profile 必须留住");
         assert!(icc.len() > 100 && icc.len() < 3000, "P3 profile 大小异常: {} B", icc.len());
     }
 
     #[test]
+    #[ignore = "需要真实素材"]
     fn decodes_cmyk_jpeg_by_converting_to_rgb() {
         // CMYK 是 image crate 读不了的边界情况之一，正是这条路径存在的理由。
-        let Some(p) = fixture("cmyk.jpg") else { return };
+        let p = fixture("cmyk.jpg");
         let raw = decode(&p).unwrap();
         assert_eq!(raw.rgba.len(), raw.width as usize * raw.height as usize * 4);
         // 源的 CMYK profile 实测 55 KB，而且转换之后它描述的已经不是产物的像素了。

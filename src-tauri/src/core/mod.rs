@@ -6,5 +6,6 @@
 pub mod audio;
 pub mod estimate;
 pub mod image;
+pub mod orchestrator;
 pub mod policy;
 pub mod video;

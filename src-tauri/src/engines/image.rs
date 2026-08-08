@@ -474,10 +474,9 @@ mod tests {
 
     // ---- 元数据策略（D-57）----
 
-    /// 真机素材。没有就跳过——CI 上没有这些文件不该让测试变红。
-    fn real(name: &str) -> Option<std::path::PathBuf> {
-        let p = std::path::PathBuf::from("/private/tmp/zzimg").join(name);
-        p.exists().then_some(p)
+    /// 真机素材，见 PROGRESS.md「素材集」。缺了就炸——见 `testutil`。
+    fn real(name: &str) -> std::path::PathBuf {
+        crate::testutil::media(&format!("image/{name}"))
     }
 
     /// 这段 EXIF 里还有没有 GPS 段。用独立解析器判定，不复用被测代码的结论。
@@ -505,10 +504,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "需要真实素材"]
     fn keeping_metadata_copies_it_byte_for_byte() {
         // D-61：保留 = 一个字节都不动。任何「只改一点点」都可能把 MakerNote
         // 写废，而那是没有解析器能验、用户也发现不了的损坏。
-        let Some(p) = real("iphone.jpg") else { return };
+        let p = real("iphone.jpg");
         let mut m = decode(&p).unwrap().meta;
         let before = m.exif.clone().expect("素材得带 EXIF，否则这条测试是空跑");
         assert!(has_gps(&before), "素材得带 GPS，否则下面那条断言是空跑");

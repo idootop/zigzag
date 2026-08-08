@@ -91,9 +91,9 @@ where
 mod tests {
     use super::*;
 
-    fn real(name: &str) -> Option<PathBuf> {
-        let p = PathBuf::from("/private/tmp/zzaud").join(name);
-        p.exists().then_some(p)
+    /// 真实音频素材，见 PROGRESS.md「素材集」。缺了就炸——见 `testutil`。
+    fn real(name: &str) -> PathBuf {
+        crate::testutil::media(&format!("audio/{name}"))
     }
 
     fn dir(tag: &str) -> PathBuf {
@@ -104,8 +104,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "需要真实素材"]
     async fn compresses_a_lossless_source_end_to_end() {
-        let Some(src) = real("music.flac") else { return };
+        let src = real("music.flac");
         let d = dir("flac");
 
         let mut seen: Vec<f64> = Vec::new();
@@ -119,10 +120,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "需要真实素材"]
     async fn an_aac_source_is_remuxed_bit_for_bit() {
         // 只换容器就该是零损耗的位流搬运。这条测试比对的是**音频数据本身**，
         // 不是文件大小——容器开销会变，音频码流一个字节都不能变。
-        let Some(src) = real("music.aac") else { return };
+        let src = real("music.aac");
         let d = dir("remux");
         let r = compress(&src, &d.join("out.m4a"), &Profile::default(), |_| {}).await.unwrap();
         assert_eq!(r.route, Route::Remux);
@@ -150,10 +152,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "需要真实素材"]
     async fn cover_art_survives_the_pipeline() {
         // D-70：选 m4a 而不是 Opus 的全部理由就是「在 Apple 生态里体验完整」，
         // 而丢封面恰恰破坏的就是这个理由。
-        let Some(src) = real("cover.mp3") else { return };
+        let src = real("cover.mp3");
         let d = dir("cover");
         let r = compress(&src, &d.join("out.m4a"), &Profile::default(), |_| {}).await.unwrap();
 
@@ -164,8 +167,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "需要真实素材"]
     async fn tags_survive_the_pipeline() {
-        let Some(src) = real("cover.mp3") else { return };
+        let src = real("cover.mp3");
         let d = dir("tags");
         let r = compress(&src, &d.join("out.m4a"), &Profile::default(), |_| {}).await.unwrap();
 
@@ -178,8 +182,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "需要真实素材"]
     async fn the_extension_is_rewritten_to_m4a() {
-        let Some(src) = real("music.flac") else { return };
+        let src = real("music.flac");
         let d = dir("ext");
         let r = compress(&src, &d.join("out.flac"), &Profile::default(), |_| {}).await.unwrap();
         assert_eq!(r.dst, d.join("out.m4a"));

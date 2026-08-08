@@ -23,6 +23,8 @@ pub mod logging;
 pub mod platform;
 pub mod scan;
 pub mod store;
+#[cfg(test)]
+mod testutil;
 
 use std::sync::{Arc, Mutex};
 

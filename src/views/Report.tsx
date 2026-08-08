@@ -189,26 +189,40 @@ function KindTable({ groups }: { groups: KindGroup[] }) {
   );
 }
 
-/** 两条队列。 */
+/**
+ * 两条队列——就是调度器真正的那两个派发循环（`core::orchestrator`）：
+ * 重活（视频）一条，轻活（图片 + 音频）一条。
+ *
+ * 条形长度是「串行跑完要多久」，总计是折过并发之后的墙钟，所以两条**不会**
+ * 加起来等于总计。这个差额正是并发省下的时间，值得明说一句。
+ */
 function Lanes({ report }: { report: ScanReport }) {
-  const cpu = report.cpu_seconds.mid;
-  const hw = report.hw_seconds.mid;
-  const max = Math.max(cpu, hw, 1);
+  const video = report.video_seconds.mid;
+  const light = report.light_seconds.mid;
+  const max = Math.max(video, light, 1);
+  const serial = video + light;
   return (
     <div className="flex flex-col gap-3">
-      <Lane label="CPU 编码" hint="x265 / AVIF / AAC" seconds={cpu} ratio={cpu / max} tone="primary" />
       <Lane
-        label="媒体引擎"
-        hint="VideoToolbox 硬件编码"
-        seconds={hw}
-        ratio={hw / max}
+        label="视频"
+        hint="同时跑 2 件"
+        seconds={video}
+        ratio={video / max}
+        tone="primary"
+        idle={video <= 0}
+      />
+      <Lane
+        label="图片与音频"
+        hint="铺满剩余核心"
+        seconds={light}
+        ratio={light / max}
         tone="good"
-        idle={hw <= 0}
+        idle={light <= 0}
       />
       <p className="text-xs text-muted-foreground">
         总计 {formatEta(report.seconds.mid)}
-        {hw > 0 && cpu > 0 && "：两条是各自独立的硅片，同时开工，所以不是相加"}
-        {hw <= 0 && "。本次没有文件走硬件编码——它只接手大文件（默认 1 GB 或 10 分钟以上）"}
+        {serial > report.seconds.mid * 1.1 &&
+          `——两条队列并发处理，比一件件排队跑省下约 ${formatEta(serial - report.seconds.mid)}`}
       </p>
     </div>
   );

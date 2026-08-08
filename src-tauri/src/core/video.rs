@@ -124,10 +124,9 @@ fn finish(
 mod tests {
     use super::*;
 
-    /// 实拍与录屏素材，见 PROGRESS.md 基准 9。没有素材就跳过，不让缺素材变成红灯。
-    fn real(name: &str) -> Option<PathBuf> {
-        let p = PathBuf::from("/private/tmp/zzvid/real").join(name);
-        p.exists().then_some(p)
+    /// 实拍与录屏素材，见 PROGRESS.md 基准 9。缺了就炸——见 `testutil`。
+    fn real(name: &str) -> PathBuf {
+        crate::testutil::media(&format!("video/{name}"))
     }
 
     fn dir(tag: &str) -> PathBuf {
@@ -145,8 +144,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "需要真实素材"]
     async fn compresses_a_real_clip_end_to_end() {
-        let Some(src) = real("motion1080.mp4") else { return };
+        let src = real("motion1080.mp4");
         let d = dir("basic");
         let dst = d.join("out.mp4");
 
@@ -168,9 +168,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "需要真实素材"]
     async fn scales_and_drops_frame_rate() {
         // 3456×2234 @58.7fps 的录屏：短边 2234 要缩到 1080，帧率要降到 30。
-        let Some(src) = real("screen.mov") else { return };
+        let src = real("screen.mov");
         let d = dir("scale");
         let dst = d.join("out.mp4");
 
@@ -185,9 +186,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "需要真实素材"]
     async fn the_extension_follows_the_container_not_the_caller() {
         // 调用方永远给 .mp4；字幕装不进去时产物必须落到 .mkv，且报告里说的是真话。
-        let Some(src) = real("motion1080.mp4") else { return };
+        let src = real("motion1080.mp4");
         let d = dir("ext");
         let dst = d.join("out.mp4");
         let r = compress(&src, &dst, &cfg(), |_| {}).await.unwrap();
@@ -198,10 +200,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "需要真实素材"]
     async fn the_quality_gate_rejects_a_deliberately_bad_encode() {
         // 门禁得真的拦得住，而不只是算个分数记在报告里。CRF 51 是 x265 的下限档，
         // 画面糊到没法看——这种产物哪怕体积只有零头也绝不能替换原文件。
-        let Some(src) = real("motion1080.mp4") else { return };
+        let src = real("motion1080.mp4");
         let d = dir("gate");
         let dst = d.join("out.mp4");
 
@@ -221,9 +224,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "需要真实素材"]
     async fn the_default_profile_clears_the_gate() {
         // 如果默认档自己都过不去，那不是素材的问题，是门槛或默认参数定错了。
-        let Some(src) = real("motion1080.mp4") else { return };
+        let src = real("motion1080.mp4");
         let d = dir("gate-pass");
         let dst = d.join("out.mp4");
 
@@ -239,10 +243,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "需要真实素材"]
     async fn a_truncated_product_never_reaches_the_destination() {
         // 校验这一步的全部意义。ffprobe 读头对截断文件照样 exit 0，
         // 所以这里只能靠全量解码（基准 9）。
-        let Some(src) = real("motion1080.mp4") else { return };
+        let src = real("motion1080.mp4");
         let d = dir("verify");
         let good = d.join("good.mp4");
         compress(&src, &good, &cfg(), |_| {}).await.unwrap();
@@ -258,8 +263,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "需要真实素材"]
     async fn output_keeps_the_source_timestamp() {
-        let Some(src) = real("motion1080.mp4") else { return };
+        let src = real("motion1080.mp4");
         let d = dir("mtime");
         let r = compress(&src, &d.join("out.mp4"), &cfg(), |_| {}).await.unwrap();
         let a = std::fs::metadata(&src).unwrap().modified().unwrap();
@@ -269,8 +275,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "需要真实素材"]
     async fn a_file_without_a_video_stream_is_rejected_early() {
-        let Some(src) = real("cam720.mp4") else { return };
+        let src = real("cam720.mp4");
         let d = dir("novideo");
         // 只留音频轨，做成一个「视频扩展名、没有视频流」的文件。
         let audio_only = d.join("noviz.mp4");
@@ -297,5 +304,81 @@ mod tests {
         assert!(!dst.exists(), "失败时不能留下产物");
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1, "也不能留下临时文件");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ────────────────────────── 基准：CPU Lane 并发度 ──────────────────────────
+    //
+    // `cargo test --release --lib -- --ignored --nocapture bench_cpu_lane`（约 8 min）。
+    //
+    // 量的是这台机器的物理，不是代码的正确性，所以**不放断言**——换台机器数字就变，
+    // 断言只会变成假红灯。结论以数据形式进 PROGRESS.md。
+
+    /// 已回收子进程累计吃掉的 CPU 秒数（user + sys）。
+    ///
+    /// 墙钟只能告诉我们「快了没有」，这个数字才能分辨**为什么**：并发后墙钟不降、
+    /// 而 CPU 秒数也不涨，说明核早就喂饱了，多开一路只是在同一批核上切片。
+    fn child_cpu_secs() -> f64 {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut ru) };
+        let s = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+        s(ru.ru_utime) + s(ru.ru_stime)
+    }
+
+    /// 把 `files` 全部压一遍，最多 `conc` 路同时跑。返回（总墙钟, 子进程 CPU 秒）。
+    async fn batch(files: &[PathBuf], cfg: &Profile, conc: usize) -> (f64, f64) {
+        let d = dir(&format!("bench{conc}"));
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(conc));
+        let (t0, c0) = (std::time::Instant::now(), child_cpu_secs());
+
+        let mut running = Vec::new();
+        for (i, f) in files.iter().enumerate() {
+            let (sem, f, cfg) = (sem.clone(), f.clone(), cfg.clone());
+            let out = d.join(format!("{i}.mp4"));
+            running.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let t = std::time::Instant::now();
+                let r = compress(&f, &out, &cfg, |_| {}).await.unwrap();
+                let name = f.file_name().unwrap().to_string_lossy().into_owned();
+                (name, t.elapsed().as_secs_f64(), r.vmaf.unwrap_or(0.0))
+            }));
+        }
+        for h in running {
+            let (name, secs, v) = h.await.unwrap();
+            println!("    {name:<16} {secs:6.2}s  vmaf {v:.2}");
+        }
+
+        let (wall, cpu) = (t0.elapsed().as_secs_f64(), child_cpu_secs() - c0);
+        let _ = std::fs::remove_dir_all(&d);
+        (wall, cpu)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "基准：手动跑，约 8 min"]
+    async fn bench_cpu_lane_concurrency() {
+        let names = ["cam720.mp4", "motion1080.mp4", "screen.mov", "ui720.mp4"];
+        let one: Vec<_> = names.iter().map(|n| real(n)).collect();
+        // 每个素材放两份，队列长度 8。4 件时并发 3 的墙钟由「3 路 + 拖一件尾巴」
+        // 决定，量到的是排布不是吞吐——首轮实测并发 3（1.09×）反而低于并发 2
+        // （1.17×），就是这个假象。
+        let files: Vec<_> = one.iter().chain(one.iter()).cloned().collect();
+
+        // 门禁开着：调度器派发的是**整件任务**（编码 + 打分 + 校验），
+        // 只量编码会高估并发收益——打分和校验也是多线程的子进程。
+        let cfg = Profile::default();
+
+        // 交错重复，让热漂移无法伪装成结论：机器越跑越热，顺序跑一遍的话
+        // 排在后面的档位天然吃亏，而这里每个档位在冷热两端各有一次。
+        let mut base = f64::NAN;
+        for conc in [1usize, 2, 4, 1, 2, 4] {
+            let (wall, cpu) = batch(&files, &cfg, conc).await;
+            if conc == 1 && base.is_nan() {
+                base = wall;
+            }
+            println!(
+                "  并发 {conc}: 墙钟 {wall:6.2}s  CPU {cpu:7.2}s  平均吃 {:4.1} 核  加速比 {:.2}×",
+                cpu / wall,
+                base / wall
+            );
+        }
     }
 }

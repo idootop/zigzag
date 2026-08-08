@@ -26,3 +26,6 @@ dist-ssr
 # zigzag
 src-tauri/binaries/
 *.zz-tmp.*
+
+# 测试素材（约 200 MB，见 PROGRESS.md「素材集」）
+/fixtures/

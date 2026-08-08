@@ -9,7 +9,8 @@
 //!    让「约 12 GB」旁边能标出「8~19 GB」。
 //! 2. 跳过项按原因分组**单独列出**，不混进「可省空间」里。用户看到
 //!    「1,204 个文件已是最优」比看到一个虚高的总数有用得多。
-//! 3. 耗时按两条队列分开报，总耗时取 max 而非和（D-42）。
+//! 3. 耗时按调度器真正的两条队列分开报（视频 / 轻活），总耗时按实测的并发
+//!    与合成规则折算，不是把单件耗时一路加下去（D-79）。
 //!
 //! 这个模块是纯的：喂它探测结果，它吐报告。不碰磁盘、不认识 Tauri。
 //!
@@ -105,10 +106,12 @@ pub struct ScanReport {
     #[ts(type = "number")] pub planned_bytes: u64,
     pub out_bytes: Range,
     pub saved_bytes: Range,
-    /// 墙钟总耗时预估：两条队列取较慢的一条（D-42）。
+    /// 墙钟总耗时预估。已按闸门宽度折过并发，见 `estimate::Estimate::wall_clock`。
     pub seconds: Range,
-    pub cpu_seconds: Range,
-    pub hw_seconds: Range,
+    /// 视频队列串行跑完要多久（未折并发）。下面这条是图片与音频。
+    /// 两条**不必**加起来等于 `seconds`——那正是并发省下来的部分。
+    pub video_seconds: Range,
+    pub light_seconds: Range,
 
     pub groups: Vec<KindGroup>,
     pub skipped: Vec<SkipGroup>,
@@ -229,8 +232,8 @@ impl Aggregator {
             out_bytes: self.total.out_bytes,
             saved_bytes: self.total.saved_bytes(),
             seconds: self.total.seconds,
-            cpu_seconds: self.total.cpu_seconds,
-            hw_seconds: self.total.hw_seconds,
+            video_seconds: self.total.video_seconds,
+            light_seconds: self.total.light_seconds,
             groups,
             skipped_files: self.by_reason.values().map(|(n, _)| n).sum(),
             skipped_bytes: self.by_reason.values().map(|(_, b)| b).sum(),
@@ -436,18 +439,21 @@ mod tests {
     }
 
     #[test]
-    fn total_time_is_the_slower_lane_not_the_sum() {
+    fn the_two_queues_are_reported_separately_and_the_total_is_not_their_sum() {
+        // 报告里的两条就是调度器真正的两条派发循环。总耗时折过并发，所以
+        // 一定短于两条相加——把它显示成和，用户会以为工具在串行跑。
         let mut hw = Profile::default();
         hw.video.lane = crate::config::Lane::MediaEngine;
         let mut a = Aggregator::new(hw, vec![root()]);
-        a.add(&root().join("a.jpg"), &jpeg(4 << 20));
+        for i in 0..40 {
+            a.add(&root().join(format!("a{i}.jpg")), &jpeg(4 << 20));
+        }
         a.add(&root().join("v.mp4"), &video(200 << 20));
 
         let r = a.finish();
-        assert!(r.cpu_seconds.mid > 0.0, "图片跑在 CPU 上");
-        assert!(r.hw_seconds.mid > 0.0, "视频跑在媒体引擎上");
-        assert_eq!(r.seconds.mid, r.cpu_seconds.mid.max(r.hw_seconds.mid));
-        assert!(r.seconds.mid < r.cpu_seconds.mid + r.hw_seconds.mid);
+        assert!(r.light_seconds.mid > 0.0, "图片进轻活队列");
+        assert!(r.video_seconds.mid > 0.0, "视频进视频队列");
+        assert!(r.seconds.mid < r.video_seconds.mid + r.light_seconds.mid);
     }
 
     #[test]

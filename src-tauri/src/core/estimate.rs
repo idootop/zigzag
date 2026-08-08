@@ -36,11 +36,18 @@
 //! | x265 medium crf24（输出像素） | 35 ~ 129 Mpx/s，真实素材约 55 |
 //! | avifenc q85 -s7 单线程 | 3.5 Mpx/s（1.56 Mpx 用 0.44 s） |
 //! | aac_at 128k | 216× 实时 |
+//!
+//! 上面三行都是**单件**的吞吐：一段视频独占机器、一张图跑在一个线程上。
+//! 把它们直接累加得到的是「串行跑完要多久」，不是墙钟——调度器同时在跑
+//! 好几件（`core::orchestrator`）。两者的换算见 [`Estimate::wall_clock`]。
+
+use std::sync::OnceLock;
 
 use serde::Serialize;
 use ts_rs::TS;
 
 use crate::config::{Lane, Profile};
+use crate::core::orchestrator::Gates;
 use crate::core::policy::shortedge::fit_short_edge;
 use crate::core::policy::skip::Probed;
 use crate::engines::audio::Route;
@@ -73,6 +80,16 @@ const IMG_MPXPS: f64 = 3.5;
 /// aac_at 相对实时的倍数。
 const AUDIO_REALTIME: f64 = 216.0;
 
+/// 视频队列开到闸门宽度（2）之后的墙钟加速比。基准 11 实测：8 件真实素材
+/// 串行 67.1 s、两路并发 55.3 s。加速比只有 1.21×——x265 自己已经吃掉六七个
+/// 核，第二路只是把剩下的空闲填满（子进程 CPU 秒数几乎不变：425.9 → 433.5）。
+/// 硬编不适用：媒体引擎是固定功能单元，没实测过并发收益，按 1.0 算。
+const VIDEO_CONCURRENCY: f64 = 1.21;
+
+/// 轻活队列的并行加速指数。基准 13 实测 2 路 1.99× / 4 路 3.81× / 8 路 6.58×，
+/// `n^0.9` 给出 1.87 / 3.48 / 6.50，逐点略偏保守——预估宁可报长不报短。
+const LIGHT_SCALING_EXP: f64 = 0.9;
+
 /// 源信息不足以估算时的兜底比例。`already_optimal` 之外的未知情况都用它，
 /// 宁可保守（预估省得少），也不要给出一个乐观到离谱的数字。
 const FALLBACK_RATIO: f64 = 0.5;
@@ -100,18 +117,33 @@ impl Range {
         self.mid += o.mid;
         self.high += o.high;
     }
-    /// 逐项取上界。两条队列并行时总耗时取较慢的一条，不是两条相加。
+    /// 逐项取上界。两条队列跑在不同硅片上时，总耗时取较慢的一条而非相加。
     fn max(self, o: Range) -> Range {
         Range::new(self.low.max(o.low), self.mid.max(o.mid), self.high.max(o.high))
     }
+    fn div(self, k: f64) -> Range {
+        Range::new(self.low / k, self.mid / k, self.high / k)
+    }
+}
+
+/// 这件活派进哪条队列。**必须与 `core::orchestrator` 的分队方式一致**——
+/// 界面上的两条耗时条就是那两个派发循环，对不上就是在骗用户。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Queue {
+    /// 视频队列。`Lane` 标明它跑在哪块硅上，决定它与轻活是相加还是真并行。
+    Video(Lane),
+    /// 轻活队列：图片与音频。
+    Light,
 }
 
 /// 单个文件的预估。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ItemEstimate {
     pub out_bytes: Range,
+    /// **单件**耗时：视频按独占机器算，图片/音频按单线程算。没有除以并发度
+    /// ——并发是队列级的事，在 [`Estimate::wall_clock`] 里一次性折算。
     pub seconds: Range,
-    pub lane: Lane,
+    pub queue: Queue,
 }
 
 /// 一批文件的汇总。
@@ -120,12 +152,14 @@ pub struct Estimate {
     pub files: u64,
     pub src_bytes: u64,
     pub out_bytes: Range,
-    /// 墙钟耗时。两条队列并行，所以取二者较大值而非相加（D-07）。
+    /// 墙钟耗时。见 [`Estimate::wall_clock`]。
     pub seconds: Range,
-    /// 软编队列自己的耗时。界面要分两条队列显示（§9 UI #2）。
-    pub cpu_seconds: Range,
-    /// 媒体引擎队列自己的耗时。
-    pub hw_seconds: Range,
+    /// 视频队列串行跑完的耗时（未折并发）。界面要分两条队列显示（§9 UI #2）。
+    pub video_seconds: Range,
+    /// 轻活队列单线程跑完的耗时（未折并发）。
+    pub light_seconds: Range,
+    /// 视频走的是媒体引擎。D-24 之后档位是全局的，所以一批里不会两种都有。
+    hw_video: bool,
 }
 
 impl Estimate {
@@ -141,11 +175,41 @@ impl Estimate {
             item.out_bytes.high.min(src_bytes as f64),
         );
         self.out_bytes.add(capped);
-        match item.lane {
-            Lane::Cpu => self.cpu_seconds.add(item.seconds),
-            Lane::MediaEngine => self.hw_seconds.add(item.seconds),
+        match item.queue {
+            Queue::Video(lane) => {
+                self.video_seconds.add(item.seconds);
+                self.hw_video = lane == Lane::MediaEngine;
+            }
+            Queue::Light => self.light_seconds.add(item.seconds),
         }
-        self.seconds = self.cpu_seconds.max(self.hw_seconds);
+        self.seconds = self.wall_clock();
+    }
+
+    /// 把两条队列的串行耗时折算成墙钟。
+    ///
+    /// 两步，各有一条实测依据：
+    ///
+    /// 1. **各自折并发**。视频闸门 2，实测只换来 1.21×（x265 本来就吃满六七个
+    ///    核，第二路填的是零头）；轻活闸门 `ncpu-2`，实测近线性（8 路 6.58×）。
+    /// 2. **再合成**。软编时两条队列抢的是同一批核，墙钟是**相加**——基准 12
+    ///    实测混跑 34.2 s、拆成两阶段跑 35.2 s，差 3%，功是守恒的。只有视频走
+    ///    媒体引擎时才是两块独立的硅，那时才取 max（这才是 D-42 成立的前提）。
+    ///
+    /// 这一步以前不存在：调度器还没实现时按「单线程串行求和」报数，图片多的
+    /// 任务会把 ETA 报大六七倍。
+    fn wall_clock(&self) -> Range {
+        let g = gates();
+        let video = self
+            .video_seconds
+            .div(if self.hw_video || g.video <= 1 { 1.0 } else { VIDEO_CONCURRENCY });
+        let light = self.light_seconds.div((g.light as f64).powf(LIGHT_SCALING_EXP));
+        if self.hw_video {
+            video.max(light)
+        } else {
+            let mut total = video;
+            total.add(light);
+            total
+        }
     }
 
     /// 能省下的字节。产物反而更大时算 0，不显示负数。
@@ -154,6 +218,12 @@ impl Estimate {
         // 注意上下界要交叉：产物取上界时省得最少。
         Range::new(s(self.out_bytes.high), s(self.out_bytes.mid), s(self.out_bytes.low))
     }
+}
+
+/// 闸门只探一次。`push` 是按文件调用的，十万文件不该做十万次 `available_parallelism`。
+fn gates() -> Gates {
+    static G: OnceLock<Gates> = OnceLock::new();
+    *G.get_or_init(Gates::detect)
 }
 
 // ---------------------------------------------------------------- 估算
@@ -190,7 +260,7 @@ fn image(p: &Probed, cfg: &Profile) -> ItemEstimate {
     ItemEstimate {
         out_bytes: Range::scaled(mid, IMG_SPREAD),
         seconds: Range::scaled(mpx / IMG_MPXPS, 1.6),
-        lane: Lane::Cpu,
+        queue: Queue::Light,
     }
 }
 
@@ -205,7 +275,7 @@ fn video(p: &Probed, cfg: &Profile) -> ItemEstimate {
         return ItemEstimate {
             out_bytes: Range::scaled(p.size_bytes as f64 * FALLBACK_RATIO, IMG_SPREAD),
             seconds: Range::scaled(10.0, 4.0),
-            lane: cfg.video.lane,
+            queue: Queue::Video(cfg.video.lane),
         };
     }
 
@@ -230,7 +300,7 @@ fn video(p: &Probed, cfg: &Profile) -> ItemEstimate {
             out_px_total / 1e6 / VIDEO_MPXPS / speedup,
             out_px_total / 1e6 / VIDEO_MPXPS_SLOW / speedup,
         ),
-        lane: cfg.video.lane,
+        queue: Queue::Video(cfg.video.lane),
     }
 }
 
@@ -243,7 +313,7 @@ fn audio(p: &Probed, cfg: &Profile) -> ItemEstimate {
             out_bytes: Range::new(bytes * 0.99, bytes, bytes),
             // 搬位流不解码，是纯 I/O，快到不值得按时长算。
             seconds: Range::scaled(0.2, 3.0),
-            lane: Lane::Cpu,
+            queue: Queue::Light,
         };
     }
 
@@ -252,7 +322,7 @@ fn audio(p: &Probed, cfg: &Profile) -> ItemEstimate {
         return ItemEstimate {
             out_bytes: Range::scaled(p.size_bytes as f64 * FALLBACK_RATIO, 1.5),
             seconds: Range::scaled(1.0, 3.0),
-            lane: Lane::Cpu,
+            queue: Queue::Light,
         };
     }
     // 音频是唯一能算准的一档：CBR 之下产物大小就是码率乘时长，不确定性只来自
@@ -261,7 +331,7 @@ fn audio(p: &Probed, cfg: &Profile) -> ItemEstimate {
     ItemEstimate {
         out_bytes: Range::new(bytes * 0.98, bytes * 1.02, bytes * 1.08),
         seconds: Range::scaled(secs / AUDIO_REALTIME, 2.0),
-        lane: Lane::Cpu,
+        queue: Queue::Light,
     }
 }
 
@@ -440,20 +510,41 @@ mod tests {
     }
 
     #[test]
-    fn two_lanes_run_in_parallel_so_time_is_the_max_not_the_sum() {
-        // D-07：CPU 与媒体引擎是独立硅片。把两条队列的耗时相加会把
-        // 「硬编吞吐白送」这个事实抹掉，预估直接翻倍。
+    fn the_light_queue_is_credited_for_running_wide() {
+        // 96 张照片按单线程串行求和是几十秒，实际八路并跑只要几秒。
+        // 不折并发的话，一盘照片的 ETA 会报大六七倍（基准 13）。
         let mut est = Estimate::default();
-        let p = video_probe(1920, 1080, 30.0, 60.0, 100_000_000);
+        let p = Probed { width: 4032, height: 3024, ..Probed::new(Class::Image, "jpg", 4 << 20) };
+        let one = item(&p, &Profile::default());
+        for _ in 0..96 {
+            est.push(4 << 20, one);
+        }
+        let serial = one.seconds.mid * 96.0;
+        assert!(est.light_seconds.mid > serial - 1e-6, "分项耗时保持单线程口径，供界面显示");
+        assert!(est.seconds.mid < serial / 2.0, "墙钟必须折掉并发：串行 {serial:.1}s vs 预估 {:.1}s", est.seconds.mid);
+    }
+
+    #[test]
+    fn software_video_adds_to_the_light_queue_but_hardware_runs_beside_it() {
+        // 基准 12：软编时两条队列抢同一批核，墙钟是相加的（混跑 34.2 s ≈
+        // 分阶段 35.2 s）。只有视频走媒体引擎，才真的是两块硅同时开工。
+        let img = Probed { width: 4032, height: 3024, ..Probed::new(Class::Image, "jpg", 4 << 20) };
+        let vid = video_probe(1920, 1080, 30.0, 60.0, 100_000_000);
         let mut hw_cfg = Profile::default();
         hw_cfg.video.lane = Lane::MediaEngine;
 
-        let cpu = item(&p, &Profile::default());
-        let hw = item(&p, &hw_cfg);
-        est.push(100_000_000, cpu);
-        est.push(100_000_000, hw);
-        assert_eq!(est.seconds.mid, cpu.seconds.mid.max(hw.seconds.mid));
-        assert!(est.seconds.mid < cpu.seconds.mid + hw.seconds.mid);
+        let mut sw = Estimate::default();
+        sw.push(4 << 20, item(&img, &Profile::default()));
+        sw.push(100_000_000, item(&vid, &Profile::default()));
+        let (v, l) = (sw.video_seconds.mid / VIDEO_CONCURRENCY, sw.light_seconds.mid);
+        assert!((sw.seconds.mid - (v + l)).abs() < 0.5, "软编：{:?}", sw.seconds);
+
+        let mut hw = Estimate::default();
+        hw.push(4 << 20, item(&img, &hw_cfg));
+        hw.push(100_000_000, item(&vid, &hw_cfg));
+        let wide = (gates().light as f64).powf(LIGHT_SCALING_EXP);
+        let expect = hw.video_seconds.mid.max(hw.light_seconds.mid / wide);
+        assert!((hw.seconds.mid - expect).abs() < 1e-9, "硬编该取 max：{:?}", hw.seconds);
     }
 
     #[test]

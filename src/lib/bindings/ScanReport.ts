@@ -25,6 +25,11 @@ errors: number, hardlinks_skipped: number, cancelled: boolean,
  */
 planned_files: number, planned_bytes: number, out_bytes: Range, saved_bytes: Range, 
 /**
- * 墙钟总耗时预估：两条队列取较慢的一条（D-42）。
+ * 墙钟总耗时预估。已按闸门宽度折过并发，见 `estimate::Estimate::wall_clock`。
  */
-seconds: Range, cpu_seconds: Range, hw_seconds: Range, groups: Array<KindGroup>, skipped: Array<SkipGroup>, skipped_files: number, skipped_bytes: number, dirs: Array<DirGroup>, };
+seconds: Range, 
+/**
+ * 视频队列串行跑完要多久（未折并发）。下面这条是图片与音频。
+ * 两条**不必**加起来等于 `seconds`——那正是并发省下来的部分。
+ */
+video_seconds: Range, light_seconds: Range, groups: Array<KindGroup>, skipped: Array<SkipGroup>, skipped_files: number, skipped_bytes: number, dirs: Array<DirGroup>, };
