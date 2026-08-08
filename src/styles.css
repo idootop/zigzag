@@ -1,0 +1,161 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+/* ── 设计 token ──────────────────────────────────────────────────────────
+   沿用 shadcn 的语义变量名（background / foreground / primary …），组件才能
+   开箱即用；但取值全部换成本应用的口径：
+
+   1. 字体用系统 SF Pro，不打包 Geist——这是个 macOS 本地工具，
+      系统字重和中文回退（PingFang SC）都比 webfont 正确，也省掉几百 KB。
+   2. 深色模式跟随系统 `prefers-color-scheme`，不用 `.dark` 类手动切。
+      归档任务常在夜里跑，白底刺眼；同时应用没有主题切换入口，
+      跟随系统就是唯一正确的行为。
+   3. 强调色用蓝色（macOS 默认高亮色系），中性灰阶保持 shadcn 的 oklch 阶梯。
+   ──────────────────────────────────────────────────────────────────────── */
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", system-ui,
+    sans-serif;
+  /* 数字用等宽：进度、体积在刷新时不会左右跳动 */
+  --font-mono: "SF Mono", ui-monospace, Menlo, monospace;
+  --font-heading: var(--font-sans);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  /* 任务状态专用色。跟 shadcn 的语义色分开，避免「成功」被主题改掉。 */
+  --color-good: var(--good);
+  --color-warn: var(--warn);
+  --color-bad: var(--destructive);
+
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+}
+
+:root {
+  --radius: 0.625rem;
+
+  --background: oklch(0.985 0 0);
+  --foreground: oklch(0.21 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.21 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.21 0 0);
+
+  --primary: oklch(0.58 0.19 258);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.96 0 0);
+  --secondary-foreground: oklch(0.21 0 0);
+  --muted: oklch(0.96 0 0);
+  --muted-foreground: oklch(0.52 0 0);
+  --accent: oklch(0.95 0.03 258);
+  --accent-foreground: oklch(0.35 0.12 258);
+
+  --destructive: oklch(0.58 0.2 27);
+  --good: oklch(0.62 0.15 152);
+  --warn: oklch(0.72 0.16 75);
+
+  --border: oklch(0.91 0 0);
+  --input: oklch(0.91 0 0);
+  --ring: oklch(0.58 0.19 258);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: oklch(0.17 0 0);
+    --foreground: oklch(0.95 0 0);
+    --card: oklch(0.21 0 0);
+    --card-foreground: oklch(0.95 0 0);
+    --popover: oklch(0.23 0 0);
+    --popover-foreground: oklch(0.95 0 0);
+
+    --primary: oklch(0.68 0.17 258);
+    --primary-foreground: oklch(0.16 0.02 258);
+    --secondary: oklch(0.27 0 0);
+    --secondary-foreground: oklch(0.95 0 0);
+    --muted: oklch(0.27 0 0);
+    --muted-foreground: oklch(0.7 0 0);
+    --accent: oklch(0.3 0.06 258);
+    --accent-foreground: oklch(0.9 0.05 258);
+
+    --destructive: oklch(0.66 0.19 25);
+    --good: oklch(0.7 0.15 152);
+    --warn: oklch(0.78 0.15 75);
+
+    --border: oklch(1 0 0 / 12%);
+    --input: oklch(1 0 0 / 16%);
+    --ring: oklch(0.68 0.17 258);
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    /* 桌面应用不是网页：整页不该被选中或橡皮筋滚动。 */
+    user-select: none;
+    overscroll-behavior: none;
+    @apply bg-background text-foreground font-sans;
+  }
+
+  /* 路径、错误信息这类需要复制出去排查的内容单独开放选中。 */
+  .selectable {
+    user-select: text;
+    cursor: text;
+  }
+
+  /* 系统开了「减弱动态效果」就别再动了。 */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+/* 无边框窗口下，顶部这条区域负责拖动窗口；里面的控件要显式声明 no-drag。 */
+.titlebar-drag {
+  -webkit-app-region: drag;
+}
+.titlebar-drag button,
+.titlebar-drag a,
+.no-drag {
+  -webkit-app-region: no-drag;
+}

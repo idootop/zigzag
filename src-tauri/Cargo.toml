@@ -1,0 +1,39 @@
+[package]
+name = "zigzag"
+version = "0.1.0"
+description = "本地归档多媒体批量压缩工具"
+authors = ["Del Wang"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "zigzag_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "io-util"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+thiserror = "2.0.20"
+tauri-plugin-shell = "2.3.5"
+tauri-plugin-dialog = "2.7.2"
+# 类型导出用 ts-rs 而非 tauri-specta：后者支持 Tauri 2 的版本只有 2.0.0-rc.25，
+# crates.io 上的稳定版 1.0.2 仍是 Tauri 1 的线，会把 webkit2gtk 拖进依赖图并冲突。
+ts-rs = "12.0.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSProcessInfo", "NSString"] }
+

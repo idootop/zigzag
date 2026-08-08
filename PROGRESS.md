@@ -384,7 +384,7 @@ ImageIO 只做**解码**，不参与编码路径——这样既拿到了 HEIC/RA
 | 源类型 | 策略 |
 |---|---|
 | 静图（JPEG / PNG / BMP / TIFF / HEIC …） | 有损 AVIF `-q 85 -y 444 -s 7`（D-25/D-26） |
-| 动图（GIF / APNG / 动画 WebP） | 动画 AVIF，ffmpeg `libaom-av1 -crf 32 -loop 0`（D-27） |
+| 动图（GIF / APNG / 动画 WebP） | 动画 AVIF，ffmpeg `libaom-av1 -crf 32 -loop 0`（D-27）。⚠️ **动画 WebP 需 ffmpeg ≥ 9.0**（`webp_anim` demuxer），8.x 解出 0 帧直接失败，见 ADR-006 |
 
 ⚠️ **色度抽样一律 4:4:4**（D-25）。原 WebP 方案强制 4:2:0，文字/线稿边缘有色边（R17）。ADR-005 基准 5 实测：**截图上 444 比 420 高 13.75 分 SSIMULACRA2，体积只 +2.7%**；而 420 存在天花板，q95 也追不上 444 的 q60。不做「截图判定后切 444」的启发式——照片上 444 只多花 6% 体积，**一律 444 更简单也更安全**。
 
@@ -682,20 +682,22 @@ zigzag/
 | **R19** | **D-03 路由方向性存疑** | 硬编等质量体积接近 ×2（ADR-004 基准 3b），而路由恰好把最大的文件送去硬编 | 三个候选方案见 ADR-004，**待用户拍板**。在此之前 §6.2 保持原样 |
 | **R15** | **系统休眠中断通宵任务** | 早上起来发现只跑了 20 分钟 | `beginActivity(.idleSystemSleepDisabled)`（§6.1），且必须在任务结束/暂停时释放 |
 | **R16** | **外置卷 TCC 权限被拒** | 扫描直接失败，报错难懂 | 启动时探测可读性，引导到系统设置（§8） |
+| **R21** | **ffmpeg 读回动画 AVIF 只认 1 帧** | §8 完整性校验若用帧数判定，会把正确的动画 AVIF 全判成损坏 | ffmpeg 优先取 `pitm` 静态主图项，8.1/9.0 一致（非回归）。动画 AVIF 的校验走 ImageIO `CGImageSourceGetCount()`，见 ADR-006 |
 
 ### 12. 里程碑与任务清单
 
 > 约定：完成一项即勾选，并在 §13 CHANGELOG 追加一行。M0~M3 是能跑通的最小闭环。
 
-#### M0 · 骨架（可运行的空壳）
-- [ ] `create-tauri-app` 初始化：Tauri 2 + React + TS + Vite
-- [ ] 接入 Tailwind 4 + shadcn/ui，确定设计 token
-- [ ] ffmpeg / ffprobe sidecar 打包配置（`aarch64-apple-darwin` 单目标 + `externalBin` + 授权协议核查）
-- [ ] `engines/ffmpeg.rs`：子进程封装、`-progress pipe:1` 解析、超时与 kill
-- [ ] SQLite 初始化 + migration 机制
-- [ ] IPC 骨架：`commands/` + 类型化事件，前后端类型由 Rust 侧生成（ts-rs 或 specta）
-- [ ] `platform/` FFI 骨架：`objc2` 接入验证（先打通 `power.rs` 一个最小用例）
-- [ ] `tracing` 日志 + 崩溃日志落盘
+#### M0 · 骨架（可运行的空壳）—— ✅ **已完成**（ADR-007）
+- [x] `create-tauri-app` 初始化：Tauri 2 + React 19 + TS 5.8 + Vite 7
+- [x] 接入 Tailwind 4 + shadcn/ui，确定设计 token
+- [x] ffmpeg / ffprobe sidecar 打包配置（`aarch64-apple-darwin` 单目标 + `externalBin` + 授权协议核查）→ **ffmpeg 9.0**，见 ADR-006 / D-28~D-30
+- [x] `engines/ffmpeg.rs`：子进程封装、`-progress pipe:1` 解析、超时与 kill
+- [x] SQLite 初始化 + migration 机制（`PRAGMA user_version` + WAL）
+- [x] IPC 骨架：`commands/` + 前端类型由 **ts-rs** 从 Rust 生成（D-31）
+- [x] `platform/` FFI 骨架：`objc2` 接入验证（`power.rs` 防休眠已打通）
+- [x] `tracing` 日志 + 崩溃日志落盘
+- [x] **配置层 + 设置界面**（用户追加需求）：全部上限参数开放可配 + 四档预设（D-34）
 
 #### M1 · 扫描与分析（先做 Dry-run，最早可交付的价值）
 - [ ] `scan/walker.rs`：jwalk 并行遍历、排除规则、符号链接与硬链接处理
@@ -1067,6 +1069,160 @@ pikafish-demo.gif : 帧数=64  UTI=com.compuserve.gif
 
 ---
 
+## 2026-08-08 · ffmpeg sidecar 升级到 9.0（ADR-006）
+
+**状态**：已完成并落地，`scripts/fetch-sidecars.sh` 已重新锚定，自检通过。
+
+### 决议记录
+
+| 编号 | 决议 | 依据 |
+|---|---|---|
+| D-28 | **sidecar 升级到 ffmpeg 9.0，构建源换成 `ffmpeg.martin-riedl.de`** | 截至 2026-08-08，这是**唯一**提供 macOS arm64 原生静态 9.0 的构建。osxexperts（原用源）尚无 9.x arm 包；evermeet 只有 Intel；homebrew-core 的 9.0 PR [#296888](https://github.com/Homebrew/homebrew-core/pull/296888) 8-04 开、至今未合并且带 `long build`/`automerge-skip`，且 brew 构建是 `--enable-shared`，本来就不能进 bundle。 |
+| D-29 | **接受随之而来的 x265 4.1 → 4.0 回退** | 实测代价为同参数下 **+1.2% 体积、VMAF 无变化**（基准 7）。小于「拿到 9.0 的动画 WebP 解码能力」的收益。**待 osxexperts 发布 9.x arm 构建后复评**，复评只需改脚本里的 URL + SHA。 |
+| D-30 | **打包许可证口径从 GPLv2+ 改为 GPLv3+** | 新构建带 `--enable-version3`（旧的 8.1 构建没有）。zigzag 走子进程调用属聚合而非链接，自身不受传染，但**分发 .app 时的源码提供义务按 GPLv3 走**。 |
+
+### 基准测试 7：x265 4.1 vs 4.0 的实际代价
+
+源：`mandelbrot 1920×1080@30 / 6s + noise(alls=8:allf=t+u)` 无损 FFV1 封装（合成源带颗粒，是 x265 的困难素材，代价会被放大而非低估）。
+参数两边完全一致：`-c:v libx265 -preset medium -crf 24 -pix_fmt yuv420p`。
+
+| ffmpeg | x265 | 体积 | VMAF |
+|---|---|---|---|
+| 8.1（原） | 4.1+1-1d117be | 6,577,694 | 69.73 |
+| **9.0（新）** | **4.0+1-6318f22** | **6,658,739（+1.23%）** | **69.78（+0.05）** |
+
+> VMAF 绝对值偏低是合成颗粒源所致，此处只看相对差。真实录屏素材上复测为 +1.46%，量级一致。
+
+**对既有标定的影响：无。** 同 CRF 下 VMAF 差 0.05（噪声级），说明 ADR-001/003/004/005 建立的 **CRF↔体积↔VMAF 标定在 9.0 上继续成立，不需要重测**。付出的只是约 1.2% 的体积。
+
+### 三条工程结论
+
+#### 1. `-progress` 的键名与单位在 9.0 未变 ✅
+
+`engines/ffmpeg.rs` 依赖 `out_time_ms` 实际是**微秒**这一历史遗留命名。大版本升级是这种约定最可能被修正的时机，若被改成真毫秒，进度条会跑到实际值的 1000 倍。实测 9.0 输出：
+
+```
+out_time_us=3018594
+out_time_ms=3018594     ← 两者仍然相等，即仍是微秒
+```
+
+解析器与其单测**无需改动**（`cargo test` 80 项全绿）。`ffprobe -print_format json` 的 `streams`/`format` 结构同样未变。
+
+#### 2. 9.0 新增 `webp_anim` demuxer —— D-27 的动画 WebP 分支这才真正可行 ⭐
+
+§5.3 把「GIF / APNG / **动画 WebP**」都列为动图源，但实测 **8.1 根本解不了动画 WebP**：
+
+| ffmpeg | 解出帧数（12 帧动画 WebP） | 结果 |
+|---|---|---|
+| 8.1 | 0 | `[webp] image data not found` 直接失败 |
+| **9.0** | **12** | 自动选中新的 `webp_anim` demuxer，PTS 正确 |
+
+也就是说这条分支在 8.1 上是写不出来的，M2「动图管线」若按原计划实现会在动画 WebP 上直接踩空。**这是本次升级最实在的收益。**
+
+#### 3. ffmpeg 读回动画 AVIF 只认 1 帧 —— 完整性校验不能靠帧数（R21）
+
+产物本身是**正确的动画 AVIF**（brand `avis`，含 `moov`/`trak`/`mdat`，ADR-005 基准 6 已用 ImageIO 验证过 64 帧可读），但 ffmpeg/ffprobe 自己读回来只报 1 帧——它优先取 `pitm` 指向的静态主图项。
+
+**8.1 与 9.0 表现完全一致，不是升级引入的回归。** 含义：§8 第 4 步的完整性校验若对动画 AVIF 用「帧数是否匹配」判定，会把好文件全判成坏的。动画 AVIF 的校验必须走 ImageIO 的 `CGImageSourceGetCount()`（R20 已要求禁用 `sips`，此处一并适用）。
+
+#### 4. 换 sidecar 后 `target/` 下的旧拷贝会静默生效 ⚠️
+
+tauri 会把 sidecar 拷一份到 `src-tauri/target/<profile>/`，而 `engines/ffmpeg.rs` 的 `resolve()` **优先取与当前可执行文件同级的那一份**（见该函数的查找顺序：同级 → PATH）。本次升级后 `binaries/` 已是 9.0，但 `target/debug/ffmpeg` 仍是 8.1 的旧拷贝（SHA 对得上旧的 osxexperts 包），`tauri dev` 会继续跑 8.1 且**没有任何提示**。
+
+`fetch-sidecars.sh` 已加入自动清理：装完新版后比对 `target/*/` 下的同名文件，不一致就删掉，交给下次构建重新拷贝。
+
+> 顺带一提，若 `target/` 下没有拷贝，`resolve()` 会回落到 PATH——也就是用户 `brew` 装的那个 ffmpeg（本机是 8.1.2）。**开发期务必确认跑的是哪一份**，否则基准数据和线上行为对不上。
+
+### 顺带修掉的两个自检 bug
+
+`scripts/fetch-sidecars.sh` 原本的编码器自检形同虚设，升级时才暴露：
+
+1. **`grep -E "libx265|hevc_videotoolbox|aac_at|libaom-av1"` 任意一项命中即通过** —— 缺三个也照样绿灯。改成逐项断言。
+2. 逐项断言后又踩了第二个坑：**`ffmpeg … | grep -q` 叠加 `set -o pipefail` 会随机失败**。`grep -q` 命中即退出，ffmpeg 还在写就吃到 SIGPIPE，整条管道被判失败——实测 5 次里偶发 1 次报「libvmaf 缺失」。改为先把列表整个抓进变量再比对。
+
+现在的自检覆盖：5 个编码器 + 2 个滤镜 + **纯静态性**（`otool -L` 不得出现非系统库，否则换台机器就跑不起来），并已用「插入一个不存在的编码器名」反向验证过确实会红着脸退出（连跑 10 次稳定通过）。
+
+### 复评/换源指引
+
+脚本里只有一处需要改：
+
+```bash
+BUILD="1785863997_9.0"                       # 固定 build id，保证可复现
+BASE="https://ffmpeg.martin-riedl.de/download/macos/arm64/$BUILD"
+FFMPEG_SHA="f54ec334…"                       # shasum -a 256 解压后的二进制
+```
+
+换源后直接跑 `./scripts/fetch-sidecars.sh`，自检会把关。
+
+---
+
+## 2026-08-08 · M0 骨架落地（ADR-007）
+
+**状态**：已完成。`cargo test --lib` 80 项通过，`pnpm build` / `tsc --noEmit` 干净，**应用已实机启动验证**（日志见下）。Rust 侧 2259 行 + 前端 11 个自写模块。
+
+### 决议记录
+
+| 编号 | 决议 | 依据 |
+|---|---|---|
+| D-31 | **前后端类型用 `ts-rs` 12.0.1 生成，放弃 `tauri-specta`** | `cargo add objc2` 时爆出无解的依赖冲突，追查发现 `tauri-specta` 稳定版仍是 1.0.2（Tauri **1** 时代），会把 `webkit2gtk` 拖进依赖图。ts-rs 以「生成测试」的形式在 `cargo test` 时导出 `.ts`，零运行时开销，也不碰 Tauri 版本线 |
+| D-32 | **`rusqlite` 锁定 0.37（对应 `libsqlite3-sys` 0.35）** | rusqlite 0.40 要求 `libsqlite3-sys ^0.38.1`，而 0.38.1 的 build script 用了 unstable 的 `cfg_select!`，本机 rustc 1.92.0 编不过。选择降 crate 而不是升全局 toolchain——不为一个依赖去动用户的工具链。待 `cfg_select!` 稳定后可解锁 |
+| D-33 | **设计 token 收敛到 shadcn 的语义变量名，取值换成 zigzag 的** | `shadcn init` 会注入自己那套 token + Geist 网络字体，与既有 `styles.css` 形成两套并存的系统。保留 shadcn 的**变量名**（组件才能开箱即用）、替换**取值**；字体改回系统 SF（本地工具没有等网络字体的理由）；深色模式走 `prefers-color-scheme` 而非 `.dark` class |
+| D-34 | **全部上限参数开放为用户可配，后端是唯一的校验方** | 用户需求。`Profile::sanitized()` 对越界值**钳位并返回修正说明**，而不是报错——归档工具不该因为一个数字填错就罢工。设置界面即时保存（无「保存」按钮），改完立刻回读后端校验后的值 |
+
+### 已落地的模块
+
+```
+src-tauri/src/
+├── commands/mod.rs   唯一依赖 Tauri 的一层：9 个 command + AppState
+├── config/           Profile（image/video/audio/output）+ 四档预设 + 原子落盘
+├── core/policy/      shortedge.rs（§4 短边规则）· route.rs（D-24 全软编 + HDR 跳过）
+├── engines/ffmpeg.rs 子进程封装 · -progress 解析 · kill_on_drop · probe
+├── store/            schema.rs（user_version 迁移）· repo.rs（jobs/items/probe_cache/dedup/events）
+├── platform/power.rs objc2 → NSProcessInfo beginActivity 防休眠（R15）
+├── error.rs          ZzError + 稳定 code() 字符串，直接写进 items.error_code
+└── logging.rs        ~/Library/Logs/zigzag，8 MB 轮转 + panic hook 落盘
+```
+
+前端：`lib/ipc.ts`（类型化 invoke 封装）· `store/app.ts`（zustand）· `views/{Home,Queue,Settings}` + `views/parts/{Field,PresetPicker,ToolBanner}`。
+`src/lib/bindings/` 下 17 个 `.ts` 由 ts-rs 生成，**不要手改**。
+
+### 三条工程结论
+
+#### 1. `-progress` 输出里的 `N/A` 会抹掉已有值（自测抓到的真 bug）
+
+解析器原本写的是 `acc.fps = value.parse().ok()`。ffmpeg 在起步阶段和纯音频片段里会输出 `fps=N/A`，`parse()` 失败返回 `None`，于是**已经拿到的正确值被覆盖成空**，UI 上表现为进度数字间歇性闪空白。
+
+修法是「解析成功才写入」：
+
+```rust
+fn set<T: std::str::FromStr>(slot: &mut Option<T>, value: &str) {
+    if let Ok(v) = value.parse() { *slot = Some(v); }
+}
+```
+
+> 教训：`Option` 字段的更新语义要区分「这次没解析出来」和「这个值不存在」。四个数值字段（`frame` / `fps` / `out_time_us` / `total_size`）全部适用，单测已覆盖。
+
+#### 2. 短边换算的预览走后端同一个函数
+
+设置界面里的「4032×3024 → 1440×1080」不是前端自己算的，而是调 `preview_resize` 让后端用**处理时的同一个 `fit_short_edge`** 算。多一次 IPC，换「预览和实际结果不可能不一致」，划算。
+
+#### 3. 首次实机启动通过
+
+```
+INFO zigzag_lib::logging: zigzag 启动 log=/Users/del/Library/Logs/zigzag/zigzag.log
+INFO zigzag_lib::store::schema: 应用数据库迁移 version=1
+INFO zigzag_lib: 状态就绪 data_dir=~/Library/Application Support/com.zigzag.app
+```
+
+窗口正常渲染，`check_tools` 未报缺失（sidecar 就位），`preview_resize` 往返正常。顺带修掉两处界面问题：预设卡片的 `line-clamp-3` 把「极致画质」的体积代价说明截断了（代价说明被截断就失去意义，改成不截断、让卡片长高）；分组标题的 `uppercase` 把 `.mp4` 变成 `.MP4`（去掉）。
+
+### 交接提示
+
+- `src-tauri/binaries/` 已 gitignore，新环境先跑 `./scripts/fetch-sidecars.sh`（带 SHA256 校验 + 编码器自检）。
+- 改了 Rust 侧带 `#[derive(TS)]` 的类型后，**必须跑一次 `cargo test`** 才会重新生成 `src/lib/bindings/`。
+
+---
+
 ## CHANGELOG
 
 | 日期 | 内容 |
@@ -1076,7 +1232,8 @@ pikafish-demo.gif : 帧数=64  UTI=com.compuserve.gif
 | 2026-08-08 | **ADR-003**：AudioToolbox AAC 档位实测 + macOS 平台能力探测。决议 D-10~D-17：单平台化、音频改 AAC-LC 128k/.m4a、视频改 8-bit、ImageIO 解码兜底、功耗管理、clonefile、ad-hoc 签名。同步更新 ADR-002 受影响章节与任务清单 |
 | 2026-08-08 | **ADR-004**：8-bit 标定 + 图片格式横评（三组基准）。决议 D-18~D-23：确认 8-bit、**图片目标格式 WebP → AVIF**（等质量小 24~27% 且编码耗时持平）、AVIF 必须走 libavif 而非 ffmpeg（后者丢 ICC）、HEIC 不采用。消解 R1/R14，新增 R18/R19。**同时发现硬编等质量体积接近 ×2，D-03 路由方向性待复议（R19）** |
 | 2026-08-08 | **ADR-005**：基准 5（AVIF 质量曲线 420 vs 444）+ 基准 6（动图）。决议 D-24~D-27：**视频取消动态硬编路由改默认全软编**（R19 结案）、AVIF 一律 `--yuv 444`（R17 根治）、默认质量 q63→q85、动图走动画 AVIF。**并修正 D-21 的抽样口径错误**——原 −24~27% 混了 444 vs 420，同口径下 AVIF≈WebP，真实优势在「WebP 锁死 420 而 AVIF 能上 444」。新增 R20（`sips` 动图崩溃） |
-| — | **代码仍为零行**，下一步 M0 第一项 |
+| 2026-08-08 | **ADR-006**：ffmpeg sidecar 8.1 → **9.0**（构建源换 martin-riedl，唯一的 arm64 原生静态 9.0）。决议 D-28~D-30。实测确认 **`-progress` 键名与单位未变**（解析器与 80 项单测无需改动）、**9.0 新增 `webp_anim` demuxer 使 D-27 的动画 WebP 分支首次可行**（8.1 解出 0 帧）、x265 4.1→4.0 的代价仅 +1.2% 体积且 VMAF 不变（既有 CRF 标定继续成立）。新增 R21。顺带修掉自检脚本的两个 bug（宽松 grep 等于没查、`pipefail` + `grep -q` 随机失败） |
+| 2026-08-08 | **ADR-007**：**M0 骨架落地并实机启动验证**，§12 勾选状态已与代码对齐。决议 D-31~D-34：ts-rs 取代 tauri-specta（后者仍是 Tauri 1 线，会拖进 webkit2gtk）、rusqlite 锁 0.37（0.38.1 的 build script 用了 unstable `cfg_select!`）、shadcn 设计 token 归一、**全部上限参数开放可配 + 四档预设**（用户需求）。抓到并修复 `-progress` 的 `N/A` 覆盖 bug。`cargo test` 80 项通过。**下一步 M1 第一项 `scan/walker.rs`** |
 
 ---
 
@@ -1089,6 +1246,7 @@ pikafish-demo.gif : 帧数=64  UTI=com.compuserve.gif
 - **ADR-002 的 §3~§12 是活文档** —— 它们是当前设计的唯一事实来源，被后续 ADR 推翻时**就地更新**并标注来源（如「(D-13)」「ADR-003 修订」）。宁可就地改，也不要留下半篇过期的架构描述让人踩坑。
 - **每次工作结束前必须更新**：§12 勾选状态 + 文末 CHANGELOG 追加一行。
 
-**当前状态**：设计完成，代码零行。下一步 M0 第一项（`create-tauri-app` 初始化）。
+**当前状态**：**M0 已完成**（ADR-007）——应用可启动、设置界面可用、sidecar 为 ffmpeg 9.0（ADR-006）。下一步是 §12 的 M1 第一项 `scan/walker.rs`。
+⚠️ **§12 的勾选状态落后于实际代码**，接手前请先核对 M0 各项的真实完成度，不要按「代码零行」推进。
 
 **无阻塞项**，全部待决问题已在 ADR-005 结案。下一步就是写代码。
