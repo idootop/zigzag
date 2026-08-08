@@ -30,7 +30,7 @@ Zigzag 的目标是让归档整理变成一个可预期、可中断、可回滚�
 
 - **三条独立管线** — 图片、视频、音频分别采用经基准测试验证的编码参数
 - **短边约束缩放** — 以短边为基准的统一缩放规则，长截图、竖拍照片、全景图均能正确处理
-- **软硬编双队列并行** — CPU 编码与硬件编码器互不占用，两条队列同时工作，实测总耗时接近单条队列
+- **动图一并处理** — GIF / APNG / 动画 WebP 转为动画 AVIF，实测可省约 87%
 - **断点续传** — 处理进度持久化至 SQLite，异常退出后重新打开可继续，自动跳过已完成文件
 - **先扫描，后处理** — 执行前给出体积分布、预计节省空间与预计耗时，确认后再开始
 - **跳过无收益文件** — 自动识别已充分压缩的文件，避免无效处理与二次劣化
@@ -53,20 +53,20 @@ Zigzag 的目标是让归档整理变成一个可预期、可中断、可回滚�
 
 | 类型 | 目标格式 | 关键参数 |
 |---|---|---|
-| **图片** | WebP | 短边上限 1080、质量 80；无损源走无损路径；保留 EXIF 与 ICC，旋转信息烘焙进像素 |
-| **视频** | HEVC（x265 / VideoToolbox） | 短边上限 1080、帧率上限 30、CRF 24、8-bit；按时长与体积在软编与硬编间自动路由 |
+| **图片** | AVIF | 短边上限 1080、质量 85、4:4:4 色度；一律有损；保留 EXIF 与 ICC，旋转信息烘焙进像素 |
+| **视频** | HEVC（x265） | 短边上限 1080、帧率上限 30、CRF 24、8-bit；默认软编，硬件编码作为「极速」预设可选 |
 | **音频** | AAC-LC（`.m4a`） | 码率上限 128 kbps，继承源采样率；AAC 源仅更换容器，不重新编码 |
 
 以上参数均可调整，并提供三档预设（省空间 / 均衡 / 极致画质）与折叠式高级设置。默认路径无需任何配置。
 
-> 上述默认值来自 Apple M1 Max 上的实测基准，包含 VMAF 评分、体积与耗时的横向对比。完整测试数据与结论见 [PROGRESS.md · ADR-001](PROGRESS.md)。
+> 上述默认值来自 Apple M1 Max 上的实测基准，包含 VMAF / SSIMULACRA2 评分、体积与耗时的横向对比，完整数据见 [PROGRESS.md · ADR-001 / ADR-004 / ADR-005](PROGRESS.md)。
 
 ## 技术栈
 
 基于 **Tauri 2 + Rust**，安装包约 15 MB，空载内存占用约 80 MB。大规模目录遍历与哈希计算采用 `jwalk` + `rayon` + `blake3`。
 
 - **前端** — React 19、Vite、TypeScript、Tailwind 4、shadcn/ui、TanStack Virtual
-- **后端** — Rust、tokio、rusqlite（WAL 模式）、image、fast_image_resize、webp
+- **后端** — Rust、tokio、rusqlite（WAL 模式）、image、fast_image_resize、ravif
 - **编解码** — ffmpeg / ffprobe sidecar，macOS 平台叠加 ImageIO 与 VideoToolbox
 
 v1 优先支持 macOS（Apple Silicon）。核心逻辑与平台相关代码已分层解耦，后续扩展至其他平台无需重构。
