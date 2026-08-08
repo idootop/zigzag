@@ -219,6 +219,29 @@ pub fn decide(p: &Probed, cfg: &Profile) -> Option<SkipReason> {
     None
 }
 
+/// 跳过判定第二级：产物已经编出来了，值不值得替换原文件（§5.5）。
+///
+/// 这一级是**权威**的——它不预测，只比对两个真实的字节数。第一级的所有启发式
+/// 判错时都由它兜住。
+///
+/// 归档盘上这不是边角情况：ADR-010 §5 实测一张 22 KB 的 WebP 转 AVIF 后变成
+/// 47 KB（膨胀 113%）。任何已经被现代编码器压实过的素材都可能走到这里。
+///
+/// `src_size == 0` 一律判为无收益：零字节文件没有可省的空间，
+/// 而且它会让百分比计算变成除零。
+pub fn no_gain(src_size: u64, dst_size: u64, cfg: &Profile) -> bool {
+    if !cfg.output.skip_no_gain {
+        return false;
+    }
+    if src_size == 0 {
+        return true;
+    }
+    // 用乘法而不是除法：整数除法会把「省了 4.9%」算成「省了 4%」，
+    // 在门槛边界上反复横跳。
+    let keep_at_most = src_size as u128 * (100 - cfg.output.min_gain_percent.min(100) as u128) / 100;
+    dst_size as u128 >= keep_at_most
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,5 +483,41 @@ mod tests {
         let before = codes.len();
         codes.dedup();
         assert_eq!(codes.len(), before);
+    }
+
+    // ------------------------------------------------------------ 第二级
+
+    #[test]
+    fn no_gain_uses_the_configured_threshold() {
+        let cfg = Profile::default(); // min_gain_percent = 5
+        assert!(!no_gain(1000, 949, &cfg), "省了 5.1%，达标");
+        assert!(no_gain(1000, 950, &cfg), "刚好省 5%，不达标（门槛是「至少」）");
+        assert!(no_gain(1000, 999, &cfg));
+        assert!(no_gain(1000, 2130, &cfg), "ADR-010 §5 的 WebP 反向膨胀");
+    }
+
+    #[test]
+    fn no_gain_respects_the_switch() {
+        let mut cfg = Profile::default();
+        cfg.output.skip_no_gain = false;
+        assert!(!no_gain(1000, 5000, &cfg), "闸门关了就该照单全收，哪怕产物更大");
+    }
+
+    #[test]
+    fn no_gain_threshold_zero_only_rejects_growth() {
+        let mut cfg = Profile::default();
+        cfg.output.min_gain_percent = 0;
+        assert!(!no_gain(1000, 999, &cfg), "省 1 个字节也算省");
+        assert!(no_gain(1000, 1000, &cfg), "一样大就没必要换");
+        assert!(no_gain(1000, 1001, &cfg));
+    }
+
+    #[test]
+    fn no_gain_handles_zero_and_huge_sizes() {
+        let cfg = Profile::default();
+        assert!(no_gain(0, 0, &cfg), "零字节源没有可省的空间，且不能让它去做除零");
+        // u64 接近上限时不能溢出——内部用 u128 算。
+        assert!(!no_gain(u64::MAX, u64::MAX / 2, &cfg));
+        assert!(no_gain(u64::MAX, u64::MAX, &cfg));
     }
 }

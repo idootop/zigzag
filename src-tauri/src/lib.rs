@@ -6,6 +6,7 @@
 //! commands/  ← 唯一依赖 Tauri 的一层，薄封装
 //! core/      ← 决策与执行，纯 Rust，可直接单测
 //! engines/   ← 外部编码器子进程封装
+//! fsops/     ← 产物落地：原子写、no-gain 闸门、零拷贝保底
 //! store/     ← SQLite 持久化，断点续跑
 //! platform/  ← macOS 专有能力（防休眠等）
 //! ```
@@ -17,6 +18,7 @@ pub mod config;
 pub mod core;
 pub mod engines;
 pub mod error;
+pub mod fsops;
 pub mod logging;
 pub mod platform;
 pub mod scan;

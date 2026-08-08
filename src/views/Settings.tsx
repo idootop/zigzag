@@ -256,6 +256,28 @@ export function Settings() {
               onChange={(min_gain_percent) => set("output", { min_gain_percent })}
             />
           )}
+          <NumberRow
+            label="跳过小文件"
+            hint="小于此体积的直接不动。缩略图、图标这类文件压完省不下几 KB，却要担一次读写风险"
+            value={profile.output.min_file_kb}
+            min={0}
+            max={1000}
+            step={10}
+            format={(v) => (v === 0 ? "不限" : `${v} KB`)}
+            onChange={(min_file_kb) => set("output", { min_file_kb })}
+          />
+          <SwitchRow
+            label="处理 RAW 底片"
+            hint={
+              <>
+                默认关。<span className="font-medium text-foreground">RAW 转码是不可逆的</span>
+                ——底片一旦转成 AVIF，白平衡、曝光这些后期空间就永久没了。除非你确定这些
+                RAW 只是留档、不再进暗房，否则别开。
+              </>
+            }
+            checked={profile.output.include_raw}
+            onChange={(include_raw) => set("output", { include_raw })}
+          />
         </Section>
       </div>
     </div>

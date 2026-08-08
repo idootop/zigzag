@@ -682,6 +682,7 @@ zigzag/
 | **R19** | **D-03 路由方向性存疑** | 硬编等质量体积接近 ×2（ADR-004 基准 3b），而路由恰好把最大的文件送去硬编 | 三个候选方案见 ADR-004，**待用户拍板**。在此之前 §6.2 保持原样 |
 | **R15** | **系统休眠中断通宵任务** | 早上起来发现只跑了 20 分钟 | `beginActivity(.idleSystemSleepDisabled)`（§6.1），且必须在任务结束/暂停时释放 |
 | **R16** | **外置卷 TCC 权限被拒** | 扫描直接失败，报错难懂 | 启动时探测可读性，引导到系统设置（§8） |
+| **R22** | **TIFF 源静默丢光 EXIF** | 扫描文档 / 老相机图丢拍摄时间与 GPS，不报错 | `image` 0.25.10 只给 png/jpeg/webp 实现 `exif_metadata()`（TIFF 的 ICC/XMP/Orientation 有，EXIF 恒 None）。用已在依赖树的 `tiff` crate 直读 IFD（ADR-012 §4） |
 | **R21** | **ffmpeg 读回动画 AVIF 只认 1 帧** | §8 完整性校验若用帧数判定，会把正确的动画 AVIF 全判成损坏 | ffmpeg 优先取 `pitm` 静态主图项，8.1/9.0 一致（非回归）。动画 AVIF 的校验走 ImageIO `CGImageSourceGetCount()`，见 ADR-006 |
 
 ### 12. 里程碑与任务清单
@@ -711,18 +712,23 @@ zigzag/
 - [x] **Dry-run 端到端跑通**（实机：选目录 → 扫描 → 报告，408 个文件，无测试钩子）→ ADR-009 §5
 
 #### M2 · 图片管线
-- [ ] Rust 主路径：`image` 解码 → `fast_image_resize` Lanczos3 → `ravif`/libavif 编码（D-21）
-- [ ] EXIF Orientation 归一化 + 旋转烘焙（§4 要点 1、3）
-- [ ] ICC / EXIF **编码期**注入（libavif icc/exif 入口，非事后拼接），**往返测试**用 `sips -g profile` 校验（R6/R18）
+- [x] Rust 主路径：`image` 解码 → `fast_image_resize` Lanczos3 → **进程内 libavif** 编码（D-21/D-48）→ ADR-010
+- [x] EXIF Orientation 归一化 + 旋转烘焙（§4 要点 1、3）→ ADR-011 §2
+- [x] ICC / EXIF **编码期**注入（libavif icc/exif 入口，非事后拼接），**往返测试**用 `sips -g profile` 校验（R6/R18）→ ADR-011 §3
+- [ ] **接线 `keep_metadata` / `strip_gps`**（现为死配置但 UI 已暴露，用户点「剥离 GPS」GPS 照发）——**优先级最高，隐私向静默失效**（D-57）
+- [ ] **剥离 EXIF IFD1 缩略图**：清 IFD0 的 next-IFD 指针 + 条件截断，**禁止重新序列化 TIFF**（会写废 MakerNote 的绝对偏移）；截断前校验各段偏移均 < IFD1 偏移，否则只清指针（D-54）
+- [ ] **XMP 提取**：`decoder.xmp_metadata()` 一行，编码侧 `avifImageSetMetadataXMP` 已就位（D-55）
+- [ ] **TIFF EXIF 补读**：`image` 不给 TIFF 实现 `exif_metadata()`，用 `tiff` crate 直读 IFD，否则扫描文档/老相机图静默丢拍摄时间与 GPS（R22）
+- [ ] **TIFF 字节编辑的往返测试**（R6）：编辑后重新解析，确认目标段消失且其余标签逐个仍可读
 - [ ] 统一有损编码路径：AVIF `-q 85 -y 444 -s 7`（D-19/D-25/D-26），三档预设 q70/85/95
 - [x] ~~**4:4:4 体积代价补测**~~ → ADR-005 基准 5 完成，结论一律 444（D-25）
 - [ ] 动图管线：GIF/APNG/动画 WebP → 动画 AVIF（ffmpeg `libaom-av1`，D-27）
-- [ ] **宽色域往返验收**：Display P3 源编码后色彩正确性（ADR-004 未覆盖）
+- [x] **宽色域往返验收**：Display P3 源编码后色彩正确性（ADR-004 未覆盖）→ ADR-011 §3
 - [ ] `platform/imageio.rs`：HEIC / RAW / AVIF / JXL 解码兜底（D-14），**必须走 `CGImageSource` C API，禁止调用 `sips`**（R20）
 - [ ] `avifenc` sidecar 编码兜底 + 完整降级链（**不得用 ffmpeg avif muxer**，D-22）
 - [ ] 边界覆盖测试：65536 上限、超长截图、动图、CMYK、16-bit
 - [x] ~~**R14 基准测试**：WebP vs HEIC~~ → ADR-004 基准 4 完成，结论改用 AVIF（D-21/D-23）
-- [ ] 原子写 + 校验 + no-gain 兜底（§8）
+- [ ] 原子写 + 校验 + no-gain 兜底（§8）—— **含产物继承源 mtime / birthtime**（D-56；Spotlight 不从 AVIF 索引 EXIF，不搬时间戳整盘归档会塌缩成压缩当天。`clonefile` 分支天然保留，只有重编码分支要显式搬）
 - [ ] `platform/clonefile.rs`：no-gain / 排除项的零拷贝落地（D-16）
 
 #### M3 · 视频与音频管线
@@ -1512,7 +1518,7 @@ INFO zigzag_lib: 状态就绪 data_dir=~/Library/Application Support/com.zigzag.
 
 ### 8. 顺带
 
-- ADR-008 留的小尾巴清掉两个：`Volume::scan_parallelism()` 已接进 `ScanOptions.parallelism`；`tcc` 的两个 command（`check_access` / `open_privacy_settings`）已进 `generate_handler!`。**剩一个**：设置界面仍缺 `output.min_file_kb` 与 `output.include_raw` 两行。
+- ADR-008 留的三个小尾巴**全部清掉**：`Volume::scan_parallelism()` 已接进 `ScanOptions.parallelism`；`tcc` 的两个 command（`check_access` / `open_privacy_settings`）已进 `generate_handler!`；设置界面补上「跳过小文件」（`output.min_file_kb`，0 显示为「不限」）与「处理 RAW 底片」（`output.include_raw`）两行。RAW 那行的说明写明**转码不可逆**——它是全部设置里唯一开了就可能毁数据的开关（R5），强调用字重而非 `text-warn`：`--warn` 是 L=0.72 的琥珀色，12px 正文压在近白卡片上对比度不够，本项目的琥珀一向只作容器底色用。
 - 日志里的并行度改为打印语义而非字面量。jwalk 的 `0` 表示「rayon 默认池」即**放开跑**，而日志打「并行度=0」会让排查往完全相反的方向猜。
 - `examples/scancheck.rs` 验完即删，沿用 ADR-008 `probecheck.rs` 的做法——一次性的验证脚本不进主干。
 
@@ -1521,6 +1527,343 @@ INFO zigzag_lib: 状态就绪 data_dir=~/Library/Application Support/com.zigzag.
 - **M1 完成，下一步是 M2 图片管线第一项**：`image` 解码 → `fast_image_resize` Lanczos3 → `ravif`/libavif 编码（D-21）。
 - 报告界面的数字全部来自 `scan/report.rs` 的 `Aggregator`，它是纯函数、不碰磁盘、不认识 Tauri。要改口径改这一个地方。
 - **前端跨 IPC 的整数一律是 `number`**（D-46）。新增 ts-rs 导出结构体时，`u64` 字段记得挂 `#[ts(type = "number")]`，否则会静默生成 `bigint`。
+
+---
+
+## 2026-08-08 · M2 图片主路径：解码 → 缩放 → AVIF（ADR-010）
+
+`engines/image.rs` 落地，`cargo test` 187 → **200 项通过**。这是全项目唯一出现 `unsafe` 的文件。
+
+### 决议记录
+
+| 编号 | 决议 | 依据 |
+|---|---|---|
+| **D-48** | **AVIF 编码走进程内 `libavif-sys`（`codec-aom`）**，不用 `ravif`，也不起 `avifenc` sidecar。`avifenc` 保留为降级链的兜底 | §1 |
+| **D-49** | **nclx 与 ICC 二选一**：带 ICC 时 `colorPrimaries` / `transferCharacteristics` 留 `UNSPECIFIED`，不带才显式标 sRGB(1/13)。`matrixCoefficients` 恒为 BT.601(6) | §2 |
+| **D-50** | **编码线程默认 1**，并发靠「一图一线程、多图并行」，而不是单图多线程 | §3 |
+| **D-51** | 位图中间表示统一为 RGBA8 + 一个 `opaque` 标志位；不透明图跳过 alpha 预乘并不写 alpha 平面 | §4 |
+
+### 1. 为什么是进程内 libavif，而不是 sidecar 或纯 Rust（D-48）
+
+三个候选，先按**能不能保住色彩**筛，再按体积验：
+
+| 方案 | ICC 入口 | 色域 setter | 结论 |
+|---|---|---|---|
+| `ravif` | 无 | 无 | 出局。会把每张图都标成 BT.709/sRGB——iPhone 归档里 Display P3 是大头，等于静默偏色 |
+| `avif-serialize` | 无 | 有 nclx | 出局。同样丢 ICC |
+| `libavif-sys` | `avifImageSetProfileICC` | 全套 | 采用 |
+| `avifenc` sidecar | `--icc` 传文件 | 全套 | 可行，但每张图要多两次读写（profile 先落临时文件）。留作兜底 |
+
+D-22 要求 ICC/EXIF 在**编码期**注入，这一条直接把两个纯 Rust 编码器排除了。
+
+剩下的疑问是：`libavif-sys` 捆的是 libavif **1.0.4** + aom **3.11.0**，而基准 5 的 q70/85/95 标定是拿 avifenc **1.3.0** + aom **3.13.1** 跑的——版本差会不会让既有标定作废？实测同素材同参数（q85 / 444 / s7 / -j 8）：
+
+| 素材 | 内嵌 1.0.4 | avifenc 1.3.0 | 差 |
+|---|---|---|---|
+| rot.jpg | 483 KB | 485 KB | **−0.28%** |
+| photo.jpg | 482 KB | 484 KB | **−0.40%** |
+| plain.jpg | 68 KB | 68 KB | **−0.04%** |
+| shot.png | 101 KB | 102 KB | **−1.15%** |
+
+四个素材全部**更小**，最大差 1.15%。基准 5 的质量档位标定原样沿用，无需重标。一次性构建代价 35.8 s（libaom + libavif 走 cmake）。
+
+### 2. 色彩标签：nclx 和 ICC 不能同时说话（D-49）
+
+`avifImageSetDefaults` 把 CP/TC/MC 全置成 `UNSPECIFIED(2)`，也就是**不写标签、让解码器自己猜**。这不能留着。但「那就全都显式写上」同样是错的：
+
+- 若产物带 ICC（比如源图是 Display P3），而 nclx 又写着 BT.709，那么**优先读 nclx 的解码器和优先读 ICC 的解码器会显示出两种颜色**。
+- 正确做法是让其中一个闭嘴。avifenc 的收尾分支（`avifenc.c:1720`）写得很清楚：仅当 `!image->icc.size` 且用户没指定 CICP 时，才补上 `BT709` / `SRGB`。本项目照抄这条规则。
+
+`matrixCoefficients` 是另一回事——它是 YUV 转换系数，不是色彩空间，任何情况下都要写。取 BT.601(6) 与 avifenc 默认一致，且**这个改动不动像素**：`reformat_libyuv.c:769` 里 `BT601` 和 `UNSPECIFIED` 两个 case 并列落到同一组 `kYuvJPEGConstants`。所以先前那次体积对比（当时还是 2/2/2）在加上显式标签后依然成立——上面 §1 的表就是加完标签重跑的。
+
+产物用 `sips` 验收，六个输出 macOS ImageIO 全部读出正确尺寸。（`sips` 只作为验收工具，应用内仍禁止调用，R20。）
+
+### 3. 编码线程数：默认 1 不是保守，是最优（D-50）
+
+`avifEncoder.maxThreads` 只设 aom 的 `g_threads`，不开 tiling（`autoTiling` 默认 false）——所以本以为它不影响产物。实测**影响，但极小**，且方向对我们有利：
+
+| 素材 | t=1 | t=4 | t=8 | t=1 耗时 | t=8 耗时 |
+|---|---|---|---|---|---|
+| rot.jpg | **480 KB** | 483 KB | 483 KB | 0.69 s | 0.29 s |
+| shot.png | **100 KB** | 101 KB | 101 KB | 0.13 s | 0.08 s |
+
+两点结论：
+
+1. 单图多线程的加速比只有 **2.4×（8 线程）**，扩展性很差。批量归档要的是吞吐不是单张延迟，「一图一线程、并发 N 图」能吃满全部核心，是明显更优的排布。
+2. t=1 的产物反而**最小**（0.6%）。既有标定是按 `-j 8` 测的，默认走 t=1 只会比标定更省，方向安全。
+
+所以 `AvifParams.threads` 默认 1，且**由调度器而非用户配置**决定——它是排布参数，不是画质参数，不该出现在设置界面。
+
+### 4. 中间表示：RGBA8 + 一个 opaque 标志（D-51）
+
+解码器吐什么格式都先归一化成 RGBA8，缩放和编码就各只有一条代码路径，不必为灰度 / 调色板 / 16-bit 各写一遍。
+
+单独存 `opaque` 是因为它一次决定两件事：**缩放时跳过 alpha 预乘/反预乘**（省两遍全图扫描），**编码时不写 alpha 平面**（`rgb.ignoreAlpha`）。PNG 截图几乎都带一条全 255 的 alpha 通道，不检测就是白花这两份开销、白占一个平面。判定本身几乎免费：源格式若无 alpha 通道（`ColorType::has_alpha()`）直接判定不透明，只有确实带通道时才扫一遍。
+
+缩放后继续沿用 `opaque` 是安全的：卷积核归一化，常量 255 的 alpha 卷积后仍是 255（有单测钉住）。
+
+另外两处防御：
+- 解码按**内容**而非扩展名判定格式（`with_guessed_format`）。归档盘里 `.jpg` 实为 PNG 很常见，按扩展名走会平白解码失败。
+- 解码分配上限设 1 GiB（`image` 默认 512 MB 对拼接全景偏紧）。这不是性能调参，是防一个声称 65535×65535 的畸形 PNG 把内存吃干——超限的那一个 item 记失败，不拖累整批。
+
+### 5. 默认档实机：一组真实素材的账
+
+短边 1080 / q85 / 444 / s7 / 单线程：
+
+| 素材 | 源 | 输出尺寸 | 产物 | 省 | 解码 | 编码 |
+|---|---|---|---|---|---|---|
+| rot.jpg | 585 KB | 1080×1440 | 97 KB | 83% | 0.03 s | 0.12 s |
+| photo.jpg | 304 KB | 1440×1080 | 91 KB | 70% | 0.02 s | 0.77 s |
+| plain.jpg | 114 KB | 900×1600（未缩） | 68 KB | 41% | 0.00 s | 0.11 s |
+| shot.png | 185 KB | 1702×1080（未缩） | 100 KB | 46% | 0.01 s | 0.12 s |
+| a.bmp | 1406 KB | 800×600 | 35 KB | 97% | 0.00 s | 0.04 s |
+| **a.webp** | 22 KB | 1280×720 | **47 KB** | **−113%** | 0.01 s | 0.07 s |
+| 合计 | 2617 KB | | 438 KB | **83%** | | |
+
+两条值得记的：
+
+**① 短边规则在真实素材上按预期不动手。** `plain.jpg`（900×1600）和 `shot.png`（1702×1080）短边都 ≤1080，原样通过、不放大。省下的 41% / 46% 纯粹来自编码。
+
+**② `a.webp` 反向膨胀 113%，这是 no-gain 闸门的第一个实证。** 一张已经被 WebP 压得很实的图，转 AVIF q85/444 只会变大。这不是 bug，也不该靠调参回避——`output.skip_no_gain` + `min_gain_percent` 存在的理由就是它。**在归档盘上「已经压过的图」是常态而不是例外**，所以 no-gain 兜底（§8）不能拖到最后做，它和编码是同一批要落地的东西。
+
+### 6. 同一个 TIFF，三个解码器三种态度
+
+`a.tif`（1024×768，YCbCr + PackBits）：
+
+| 解码器 | 结果 |
+|---|---|
+| `image` 0.25 | 失败：`The encoder or decoder for Tiff does not support the color type Unknown(24)` |
+| macOS ImageIO（`sips`） | 失败：`pixelWidth: <nil>` |
+| ffmpeg 9.0 | **成功**（`tiff, 1024x768, yuv420p`） |
+
+这条推翻了一个原本的默认假设：**降级链 `image` → ImageIO 并不能覆盖全部**。ImageIO 的价值在 HEIC / RAW / JXL 这些 Apple 生态格式（D-14 成立），但对冷门 TIFF 变体它不比 `image` 强。真要兜底到底，最后一环得是 ffmpeg。
+
+暂不实现——归档盘里 YCbCr PackBits TIFF 属于罕见品种，当前行为（报错、记失败、跳过、不崩）已经是可接受的。记在这里，等实机跑到真实盘出现足量此类失败再决定要不要加这一环。
+
+> **已由 D-52 结案（ADR-011 §1）**：支持范围明确收窄到常用格式，冷门变体解码失败即记失败跳过，不再考虑加 ffmpeg 这一环。
+
+### 7. 单测
+
+13 项，覆盖：缓冲区长度不匹配 / 零尺寸拒绝、不透明检测、产物 ftyp+avif 魔数、带 alpha 编码、**极端比例**（1×300 / 300×1 / 1×1，420 和 444 各跑一遍——420 下宽度不足一个色度块是典型越界点）、ICC 确实出现在产物字节里、质量档位确实改变体积（防字段名写错被静默忽略）、上限内不缩放、cap=0 不缩放、短边缩放保持比例、长截图不被压扁、缩放保持 opaque、缩放到 1 像素不崩。
+
+`examples/imgcheck.rs` 验完即删，沿用既有做法。
+
+### 交接提示
+
+- **`engines/image.rs` 是全项目唯一的 `unsafe` 文件**，三个 C 对象（`avifImage` / `avifEncoder` / `avifRWData`）各有 Drop 守卫，任何 `?` 早退都不会漏内存。新增 FFI 调用请保持这个约束，不要把 `unsafe` 扩散出去。
+- `Metadata { icc, exif, xmp }` 的入口已经在，但**还没有人往里填**——下一项就是从源图提取 ICC/EXIF 并做往返验收（§12 M2 第三项）。注意 `image` 的 `ImageReader::decode()` 会吃掉 decoder，拿 ICC 得手工构造 decoder 调 `icc_profile()`。→ **已由 ADR-011 §3 落地**
+- 缩放复用 `core/policy/shortedge::fit_short_edge`，与设置界面的实时预览是同一个函数，别再写第二份。
+
+---
+
+## 2026-08-08 · M2 图片元数据：格式收窄 + 朝向烘焙 + 色彩往返（ADR-011）
+
+接 ADR-010。主路径能跑通之后，这一轮补的是「像素之外的那一半」——**朝向**和**色彩描述**。这两样丢了不会报错，只会让照片默默转向或偏色，属于最难在批处理里被发现的一类损坏。
+
+### 1. 支持范围收窄到常用格式（D-52）
+
+**D-52：只处理归档盘里真实会出现的图片格式，设计与游戏工具链的中间产物不在支持范围内。**
+
+`image` 的默认 features 会开 15 种格式，其中 TGA / PNM / DDS / QOI / farbfeld 是设计和游戏管线的中间产物，EXR / HDR 是浮点高动态格式——照片和截图的归档盘里遇不到。默认 features 还会顺手拖进 `ravif`（AVIF 编码走 libavif，用不上，见 D-48）。
+
+收窄成两处，**两边必须对齐**，否则会出现「扫描认得、解码不认得」的假成功：
+
+| 位置 | 变化 |
+|---|---|
+| `Cargo.toml` 的 `image` features | 15 个格式 → **6 个**（jpeg / png / gif / webp / tiff / bmp），并关掉 `rayon` |
+| `core/policy/kind.rs` 的 `IMAGE` | 17 个扩展名 → **11 个**（jpg/jpeg/jpe/jfif、png/apng、bmp、gif、tif/tiff、webp） |
+
+HEIC / RAW / AVIF / JXL 不受影响，它们本来就归 `MODERN_IMAGE` / `RAW_IMAGE`，解码另走 ImageIO（D-14）。
+
+**未知扩展名一律当非媒体忽略**——这是安全的一侧：漏压一个文件是零成本，误压一个不认识的文件才是事故。这条同时给 ADR-010 §6 那个悬而未决的问题结了案：冷门 TIFF 变体不再考虑加 ffmpeg 兜底，解不开就记失败跳过。
+
+### 2. 朝向：烘焙进像素，并且**必须**清掉标签（D-53）
+
+**D-53：解码后立刻把 EXIF Orientation 应用到像素上，同时把 EXIF 里的 Orientation 标签清掉。两件事是一件事，不能只做前一半。**
+
+烘焙本身没有悬念：短边缩放是按显示后的尺寸算的，一张存储 4032×3024、EXIF 说转 90° 的竖构图照片，显示尺寸是 3024×4032，短边是 3024 而不是 4032。不先归一化，缩放就会按错误的边计算。
+
+有悬念的是**为什么必须清标签**。libavif 有一个容易踩的行为——`avifImageSetMetadataExif()` 会**自动解析 EXIF 里的 Orientation 并翻译成容器级的 irot/imir 变换**（`exif.c:145`）。也就是说，像素已经转过一次，容器又要求再转一次。
+
+实测对照（64×48 源图，EXIF 声明转 90°，解码后像素已是 48×64）：
+
+| | `avifdec --info` | `ffprobe` | macOS ImageIO |
+|---|---|---|---|
+| **清了标签**（本项目做法） | `Transformations: None` | 无 | 48×64 ✅ |
+| **没清标签**（对照组） | `irot (Rotation): 3` | `rotation=-90` | 48×64 |
+
+容器里确实多了一层旋转，ffprobe 直接把它读成 `rotation=-90`。
+
+**但两边 ImageIO 都报 48×64**——macOS 和 `avifdec` 的 PNG 输出都不理会 irot。这让问题更糟而不是更轻：**同一个文件在 Finder 里看着正常，在遵循规范的解码器（浏览器等）里是躺倒的**。批处理跑完一万张，用预览检查根本发现不了。
+
+实现上只有一行，但那一行不能省：
+
+```rust
+if orientation != Orientation::NoTransforms { img.apply_orientation(orientation); }
+// 返回 None 只表示这段 EXIF 里压根没有合法的 Orientation，那就没什么可清的。
+if let Some(e) = exif.as_mut() { let _ = Orientation::remove_from_exif_chunk(e); }
+```
+
+`Decoded` 因此多带一个 `baked_orientation` 字段，记录「已经烘进像素里的是哪个朝向」。它不参与编码，是给上层做校验和排错用的——沉默地转了图不留痕迹，出问题时无从查起。
+
+顺带一个 libavif 的实现细节，省得下一个人重复踩：`avifGetExifTiffHeaderOffset` 自己会扫 `II*\0` / `MM\0*` 找 TIFF 头并补上 4 字节偏移（`write.c:824-827`），所以**原样传 TIFF chunk 即可**，不要自己加壳。
+
+### 3. ICC / EXIF 注入与 Display P3 往返验收
+
+提取端补齐了 ADR-010 留下的空缺：`ImageReader::into_decoder()` 拿到 decoder 后先取 `icc_profile()` / `exif_metadata()` / `orientation()`，再用 `DynamicImage::from_decoder()` 消费它。顺序不能反——`decode()` 会吃掉 decoder。
+
+**实机往返**（`photo.jpg` 经 `sips --matchTo Display P3.icc` 转成 P3 源，4032×3024，ICC 536 字节）：
+
+| | 产物 | CP / TC / MC | ICC | EXIF | `sips -g profile` 读回 |
+|---|---|---|---|---|---|
+| **带 ICC**（本项目做法） | 90348 B | **2 / 2** / 6 | 536 B | 56 B | **Display P3** ✅ |
+| **丢 ICC**（对照组） | 89674 B | **1 / 13** / 6 | 无 | 无 | sRGB IEC61966-2.1 |
+
+D-49 的两条分支都按设计工作：**有 ICC 时 CP/TC 留 UNSPECIFIED**，由 ICC 说了算，macOS 正确读回 Display P3；**无 ICC 时显式写 1/13**，明确声明 sRGB。MC 恒为 6，两边一致（且不改变像素，见 D-49）。
+
+这张表也是 D-48「不用 ravif」的实证——对照组正是 ravif 路径的效果：**一张 P3 照片被静默降级成 sRGB**，不报错、不失败，只是颜色变了。
+
+~~**代价 674 字节**，占 90 KB 产物的 0.75%。元数据保真的价格便宜到不值得做成选项。~~
+
+> ⚠️ **本段结论已被 ADR-012 §1 推翻**。674 B 是在 `sips --matchTo` 处理过的文件上量的——sips 把 EXIF 砍到了 56 字节，不代表真实相机文件。真机 iPhone JPEG 的 EXIF 是 **29160 字节**，全量透传的实际代价是 **+10.24%** 而非 0.75%。
+
+### 4. 单测
+
+`engines::image` 13 → **19 项**，全库 200 → **206 项通过**。新增六项都用合成 JPEG 做夹具（`jpeg_with(w, h, exif_orientation, icc)` 手工拼 APP1/APP2 段），不依赖外部素材：
+
+- 朝向被烘进像素（尺寸真的转过来了）
+- **烘焙后标签确实被清掉**（钉住 D-53 的后一半，防止将来有人「优化」掉那行）
+- **八个 Orientation 值逐个跑**（1..=8，含非法值 9 的兜底）
+- 无 EXIF 不算错误
+- **ICC 走完整条链**（解码提取 → 缩放 → 编码注入，在产物字节里找得到）
+- 按内容而非扩展名识别格式
+
+### 交接提示
+
+- **格式支持范围改动要改两处**：`Cargo.toml` 的 `image` features 和 `kind.rs` 的 `IMAGE` 列表。只改一处会造成扫描阶段收下、解码阶段失败的假成功。
+- **不要单独「优化」掉 `remove_from_exif_chunk` 那一行**。它看起来像是可有可无的清理，实际上是 D-53 的另一半——去掉就等于给每张带朝向的照片盖一个隐形的二次旋转。单测 `clears_the_orientation_tag_after_baking` 会拦住。
+- ~~XMP 提取还没做（`Metadata.xmp` 恒为 `None`）。`image` 0.25 不暴露 XMP 入口，要么自己扫 APP1 的 `http://ns.adobe.com/xap/1.0/\0` 段，要么等 ImageIO 兜底那一环一起做。**暂不做**——归档场景里 XMP 主要是 Lightroom 编辑记录，而 `.xmp` 边车文件已在 `is_junk` 里跳过，源图内嵌 XMP 丢失的实际影响很小。~~
+
+  > ⚠️ **前提有误，已由 ADR-012 §3 更正**。`image` 0.25.10 **确实暴露** `ImageDecoder::xmp_metadata()`（`io/decoder.rs:38`），jpeg/png/webp/tiff/gif 五个 codec 全部实现。不需要自己扫 APP1 段，改动就是 `decode()` 里的一行。→ D-55
+
+---
+
+## 2026-08-08 · 元数据保留策略复核：代价重估 + 分层取舍（ADR-012）
+
+复核 ADR-011 的元数据结论。**核心机制（编码期注入、nclx/ICC 互斥、朝向烘焙+清标签）全部成立，不动**；但代价评估错了一个数量级，且漏了归档场景里最要命的一项。
+
+**实验环境**：素材 `IMG_7592.JPG`（iPhone 17 Pro，4032×3024，Display P3）与 `IMG_20240705_205557.jpg`（vivo Android，4728 KB）；编码 `avifenc 1.3.0 (aom 3.13.1)`，参数取项目默认档 `-q 85 -y 444 -s 7`，短边缩到 1080（1440×1080）；缩放用 `ffmpeg 8.1.2` 生成 PNG 中间件代替引擎的 Lanczos3 路径——**元数据增量与像素路径无关**（meta box 是附加的，不参与编码），故绝对体积与引擎会有出入，增量数据成立。
+
+### 1. 「674 字节 / 0.75%」不成立，真实代价是 +10.24%（推翻 ADR-011 §3 末段）
+
+ADR-011 那个数是在 `sips --matchTo Display P3.icc` 处理过的文件上量的，**sips 把 EXIF 砍到了 56 字节**。真实相机文件差两个量级：
+
+| 真实素材 | EXIF | XMP | ICC |
+|---|---|---|---|
+| iPhone 17 Pro JPEG | **29160 B** | 3225 B | 536 B |
+| vivo Android JPEG | **42382 B** | — | 566 B |
+
+按默认档实测产物：
+
+| 变体 | 产物 | 增量 |
+|---|---|---|
+| 无元数据 | 323023 B | — |
+| 仅 ICC | 323572 B | +0.17% |
+| **全量透传（ADR-011 现设计）** | 356098 B | **+10.24%** |
+| **剥 IFD1 后（本 ADR 方案）** | 330022 B | **+2.17%** |
+
+10% 不是「便宜到不值得做成选项」，那是本工具存在意义的十分之一。**但结论不是关掉元数据，而是别搬那 89% 的废物**——见 D-54。
+
+### 2. EXIF 里 89~96% 是缩略图，且在 AVIF 里零读取方（D-54）
+
+**D-54：EXIF 只剥 IFD1（内嵌缩略图），IFD0 / ExifIFD / GPS / MakerNote 全部原样保留。**
+
+拆 EXIF 内部结构：
+
+| 段 | iPhone | vivo |
+|---|---|---|
+| **thumbnail (IFD1)** | **26058 B (89%)** | **40678 B (96%)** |
+| MakerNote | 1898 B | 0 B |
+| ExifIFD + IFD0 + GPS | 1173 B | 1650 B |
+
+IFD1 是一张 160×120 的陈旧 JPEG，描述的还是**原图**——产物已经缩到 1440×1080，内容对不上；而且没有任何消费方会从 AVIF 的 `meta` box 里读 IFD1 缩略图（Finder / 预览 / 浏览器都是直接解主图）。**它是纯废重。**
+
+剥掉后 29160 B → **3084 B**，语义标签逐个验证一个没丢：
+
+```
+Make=Apple  Model=iPhone 17 Pro  DateTimeOriginal=2025:10:04 10:10:31
+ExposureTime=1/1642  FNumber  ISO=64  FocalLength  LensModel  Orientation
+GPS_IFD=True  MakerNote 保留
+```
+
+macOS 往返干净：`sips -g profile` 读回 **Display P3**，`avifdec --info` 报 `Exif Metadata: Present (3084 bytes)` / **`Transformations: None`**（D-53 的清标签逻辑不受影响）。
+
+⚠️ **实现约束（这条比结论本身更容易写错）**：
+
+- **只把 IFD0 的 next-IFD 指针清零，再按该偏移截断；禁止重新序列化 TIFF。** MakerNote 内部普遍含指向原 chunk 的**绝对偏移**，重排字节就把它写废了——而且是静默写废，解析器只会看到乱码。
+- 截断前**必须加保护**：确认 IFD0 / ExifIFD / GPS 的所有数据偏移都 < IFD1 偏移（正常相机布局是缩略图在尾部，成立）。**不满足就只清指针、不截断**——保正确性，放弃省那几 KB。
+
+### 3. XMP 不是做不了，是一行（D-55）
+
+**D-55：XMP 纳入默认保留范围。**
+
+ADR-011 交接提示称「`image` 0.25 不暴露 XMP 入口」——对 0.25.10 不成立。`ImageDecoder::xmp_metadata()` 定义在 `io/decoder.rs:38`，jpeg / png / webp / tiff / gif **五个 codec 全部实现**。编码侧 `avifImageSetMetadataXMP` 早已接好（`engines/image.rs:255`），`Metadata.xmp` 字段也在。改动就是 `decode()` 里取一次。
+
+XMP 装的是评分、关键词、版权、Lightroom 编辑记录——归档里最难重建的那一类。测试素材上 3225 B。
+
+> 原「边车文件已跳过所以影响很小」的理由站不住：`.xmp` 边车被 `is_junk` 跳过意味着它原样留在盘上，但**源图内嵌的那份 XMP 仍然会丢**，两者不是同一份数据。
+
+### 4. TIFF 静默丢光 EXIF（R22）
+
+`image` 0.25.10 只给 **png / jpeg / webp** 实现了 `exif_metadata()`（`grep -rn "fn exif_metadata" src/codecs/` 确认）。TIFF 的情况是：
+
+| | ICC | XMP | Orientation | **EXIF** |
+|---|---|---|---|---|
+| TIFF decoder | ✅ | ✅ | ✅（从 TIFF tag 直读，`tiff.rs:337`）| ❌ **恒 None** |
+
+朝向那条侥幸是对的——TIFF 走独立 tag 路径，不经过 EXIF chunk，所以不会出现 D-53 的双重旋转。但**拍摄时间与 GPS 会无声无息丢掉**，而 TIFF 在 D-52 的支持范围内（扫描文档、老相机图）。列为 R22，方案是用已在依赖树里的 `tiff` crate 直读 IFD。
+
+### 5. 文件时间戳：最要命的一项，此前完全不在计划里（D-56）
+
+**D-56：产物必须继承源文件的 mtime（及 birthtime），归入写入阶段。**
+
+全仓库 grep 无任何 `mtime` / `FileTimes` / `utimes` **写入**（现有 mtime 用途只有扫描期的缓存键与改动校验）。实测产物：
+
+```
+kMDItemContentCreationDate = 2026-08-08   ← 压缩当天，不是拍摄日
+kMDItemAcquisitionModel    = (null)       ← Spotlight 根本不从 AVIF 索引 EXIF
+```
+
+**关键点在第二行**：即使 EXIF 完整保留，macOS Spotlight 也不从 AVIF 里索引它。于是在 Finder 和「照片」里，**唯一存在的日期就是文件日期**。写入阶段不搬 mtime，一块二十年的归档盘压完会全部塌缩成压缩当天——比 ICC 偏色更容易被用户看见，代价却是零字节。
+
+挂到 §12 M2「原子写 + 校验 + no-gain 兜底」那一项下。注意 no-gain 走 `clonefile` 的分支（D-16）天然保留时间戳，只有真正重编码的分支需要显式搬。
+
+### 6. `keep_metadata` / `strip_gps` 是接了 UI 的死配置（D-57）
+
+**D-57：配置项要么接线，要么从 UI 撤掉；不接受「界面上有、代码里没有」的中间状态。**
+
+`config/mod.rs:43-45` 声明了两个字段，**Rust 侧无任何地方读取**（grep 确认）；而 `views/Settings.tsx:119-127` 把两个开关都露出去了，「剥离 GPS」的 hint 还写着「保留其他元数据，只去掉拍摄位置」。**用户点了开关，GPS 照样写进产物**——隐私向的静默失效，优先级高于本 ADR 其余各项。
+
+`strip_gps` 的实现即从 IFD0 删掉 `0x8825`（GPS IFD 指针）那个 tag entry，与 D-54 的 IFD1 处理是同一套 TIFF 编辑代码。
+
+### 7. 默认策略：按语义价值分层，而不是全留或全扔
+
+| 类别 | 默认 | 理由 |
+|---|---|---|
+| ICC | **全留** | +0.17%，丢了就是不可逆偏色（D-48/D-49 已证） |
+| EXIF 语义段（IFD0 / ExifIFD / GPS / MakerNote） | **全留** | ~1.2~3 KB，归档的核心价值 |
+| EXIF IFD1 缩略图 | **剥掉** | 89~96% 的体积，零读取方，内容还与产物对不上 |
+| XMP | **留** | 评分/关键词/版权，重建不了 |
+| 文件 mtime / birthtime | **搬** | Finder 与「照片」只认这个 |
+| GPS | 跟随 `strip_gps` | 把开关真正接上 |
+
+净效果：元数据开销 **+10.24% → +2.17%**，语义信息一条不少，同时补上时间戳这个真正的大洞。
+
+### 交接提示
+
+- **本 ADR 只改策略，不改机制**。ADR-010 / ADR-011 的编码期注入、nclx/ICC 互斥、朝向烘焙+清标签三条全部继续有效，`remove_from_exif_chunk` 那行依然不能删（D-53）。
+- **TIFF 编辑代码（剥 IFD1 / 删 GPS tag）是新的自研字节操作，归 R6 管辖**——必须配往返测试：编辑后重新解析，确认目标段消失、其余标签逐个仍可读。
+- **量元数据代价不要拿 `sips` 处理过的文件当素材**，它会把 EXIF 砍成几十字节，量出来的结论是假的。这正是 ADR-011 那个 674 B 的来源。
 
 ---
 
@@ -1537,7 +1880,10 @@ INFO zigzag_lib: 状态就绪 data_dir=~/Library/Application Support/com.zigzag.
 | 2026-08-08 | **ADR-007**：**M0 骨架落地并实机启动验证**，§12 勾选状态已与代码对齐。决议 D-31~D-34：ts-rs 取代 tauri-specta（后者仍是 Tauri 1 线，会拖进 webkit2gtk）、rusqlite 锁 0.37（0.38.1 的 build script 用了 unstable `cfg_select!`）、shadcn 设计 token 归一、**全部上限参数开放可配 + 四档预设**（用户需求）。抓到并修复 `-progress` 的 `N/A` 覆盖 bug。`cargo test` 80 项通过。**下一步 M1 第一项 `scan/walker.rs`** |
 | 2026-08-08 | **ADR-008**：**M1 扫描层落地**（walker / volume / tcc / probe / estimate），`cargo test` 80 → **156 项通过**。决议 D-36~D-42：TCC 单锚点深链（实测证明锚点被尊重、且移动卷与普通目录同面板）、**HDR 四信号判定**（实测抓到只带 `color_space=bt2020nc` 的真实文件，原单信号版本会漏判）、Dolby Vision 改认 `codec_tag_string`（`side_data_list` 实测恒为 null）、**预估给区间不给单点**（同规格素材耗时差 3.7 倍）、视频体积按 bits/px 而非源体积百分比、图片按「已压过/没压过」分两档、双队列耗时取 max。踩坑记录：窗口 owner name 是本地化的、`Removable Media` 取值是 Fixed/Removable 而非 Yes/No、`-color_trc` 作输出选项不写进码流 |
 | 2026-08-08 | **ADR-009**：**M1 收尾，Dry-run 实机跑通**（`scan/session.rs` 编排 + `scan/report.rs` 聚合 + `commands/scan.rs` IPC + 扫描报告界面），`cargo test` 156 → **187 项通过**。决议 D-43~D-47：图片尺寸走 `imagesize` 读文件头且**不建缓存**（实测 136 us vs ffprobe 20~60 ms，而查库要 3.8 us，建缓存只省 9 us/个）、ffprobe 并发取 `min(可用, 8)`（实测 8 是拐点，12 与 8 完全相同）、**音频「源码率低于目标码率」在扫描期就判 NoGain**（实测 AAC-LC 是 CBR，六个不同源码率的产物全是 1897 KB，盈亏平衡点 ≈136 kbps）、ts-rs 的 `u64` 一律标 `#[ts(type="number")]`（Tauri IPC 走 JSON，默认的 `bigint` 会在运行时炸）、预估不追求比特级一致（f64 结合律 × JoinSet 顺序，差在第 14 位，是 ulp 不是 bug）。**抓到两个只有跑起来才暴露的界面 bug**：StrictMode 双跑导致 `start()` 掐掉自己的事件监听、`dir="rtl"` 把路径开头的 `/` 甩到行尾 |
+| 2026-08-08 | **ADR-010**：**M2 图片主路径落地**（`engines/image.rs`：解码 → Lanczos3 短边缩放 → AVIF），`cargo test` 187 → **200 项通过**。决议 D-48~D-51：**AVIF 编码走进程内 `libavif-sys`**（`ravif`/`avif-serialize` 均无 ICC 入口，会把 Display P3 静默标成 BT.709；实测 libavif 1.0.4 产物比标定所用的 avifenc 1.3.0 小 0.04~1.15%，基准 5 标定原样沿用）、**nclx 与 ICC 二选一**（带 ICC 时 CP/TC 留 UNSPECIFIED，否则两类解码器会显示两种颜色；MC 恒 BT.601 且不改变像素）、**编码线程默认 1**（8 线程加速比仅 2.4×，而 t=1 产物反而小 0.6%，一图一线程吞吐更优）、中间表示统一 RGBA8 + `opaque` 标志（跳过 alpha 预乘、不写 alpha 平面）。默认档实机六个素材合计省 **83%**，产物 macOS ImageIO 全部可读。**两个新发现**：已被 WebP 压实的图转 AVIF 会反向膨胀 113%（no-gain 闸门的第一个实证，不能拖到最后做）；YCbCr+PackBits TIFF 上 `image` 与 ImageIO **双双失败而 ffmpeg 成功**，说明降级链末端可能还需要 ffmpeg 一环 |
 | 2026-08-08 | **新增 §12.1「基准 8 · 发布前验收基准」**（规格已定，待 M6 后执行）：三轴（耗时 / 质量 / 体积）、固定素材集（清单进 git、素材不进）、必须**跑完整应用**而非手搓 ffmpeg 命令、三条验收门槛。README 路线图与「约 1/3 体积」的口径同步标注为**由该基准回填** |
+| 2026-08-08 | **ADR-011**：**M2 图片元数据补齐**（朝向烘焙 + ICC/EXIF 编码期注入），`cargo test` 200 → **206 项通过**。决议 D-52~D-53：**支持格式收窄到常用格式**（`image` features 15 → 6，`kind.rs` 扩展名 17 → 11，设计/游戏工具链的中间产物与浮点 HDR 格式不在范围内，顺带给 ADR-010 §6 的 ffmpeg 兜底问题结案）、**EXIF 朝向烘焙进像素的同时必须清掉 EXIF 标签**——`avifImageSetMetadataExif` 会自动把 Orientation 翻成容器级 irot（`exif.c:145`），不清就是转两次，实测对照组产物带 `irot: 3` / ffprobe 读到 `rotation=-90`，而 macOS ImageIO 与 avifdec 都忽略 irot，**结果是同一文件在 Finder 里正常、在浏览器里躺倒**。**Display P3 往返验收通过**：带 ICC 时 CP/TC 留 2/2 交给 ICC，`sips` 正确读回 Display P3；对照组（模拟 ravif 路径）静默降级成 sRGB——这正是 D-48 的实证。元数据代价 674 字节（0.75%）**（此数已被 ADR-012 §1 推翻，见下行）** |
+| 2026-08-08 | **ADR-012**：**元数据保留策略复核**（纯文档轮次，无代码改动）。ADR-010/011 的三条机制全部维持，但**代价评估被推翻**：ADR-011 的「674 B / 0.75%」量在 `sips` 处理过的文件上（EXIF 被砍到 56 B），真机 iPhone JPEG 的 EXIF 是 **29160 B**，全量透传实测 **+10.24%**。决议 D-54~D-57：**EXIF 只剥 IFD1 缩略图**（实测占 EXIF 的 **89%（iPhone）/ 96%（Android）**，是描述原图的 160×120 陈旧 JPEG，AVIF 里零读取方；剥后 29160 → 3084 B，代价 **+10.24% → +2.17%**，Make/Model/DateTimeOriginal/曝光/GPS/MakerNote 逐个验证无损，`sips` 仍读回 Display P3 且 `Transformations: None`）——**实现只清 next-IFD 指针 + 条件截断，禁止重新序列化 TIFF**（会静默写废 MakerNote 的绝对偏移）、**XMP 纳入保留**（ADR-011「`image` 不暴露 XMP 入口」的前提有误，0.25.10 的 `xmp_metadata()` 五个 codec 全实现，编码侧早已就位，改动一行）、**产物必须继承源 mtime/birthtime**（实测 Spotlight **不从 AVIF 索引 EXIF**，`kMDItemAcquisitionModel=null`，Finder 与「照片」只认文件日期——不搬则整盘归档塌缩成压缩当天）、**`keep_metadata`/`strip_gps` 是接了 UI 的死配置**（Rust 侧无人读取，用户点「剥离 GPS」GPS 照发，隐私向静默失效，优先级最高）。新增 **R22**（TIFF 静默丢 EXIF：`image` 只给 png/jpeg/webp 实现 `exif_metadata()`） |
 
 ---
 
@@ -1550,7 +1896,12 @@ INFO zigzag_lib: 状态就绪 data_dir=~/Library/Application Support/com.zigzag.
 - **ADR-002 的 §3~§12 是活文档** —— 它们是当前设计的唯一事实来源，被后续 ADR 推翻时**就地更新**并标注来源（如「(D-13)」「ADR-003 修订」）。宁可就地改，也不要留下半篇过期的架构描述让人踩坑。
 - **每次工作结束前必须更新**：§12 勾选状态 + 文末 CHANGELOG 追加一行。
 
-**当前状态**：**M0、M1 均已完成**（ADR-007 / ADR-008 / ADR-009）。扫描、卷探测、权限探测、ffprobe 探测与缓存、策略判定、预估模型、IPC 事件、扫描报告界面全部落地，`cargo test` **187 项通过**，**Dry-run 已实机跑通**（选目录 → 扫描 → 报告，数字与后端日志逐项核对一致）。下一步是 §12 **M2 图片管线**第一项：`image` 解码 → `fast_image_resize` Lanczos3 → `ravif`/libavif 编码（D-21）。
-决议编号已用到 **D-47**，新决议从 D-48 起；基准测试编号已用到 **7**，**基准 8 已预留给发布前验收**（规格见 §12.1，待执行）。
+**当前状态**：**M0、M1 已完成**（ADR-007 / ADR-008 / ADR-009），**M2 进行中**（ADR-010 / ADR-011 / ADR-012）。扫描链路全部落地且 Dry-run 已实机跑通；图片单张管线（解码 → 朝向烘焙 → 短边缩放 → AVIF 编码 + ICC/EXIF 注入）已完整落地并实机验收（含 Display P3 往返），`cargo test` **206 项通过**。**ADR-012 是纯文档轮次，代码未动**——它给元数据策略定了新方向（分层取舍而非全留），对应四项新任务已插入 §12 M2。
 
-**无阻塞项**。唯一遗留的小尾巴：设置界面缺 `output.min_file_kb` 与 `output.include_raw` 两行（ADR-009 §8）。
+**下一步按此序**：①「接线 `keep_metadata`/`strip_gps`」（D-57，隐私向静默失效，优先级最高）→ ② 剥 IFD1 + XMP + TIFF EXIF 三项元数据补齐（D-54/D-55/R22，共用同一套 TIFF 字节编辑代码，宜一并做掉并配往返测试）→ ③ 原本的「统一有损编码入口（三档预设 q70/85/95）」→ 随后动图管线与 ImageIO 解码兜底。
+
+决议编号已用到 **D-57**，新决议从 D-58 起；风险编号已用到 **R22**；基准测试编号已用到 **7**，**基准 8 已预留给发布前验收**（规格见 §12.1，待执行）。
+
+**无阻塞项。两个提前暴露的排期问题**：
+1. ADR-010 §5 实测「已被 WebP 压实的图转 AVIF 反向膨胀 113%」，说明 no-gain 兜底在归档盘上是常态路径而非边角情况，不宜排到 M2 最后。
+2. ADR-012 §5 的 mtime 搬运挂在「原子写」项下，而写入阶段尚未开工——**这是目前唯一一个「零字节代价、但漏了就毁掉整盘归档可用性」的点**，写入阶段一开工就要带上，别等验收才发现。

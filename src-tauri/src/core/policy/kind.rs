@@ -35,10 +35,12 @@ impl Class {
 }
 
 /// 常规图片。GIF 也在内——D-27 之后动图走动画 AVIF，不再是排除项。
-const IMAGE: &[&str] = &[
-    "jpg", "jpeg", "jpe", "jfif", "png", "apng", "bmp", "gif", "tif", "tiff", "webp", "ico",
-    "tga", "pnm", "ppm", "pgm", "pbm",
-];
+///
+/// 只列归档盘里真实会出现的格式（D-52）。TGA / PNM / DDS / QOI 这类是设计与
+/// 游戏工具链的中间产物，照片库里遇不到；ICO 即使遇到也在「跳过小文件」门槛下。
+/// 不认识的扩展名一律当非媒体忽略，这是安全的一侧。
+const IMAGE: &[&str] =
+    &["jpg", "jpeg", "jpe", "jfif", "png", "apng", "bmp", "gif", "tif", "tiff", "webp"];
 
 const MODERN_IMAGE: &[&str] = &["heic", "heif", "hif", "avif", "avifs", "jxl"];
 
