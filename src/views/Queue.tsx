@@ -51,8 +51,17 @@ const ROW_H = 52;
 /**
  * 筛选栏。`status` 为 `null` 表示不筛。
  *
- * `count` 让这一行同时充当从前那条独立的统计行——两者本来就是同五个类别、
+ * `count` 让这一行同时充当从前那条独立的统计行——两者本来就是同几个类别、
  * 同一份 `JobUpdate`，渲染两遍是重复了一个概念，不只是多占 30px。
+ *
+ * **每个徽标必须等于它那一栏的行数。** 列表是按库里的 `status` 查的，所以徽标
+ * 也得按 `status` 拆：`update.pending` 是「还没处理完的」，含在飞的那几件，
+ * 直接拿来当「待处理」就会出现徽标写着 1、列表却是空的（ADR-029）。
+ *
+ * 「处理中」＝库里 `status='running'`，也就是**此刻真的在编码**的那几件，至多
+ * 闸门那么宽（视频 2 + 轻活 `ncpu-2`）。从库里取一批只是把它们排进通道、不写
+ * 任何状态，`running` 是闸门放行那一刻才写的（ADR-030）。所以这一栏的行数就是
+ * 并发窗口，和 `CLAIM_BATCH` 调多大没有关系。
  */
 const FILTERS: {
   id: string;
@@ -62,7 +71,13 @@ const FILTERS: {
   tone?: "good" | "bad";
 }[] = [
   { id: "all", status: null, label: "全部", count: (u) => u.total },
-  { id: "pending", status: "pending", label: "待处理", count: (u) => u.pending },
+  {
+    id: "pending",
+    status: "pending",
+    label: "待处理",
+    count: (u) => Math.max(0, u.pending - u.running),
+  },
+  { id: "running", status: "running", label: "处理中", count: (u) => u.running },
   { id: "done", status: "done", label: "已完成", count: (u) => u.done, tone: "good" },
   { id: "skipped", status: "skipped", label: "跳过", count: (u) => u.skipped },
   { id: "failed", status: "failed", label: "失败", count: (u) => u.failed, tone: "bad" },
@@ -178,10 +193,11 @@ function Header({ update }: { update: JobUpdate | null }) {
           </span>
         )}
         <div className="flex-1" />
-        {/* 样本不足时后端给 null，那就不显示——宁可没有，也不显示一个乱跳的数字。
-            **暂停时照常显示**（tasks.md #6）：它回答的是「现在点继续还要多久」，
-            而暂停期间这个数字是冻住的——后端算它时扣掉了停着的那段时间
-            （`core::job::PauseClock`），不扣的话它会在暂停期间一路往上涨。 */}
+        {/* 库里没有逐件预估时（v5 之前扫的任务）后端给 null，那就不显示——宁可
+            没有，也不显示一个编出来的数字。
+            **暂停时照常显示**（tasks.md #6）：它回答的是「现在点继续还要多久」。
+            暂停期间这个数是冻住的——公式里根本没有墙上时间，读数只随「哪几件
+            落定了」变（ADR-029）。 */}
         {update.eta_secs !== null && (
           <span className="text-xs tabular-nums text-muted-foreground">
             剩余 {formatEta(update.eta_secs)}
@@ -251,6 +267,11 @@ function StatusLine({
         <div className={box}>
           <Check className="size-3 shrink-0 text-good" />
           已完成
+          {/* 跑完了才有的一个数，格式和每行的「用时」一致。它是**这一次**跑掉的
+              时间：中途退出应用再回来接着跑，只算回来之后的那一段。 */}
+          {update.elapsed_secs > 0 && (
+            <span className="tabular-nums">耗时 {formatDuration(update.elapsed_secs)}</span>
+          )}
         </div>
       );
     case "failed":

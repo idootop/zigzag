@@ -92,7 +92,7 @@ pub enum Event {
     /// 0.0~1.0。图片管线不报进度（一张图零点几秒，报了也没人看得见）。
     Progress { id: i64, fraction: f64 },
     Finished { id: i64, result: Result<Done> },
-    /// 取消时已经进了通道却没派发出去的。**它必须回到队列**——认领时已经被
+    /// 停下时已经进了通道却没派发出去的。**它必须回到队列**——认领时已经被
     /// 标成 running，不退回就会一直卡在那儿，下次启动才被崩溃恢复捡起来。
     Requeued { id: i64 },
 }
@@ -230,8 +230,20 @@ async fn watch_power(mut video: Lane, mut light: Lane, full: Gates) {
     }
 }
 
-/// 暂停与取消。§6.3 的「停止派发」语义：**不挂起已经在跑的 ffmpeg**，
-/// 只是不再派新的。挂起子进程跨平台行为不一致，还容易留下僵尸进程。
+/// 暂停与取消。**对这一层来说是同一件事：立刻停下**（[`Control::is_stopping`]）。
+///
+/// 两者都把在飞的任务连同它们的 ffmpeg 子进程一起掐掉（见 [`abort_all_running`]），
+/// 区别只在停下之后谁来收拾：取消把整份队列删掉（`job_discard`），暂停则由
+/// [`crate::core::job`] 把条目退回待处理、等「继续」再起一趟。
+///
+/// 暂停原本是 §6.3 的「只停止派发，不打断在飞的那几件」，理由是 x265 没有断点
+/// 续编，掐掉等于把已经编的几分钟扔掉。**ADR-028 按用户的要求改掉了它**：按下
+/// 暂停的意思就是「现在把机器还给我」，而照原样办，界面已经停了之后 ffmpeg 还会
+/// 在 400~800% 的 CPU 上接着跑 16~44 秒（ADR-027 实测，跟着在飞那件还剩多少走，
+/// 没有上界）。代价是那几件下次从零再来，这是用户明确认下的那一笔。
+///
+/// 挂起子进程（SIGSTOP）不是出路：跨平台行为不一致，还容易留下僵尸进程，而且
+/// 一段挂起的 x265 仍然占着几百 MB 内存和它那份临时文件。
 #[derive(Debug, Default)]
 pub struct Control {
     cancelled: AtomicBool,
@@ -248,6 +260,9 @@ impl Control {
 
     pub fn pause(&self) {
         self.paused.store(true, Ordering::SeqCst);
+        // 和 `cancel` 一样要叫醒等在 `stopping` 上的派发循环。少了这一下，暂停
+        // 就得等某件在飞的任务自己跑完才被看见——那正是这次要修的病。
+        self.wake.notify_waiters();
     }
 
     pub fn resume(&self) {
@@ -263,16 +278,37 @@ impl Control {
         self.paused.load(Ordering::SeqCst)
     }
 
+    /// 该停下了吗——**暂停和取消在这一层不分家**，区别在停下之后谁来收拾。
+    pub fn is_stopping(&self) -> bool {
+        self.is_cancelled() || self.is_paused()
+    }
+
     /// 暂停期间在这里等。取消同样会把它放行——之后由调用方判断该退出。
     ///
-    /// 公开是因为**供给端也要跟着停**（`core::job` 的认领循环）：只让派发循环
-    /// 停下的话，认领循环会继续把条目标成 running 塞进通道，暂停期间库里就攒出
-    /// 一堆「在跑」却没人跑的条目；此时退出应用，它们要等下次崩溃恢复才回得来。
+    /// 只有 [`crate::core::job::run`] 用它，用在**两趟之间**：这一层的派发循环
+    /// 和供给端遇到暂停都是直接收工，谁也不在暂停里停着等（见 [`Control`]）。
     pub async fn wait_if_paused(&self) {
         while self.is_paused() && !self.is_cancelled() {
             // 先登记再复查：notify 发生在检查与 await 之间时不会丢唤醒。
             let waiter = self.wake.notified();
             if !self.is_paused() || self.is_cancelled() {
+                break;
+            }
+            waiter.await;
+        }
+    }
+
+    /// 等到该停为止；已经该停了就立刻返回。
+    ///
+    /// 派发循环拿它给那些长等待加一条退出边。只在循环顶上查一次 [`Self::is_stopping`]
+    /// 是不够的：闸门满是常态，那时循环卡在 `acquire_owned` 上，要等某件在飞的
+    /// 任务自己跑完才回得到顶上。
+    pub async fn stopping(&self) {
+        while !self.is_stopping() {
+            // 同 `wait_if_paused`：先登记再复查。`resume` 也会 notify，
+            // 那时这里空转一圈重新登记即可。
+            let waiter = self.wake.notified();
+            if self.is_stopping() {
                 break;
             }
             waiter.await;
@@ -288,13 +324,27 @@ pub struct Summary {
     /// 压了但没要：没省够体积，或 VMAF 没过门禁。原文件一个字节没动。
     pub skipped: u64,
     pub failed: u64,
-    /// 取消时还没派发出去的件数。
-    pub cancelled: u64,
+    /// 停下时没跑成的件数：还没派发出去的，加上在飞被掐掉的。
+    ///
+    /// 取消和暂停记在同一个数里，是因为对上游而言它们是同一件事——**都还挂在
+    /// 库里的 `running` 上，都要退回队列**（前者靠 `Event::Requeued`，后者靠
+    /// `db::release_running`）。分开计数并不会让任何一方多做一件事。
+    pub stopped: u64,
     pub src_bytes: u64,
     pub dst_bytes: u64,
 }
 
 impl Summary {
+    /// 把另一份账并进来。两条队列各记各的，一个任务的多趟之间也各记各的。
+    pub fn merge(&mut self, o: Summary) {
+        self.written += o.written;
+        self.skipped += o.skipped;
+        self.failed += o.failed;
+        self.stopped += o.stopped;
+        self.src_bytes += o.src_bytes;
+        self.dst_bytes += o.dst_bytes;
+    }
+
     fn record(&mut self, r: &Result<Done>) {
         match r {
             Ok(d) => {
@@ -348,7 +398,9 @@ where
 /// 通道的话，视频那头满了会把排在后面的图片一起堵住，等于把两条闸门的隔离
 /// 又还回去了。上游（`core::job`）为此开两个认领循环，各喂各的。
 ///
-/// 发送端 drop 掉即表示「没有更多任务了」，两条都收完才返回。
+/// 发送端 drop 掉即表示「没有更多任务了」，两条都收完才返回。取消或暂停会让
+/// 两条队列一起提前收工（见 [`Control`]），那时返回的是这一趟的账，没跑成的
+/// 条目由上游退回队列。
 pub async fn run_streamed<F>(
     heavy: mpsc::Receiver<Task>,
     light: mpsc::Receiver<Task>,
@@ -374,12 +426,7 @@ where
     // 两条队列都收完了，看门狗没有别的退出条件——它是个无限循环。
     watchdog.abort();
 
-    sa.written += sb.written;
-    sa.skipped += sb.skipped;
-    sa.failed += sb.failed;
-    sa.cancelled += sb.cancelled;
-    sa.src_bytes += sb.src_bytes;
-    sa.dst_bytes += sb.dst_bytes;
+    sa.merge(sb);
     sa
 }
 
@@ -400,16 +447,39 @@ where
     let mut running = JoinSet::new();
 
     loop {
-        ctl.wait_if_paused().await;
-        if ctl.is_cancelled() {
-            summary.cancelled += drain(&mut pending, &on_event);
+        if ctl.is_stopping() {
+            summary.stopped += drain(&mut pending, &on_event);
+            // 在飞的那几件交给下面的收尾统一掐掉——那里本来就要处理「停下恰好
+            // 落在等在飞任务的那段」，两处各写一遍只会有一处先长歪。
             break;
         }
-        let Some(task) = pending.recv().await else { break };
 
-        // 先拿许可再 spawn：在飞的任务数就恒等于闸门宽度（见模块文档）。
-        // 信号量只在整个调度结束时才可能被关闭，这里不会拿不到。
-        let permit = sem.clone().acquire_owned().await.expect("闸门不会在派发期间关闭");
+        // 两处长等待都要能被叫醒：闸门满时等在 `acquire_owned`，通道空时等在
+        // `recv`。两者都是分钟级的等待，而停止标志只在循环顶上查——不给它们加
+        // 这条退出边，停下就要等某件在飞的任务自己跑完才被看见。
+        //
+        // **先拿许可再取任务**，顺序不能反：反过来的话，停下恰好落在两步中间
+        // 会丢掉一件已经从通道里拿出来、库里还标着 running 的任务；这个顺序下
+        // 丢的只是一个许可。代价是通道空时有一个许可闲置着，看门狗那 5 秒一次
+        // 的收窄可能扣不到它——而它本来就是「扣不动就下次再扣」。
+        // 「在飞的任务数恒等于闸门宽度」这条不变量不受影响。
+        let next = tokio::select! {
+            biased;
+            () = ctl.stopping() => None,
+            r = async {
+                // 信号量只在整个调度结束时才可能被关闭，这里不会拿不到。
+                let permit = sem.clone().acquire_owned().await.ok()?;
+                Some((pending.recv().await?, permit))
+            } => Some(r),
+        };
+        let (task, permit) = match next {
+            // 该停了：回到顶上，由上面那条分支把账结清。
+            None => continue,
+            // 通道关了，正常收尾。
+            Some(None) => break,
+            Some(Some(v)) => v,
+        };
+
         let (cfg, on_event) = (cfg.clone(), on_event.clone());
         running.spawn(async move {
             let _permit = permit;
@@ -422,17 +492,78 @@ where
 
         // 收掉已经结束的，避免 JoinSet 无限攒完成态。
         while let Some(r) = running.try_join_next() {
-            summary.record(&flatten(r));
+            record(&mut summary, r);
         }
     }
 
-    while let Some(r) = running.join_next().await {
-        summary.record(&flatten(r));
-    }
+    await_running(&mut summary, &mut running, &ctl).await;
     summary
 }
 
-/// 取消时把通道里剩下的倒干净，逐条报 `Requeued`。
+/// 等在飞的那几件跑完，**取消或暂停要能打断这段等待**。
+///
+/// 这段等待不是边角情况，恰恰是常态：通道一关，派发循环剩下的时间全在这儿。
+/// 只有一个视频的任务从头到尾都是如此——供给端送完就 drop 了。ADR-027 修完
+/// 第一版之后真机仍然复现，正是漏了这条退出边：界面已经停了，ffmpeg 又以 700%
+/// 的 CPU 跑了 74 秒，最后把用户喊停的产物提交进了输出目录。
+async fn await_running(summary: &mut Summary, running: &mut JoinSet<Result<Done>>, ctl: &Control) {
+    loop {
+        tokio::select! {
+            biased;
+            () = ctl.stopping() => return abort_all_running(summary, running).await,
+            // `join_next` 是取消安全的：这一轮没选中它，已完成的结果仍留在
+            // `JoinSet` 里，下一轮照样取得到。
+            r = running.join_next() => match r {
+                Some(r) => record(summary, r),
+                None => return,
+            },
+        }
+    }
+}
+
+/// 停下时把在飞的任务全部掐掉。取消和暂停走的是同一条（见 [`Control`]）。
+///
+/// `abort_all` 会 drop 掉每个任务体，于是两件事顺势发生：三条管线的
+/// `Command` 全都设了 `kill_on_drop(true)`，子进程当场收到 SIGKILL；`Staged`
+/// 的 `Drop` 把 `.zz-*.tmp` 删掉。**中途掐掉不会留下垃圾**——这一点曾被当成
+/// 不能掐的理由写进 `job_discard` 的注释里，实测是反的（ADR-027）。
+///
+/// 掐不到的是 `spawn_blocking` 交出去的那些活——abort 只 drop 掉 `JoinHandle`，
+/// 闭包照跑到底。这是**有意留着**的（D-198）：§8 的原子提交序列不能被从中间
+/// 撕开。落在这个窗口里的有两处，边界都量过：
+///
+/// - 视频管线的 VMAF + 可解码校验 + 提交（`core::video`）：三段 2 秒抽样加一次
+///   解码，**与视频长度无关**，实测约 6 秒封顶，每条视频队列至多一件。
+/// - 图片管线整段（见 [`encode`]）：每张几百毫秒，至多「轻活闸门宽度」张。
+///   实测取消 84 视频 + 3000 图那一批时，账上 57 件而磁盘上 65 个文件，
+///   差的 8 个正是闸门宽度（`ncpu` 10 - 2）。
+///
+/// 不为这个窗口再加一层检查：检查点只能放在 commit 之前，而闭包基本一 spawn
+/// 就开跑，挡不住几个，代价却是三条管线都要多穿一个 `ctl` 参数。
+///
+/// 落在这个窗口里的那几件**不会回报 `Finished`**（任务体已经在 await 处被掐断，
+/// 走不到那一行），所以账目是干净的：它们照样以 running 身份退回队列，下一趟
+/// 重跑。重跑的代价是镜像模式覆盖同一个产物路径、原地模式发现源文件已被上一趟
+/// 收进回收站从而记 `src_missing`——都封在「轻活闸门宽度 + 每条队列一件」之内。
+async fn abort_all_running(summary: &mut Summary, running: &mut JoinSet<Result<Done>>) {
+    running.abort_all();
+    while let Some(r) = running.join_next().await {
+        record(summary, r);
+    }
+}
+
+/// 把 `JoinSet` 的一条结果记进账。
+///
+/// **被 abort 掉的不算失败**：那是用户按了取消，不是这件文件有问题。记成
+/// failed 的话，点一次取消就会在异常列表里凭空多出一批「任务线程异常退出」。
+fn record(summary: &mut Summary, r: std::result::Result<Result<Done>, tokio::task::JoinError>) {
+    match r {
+        Err(e) if e.is_cancelled() => summary.stopped += 1,
+        r => summary.record(&flatten(r)),
+    }
+}
+
+/// 停下时把通道里剩下的倒干净，逐条报 `Requeued`。
 ///
 /// 先 `close()` 再 `try_recv()`：不关的话上游还在往里塞，这个循环可能永远
 /// 追不上；关了之后已经在通道里的仍然收得到，语义正是「不再接新的，但手上
@@ -759,8 +890,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancelling_stops_dispatching_and_counts_the_rest() {
-        // 取消是「不再派新的」，不是「杀掉在跑的」。这里用 200 件必失败的任务，
-        // 第一件回来就取消，剩下的必须被算进 cancelled 而不是悄悄消失。
+        // 通道里还没派发出去的那些，必须被算进 stopped 而不是悄悄消失。
+        // 这里用 200 件必失败的任务，第一件回来就取消。
         let tasks: Vec<_> =
             (1..=200).map(|i| task(i, MediaKind::Image, "/nonexistent/x.jpg")).collect();
         let ctl = Arc::new(Control::default());
@@ -773,8 +904,8 @@ mod tests {
             })
             .await;
 
-        assert!(summary.cancelled > 0, "取消之后没有任何任务被拦下");
-        assert_eq!(summary.failed + summary.cancelled, 200, "有任务既没跑也没被记为取消");
+        assert!(summary.stopped > 0, "取消之后没有任何任务被拦下");
+        assert_eq!(summary.failed + summary.stopped, 200, "有任务既没跑也没被记为拦下");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -795,8 +926,170 @@ mod tests {
         })
         .await;
 
-        assert_eq!(requeued.lock().unwrap().len() as u64, summary.cancelled);
-        assert!(summary.cancelled > 0);
+        assert_eq!(requeued.lock().unwrap().len() as u64, summary.stopped);
+        assert!(summary.stopped > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelling_does_not_wait_for_the_work_in_flight() {
+        // 「停止派发」时这里等的是在飞的任务自己跑完：真机上一段 4 分 39 秒的
+        // 视频在七成处取消，ffmpeg 又以 620~800% 的 CPU 跑了 44 秒才停
+        // （ADR-027）。abort 之后应当立刻返回。
+        let mut running: JoinSet<Result<Done>> = JoinSet::new();
+        for _ in 0..3 {
+            running.spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                unreachable!("这三件不该有机会跑完")
+            });
+        }
+        // 先让它们真的跑起来，否则测的是「还没开始就被 abort」。
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        let mut summary = Summary::default();
+        let t = std::time::Instant::now();
+        abort_all_running(&mut summary, &mut running).await;
+
+        assert!(t.elapsed() < std::time::Duration::from_secs(1), "掐了 {:?} 才回来", t.elapsed());
+        assert_eq!(summary.stopped, 3);
+        assert_eq!(summary.failed, 0, "取消不是失败，记成 failed 会在异常列表里凭空多出一批");
+    }
+
+    /// 一种喊停的方式：名字 + 按下它的那一下。
+    type Stop = (&'static str, fn(&Control));
+
+    /// 取消和暂停在这一层必须一模一样（ADR-028），所以下面几组都跑两遍。
+    const STOPS: [Stop; 2] = [("取消", Control::cancel), ("暂停", Control::pause)];
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stopping_wakes_a_queue_that_is_waiting_for_work() {
+        // 派发循环平时就卡在两处长等待上（等闸门许可、等通道来任务），而停止
+        // 标志只在循环顶上查。不给这两处加退出边，喊停就得等到有任务进来、
+        // 或者发送端 drop 才生效。这里发送端一直开着、一件任务都不送——
+        // 少了那条退出边，下面这个 timeout 就会到点。
+        for (name, stop) in STOPS {
+            let (htx, hrx) = mpsc::channel(4);
+            let (ltx, lrx) = mpsc::channel(4);
+            let ctl = Arc::new(Control::default());
+            let c = ctl.clone();
+
+            let job = tokio::spawn(async move {
+                run_streamed(hrx, lrx, &Profile::default(), Gates { video: 1, light: 1 }, c, |_| {})
+                    .await
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            stop(&ctl);
+
+            let summary = tokio::time::timeout(std::time::Duration::from_secs(2), job)
+                .await
+                .unwrap_or_else(|_| panic!("{name}之后派发循环没能退出"))
+                .unwrap();
+            assert_eq!(summary, Summary::default(), "一件都没派出去，账上不该有数");
+            drop((htx, ltx));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stopping_interrupts_the_wait_for_the_last_files() {
+        // 通道一关，派发循环剩下的时间全花在收尾的等待上，只剩最后几件在飞。
+        // 真机上「一个视频的任务」从头到尾都是这个状态：供给端送完就 drop 了。
+        // 这里少一条退出边，喊停就得等那件视频自己编完——实测 74 秒（ADR-027）。
+        for (name, stop) in STOPS {
+            let mut running: JoinSet<Result<Done>> = JoinSet::new();
+            for _ in 0..2 {
+                running.spawn(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    unreachable!("这两件不该有机会跑完")
+                });
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+            let ctl = Arc::new(Control::default());
+            let c = ctl.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                stop(&c);
+            });
+
+            let mut summary = Summary::default();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                await_running(&mut summary, &mut running, &ctl),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{name}没能打断收尾的等待"));
+            assert_eq!(summary.stopped, 2);
+        }
+    }
+
+    /// 真视频 + 真 ffmpeg：喊停之后子进程该当场没，输出目录不留东西。
+    ///
+    /// **只送一件、送完立刻 drop 发送端**，照着真机上「一个视频的任务」来：
+    /// 那时通道早早就关了，派发循环整段时间都停在收尾的等待上。留着发送端的话
+    /// 这个测试会绿，而真机上照样跑满 74 秒（ADR-027 的第二次翻车就在这里）。
+    ///
+    /// 取消和暂停各跑一遍，**串在一个测试里**：判据是数全机的 ffmpeg 进程，
+    /// 拆成两个测试会被 cargo 并行调度，两边互相数到对方的子进程。
+    ///
+    /// 需要 /tmp/zz-long/long.mov，所以默认忽略。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn stopping_kills_the_real_ffmpeg() {
+        fn ffmpegs() -> usize {
+            let out = std::process::Command::new("pgrep")
+                .args(["-f", "target/debug/ffmpeg"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).lines().count()
+        }
+
+        let src = PathBuf::from("/tmp/zz-long/long.mov");
+        assert!(src.exists(), "缺素材");
+
+        for (name, stop) in STOPS {
+            let out = std::path::Path::new("/tmp/zz-abort-test");
+            let _ = std::fs::remove_dir_all(out);
+            std::fs::create_dir_all(out).unwrap();
+
+            let (htx, hrx) = mpsc::channel(4);
+            let (ltx, lrx) = mpsc::channel(4);
+            htx.send(Task { id: 1, src: src.clone(), dst: out.join("out.mp4"), kind: MediaKind::Video })
+                .await
+                .unwrap();
+            drop((htx, ltx));
+            let ctl = Arc::new(Control::default());
+            let c = ctl.clone();
+            let job = tokio::spawn(async move {
+                run_streamed(hrx, lrx, &Profile::default(), Gates { video: 2, light: 4 }, c, |_| {})
+                    .await
+            });
+
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            assert!(ffmpegs() > 0, "十秒了还没起 ffmpeg，这一趟不算数");
+            let t = std::time::Instant::now();
+            stop(&ctl);
+
+            let summary = tokio::time::timeout(std::time::Duration::from_secs(30), job)
+                .await
+                .unwrap_or_else(|_| panic!("{name}之后调度没能返回"))
+                .unwrap();
+            let returned = t.elapsed();
+
+            let mut gone = None;
+            for _ in 0..300 {
+                if ffmpegs() == 0 {
+                    gone = Some(t.elapsed());
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            eprintln!("[{name}] 调度返回 {returned:?}  ffmpeg 消失 {gone:?}  summary={summary:?}");
+            let left: Vec<_> =
+                std::fs::read_dir(out).unwrap().map(|e| e.unwrap().file_name()).collect();
+            eprintln!("[{name}] 残留: {left:?}");
+            assert!(gone.is_some_and(|d| d < std::time::Duration::from_secs(3)), "[{name}] ffmpeg 没被掐掉");
+            assert_eq!(summary.written, 0, "[{name}] 用户喊停之后不该再把产物提交进输出目录");
+            assert!(left.is_empty(), "[{name}] 掐掉之后输出目录该是干净的，实际留下 {left:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -830,7 +1123,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn pausing_holds_the_queue_until_resumed() {
+    async fn pausing_ends_the_pass_it_does_not_hold_it() {
+        // 这一条原来叫 `pausing_holds_the_queue_until_resumed`：暂停时派发循环
+        // 停在 `wait_if_paused` 上等「继续」，这一层不返回。ADR-028 改掉了它——
+        // 暂停和取消一样是当场收工，等「继续」的活挪到了 `job::run` 的两趟之间。
+        // 这里钉的就是这个交接：**这一层必须返回**，否则 `job::run` 永远拿不到
+        // 这一趟的账，也就永远起不了下一趟。
         let tasks: Vec<_> =
             (1..=50).map(|i| task(i, MediaKind::Image, "/nonexistent/x.jpg")).collect();
         let ctl = Arc::new(Control::default());
@@ -848,12 +1146,12 @@ mod tests {
             .await
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let summary = tokio::time::timeout(std::time::Duration::from_secs(2), job)
+            .await
+            .expect("暂停之后派发循环没能返回——「继续」就再也起不来了")
+            .unwrap();
         assert_eq!(started.load(Ordering::SeqCst), 0, "暂停状态下不该派发任何任务");
-
-        ctl.resume();
-        let summary = job.await.unwrap();
-        assert_eq!(summary.failed, 50, "恢复后没有把队列跑完");
+        assert_eq!(summary.stopped, 50, "一件都没跑，五十件全该记成拦下并退回队列");
     }
 
     // ────────────────────────── 基准：轻活闸门 ──────────────────────────

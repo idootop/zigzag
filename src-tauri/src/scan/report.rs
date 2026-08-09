@@ -172,6 +172,17 @@ pub struct Aggregator {
     cancelled: bool,
 }
 
+/// [`Aggregator::add`] 对一个文件的判定：压不压，以及预计要跑多久。
+///
+/// 两个值来自同一次判定，必须一起交给调用方——`est_secs` 是跑动中「剩余时间」
+/// 的全部依据（ADR-029），从前它在这里算完就被丢掉了。
+pub struct Added {
+    /// 非 `None` 表示这一件不压，值是原因。
+    pub skip: Option<SkipReason>,
+    /// 单件耗时（串行秒，未折并发），见 [`crate::store::NewItem::est_secs`]。
+    pub est_secs: f64,
+}
+
 impl Aggregator {
     pub fn new(cfg: Profile, roots: Vec<PathBuf>) -> Self {
         Self {
@@ -192,11 +203,11 @@ impl Aggregator {
         }
     }
 
-    /// 记一个已探测的文件，返回它被跳过的原因（`None` = 进处理计划）。
+    /// 记一个已探测的文件，返回它该怎么入库。
     ///
-    /// 跳过判定在这里做，调用方不用重复一遍——但结果要还给调用方：扫描会把
-    /// 「进计划」的那些写进 `items`，判两遍等于给了两个可能不一致的答案。
-    pub fn add(&mut self, path: &Path, p: &Probed) -> Option<SkipReason> {
+    /// 跳过判定和逐件预估都在这里做，调用方不用重复一遍——但两个结果都要还给
+    /// 调用方：扫描会把它们一起写进 `items`，各判一遍等于给了两个可能不一致的答案。
+    pub fn add(&mut self, path: &Path, p: &Probed) -> Added {
         self.media_found += 1;
         self.note_dir(path, p.size_bytes);
 
@@ -204,13 +215,15 @@ impl Aggregator {
             let slot = self.by_reason.entry(reason).or_insert((0, 0));
             slot.0 += 1;
             slot.1 += p.size_bytes;
-            return Some(reason);
+            // 跳过的条目在镜像模式下还要 clonefile 进输出树，但那是 APFS 上的
+            // O(1) 操作，不占预估时间。
+            return Added { skip: Some(reason), est_secs: 0.0 };
         }
 
         let item = estimate::item(p, &self.cfg);
         self.total.push(p.size_bytes, item);
         self.by_kind.entry(p.class.media_kind()).or_default().push(p.size_bytes, item);
-        None
+        Added { skip: None, est_secs: item.seconds.mid }
     }
 
     /// 把 walker 的统计并进来。遍历与探测是两个阶段，计数分开攒。

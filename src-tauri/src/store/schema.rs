@@ -8,11 +8,12 @@ use rusqlite::Connection;
 use crate::error::Result;
 
 /// 当前 schema 版本。加迁移时 +1，并在 `MIGRATIONS` 末尾追加。
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 type Migration = fn(&Connection) -> rusqlite::Result<()>;
 
-const MIGRATIONS: &[Migration] = &[v1_initial, v2_dedup, v3_item_list_index, v4_job_estimate];
+const MIGRATIONS: &[Migration] =
+    &[v1_initial, v2_dedup, v3_item_list_index, v4_job_estimate, v5_item_estimate];
 
 /// 打开数据库并迁移到最新版本。
 pub fn open(path: &std::path::Path) -> Result<Connection> {
@@ -248,6 +249,19 @@ fn v3_item_list_index(conn: &Connection) -> rusqlite::Result<()> {
 /// 允许 NULL：v4 之前建的任务没有这个数，预检只能放行（见 D-147）。
 fn v4_job_estimate(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("ALTER TABLE jobs ADD COLUMN est_out_bytes INTEGER;")
+}
+
+/// 把扫描时算出的**逐个文件**耗时预估存进条目行，给跑动中的「剩余时间」用。
+///
+/// v4 存的是整批的产物体积，这一列存的是每一件要跑多久（`estimate::item` 的
+/// `seconds.mid`，单件串行秒、未折并发）。有了它，剩余时间才能按**工作量**外推
+/// 而不是按件数——一个 665 MB 的视频和一张 4.8 MB 的照片在按件数的平均里是等价的
+/// 一件，实测差 20 倍（ADR-029）。
+///
+/// `DEFAULT 0` 而不是允许 NULL：这一列只参与求和，0 就是「不知道」，
+/// 求和结果为 0 时 ETA 直接不显示（旧库里跑到一半的任务就是这个待遇）。
+fn v5_item_estimate(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("ALTER TABLE items ADD COLUMN est_secs REAL NOT NULL DEFAULT 0;")
 }
 
 #[cfg(test)]

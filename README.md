@@ -1,12 +1,13 @@
 <div align="center">
 
-# Zigzag
+<img src="src-tauri/icons/icon.png" width="128" height="128" alt="ZigZag" />
+
+# ZigZag
 
 **体积更小，画质如初**
 
 面向本地归档的多媒体批量压缩工具。<br/>
-在肉眼无损的前提下，把照片压到约 **1/7**、视频压到约 **1/5**，<br/>
-拍摄时间、地点与设备信息一并带走。
+在肉眼无损的前提下，把照片压到约 **1/10**、视频压到约 **1/5**<br/>
 
 [![Status](https://img.shields.io/badge/status-开发中·未发布-orange)](PROGRESS.md)
 [![Platform](https://img.shields.io/badge/platform-macOS%20(Apple%20Silicon)-black)](#系统要求)
@@ -29,7 +30,7 @@
 处理慢、画质损失不可控、任务断了就得从头再来。更要命的是，多数工具压完就覆写或删除原文件，
 一旦出错便无从挽回。
 
-Zigzag 想让归档整理变成一件**可预期、可中断、可回滚**的事：
+ZigZag 想让归档整理变成一件**可预期、可中断、可回滚**的事：
 选好目录，先看预估能省多少，确认后再开始，随时可以关机，下次打开接着跑。
 
 ## 特性
@@ -118,7 +119,7 @@ pnpm tauri build     # 打包出 .app 与 .dmg
 > 放行方式二选一：
 >
 > - 前往**系统设置 → 隐私与安全性**，在底部点击「仍要打开」；
-> - 或在终端执行 `xattr -dr com.apple.quarantine /Applications/zigzag.app`。
+> - 或在终端执行 `xattr -dr com.apple.quarantine /Applications/ZigZag.app`。
 >
 > 只需操作一次，之后正常双击即可。
 

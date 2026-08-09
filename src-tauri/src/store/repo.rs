@@ -31,13 +31,18 @@ pub struct NewItem {
     /// ——把原文件放进输出树，不然那棵树会缺文件（D-16 / D-101）。真正的处理
     /// 在认领时短路掉。
     pub skip_reason: Option<&'static str>,
+    /// 扫描时算出的单件耗时（串行秒，未折并发），来自 `estimate::item`。
+    ///
+    /// 跑动中的「剩余时间」按它加权（ADR-029）。跳过的条目是 0——它们只是被
+    /// clonefile 进输出树，不花时间。
+    pub est_secs: f64,
 }
 
 /// 一条刚被认领、即将派发的条目。
 ///
 /// 带上 `src_size`/`src_mtime` 是为了在派发前做**源改动检测**（§7 恢复语义）：
 /// 库里的记录可能是几天前扫的，文件早被替换或删掉了。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Claimed {
     pub id: i64,
     pub src_path: String,
@@ -50,6 +55,8 @@ pub struct Claimed {
     /// 手改过的库）要是被当成「没有原因」，一个 RAW 就会真的被转码（R5）。
     /// 查表只用来给这条记录配一句人话。
     pub skip_reason: Option<String>,
+    /// 扫描时算出的单件耗时，见 [`NewItem::est_secs`]。记账线程拿它算剩余时间。
+    pub est_secs: f64,
 }
 
 /// 一条待落库的结果。
@@ -58,17 +65,23 @@ pub struct Claimed {
 /// 调用方把结果攒进 `Vec`，满 200 条或 500 ms 交给 [`Db::apply_results`] 一次写完。
 #[derive(Debug, Clone)]
 pub enum ItemResult {
+    /// 闸门放行了，这一件**此刻真的在编码**。
+    ///
+    /// 库里的 `running` 就是从这里来的，不是从认领来的（ADR-030）：认领只是
+    /// 供给端的缓冲，一次取一批是为了少走几趟库，跟「谁在跑」没有关系。
+    Started { id: i64 },
     Done { id: i64, dst_path: String, dst_size: u64, elapsed_ms: u64 },
     Failed { id: i64, code: String, msg: String },
     Skipped { id: i64, reason: String },
-    /// 认领了但没跑（暂停、取消、卷拔出）。退回队列，下次接着来。
+    /// 排上了队但没轮到就停了（暂停、取消、卷拔出）。下次接着来。
     Requeued { id: i64 },
 }
 
 impl ItemResult {
     fn id(&self) -> i64 {
         match self {
-            ItemResult::Done { id, .. }
+            ItemResult::Started { id }
+            | ItemResult::Done { id, .. }
             | ItemResult::Failed { id, .. }
             | ItemResult::Skipped { id, .. }
             | ItemResult::Requeued { id } => *id,
@@ -180,6 +193,23 @@ impl Db {
         self.conn.lock().expect("数据库锁中毒")
     }
 
+    /// 收地：`VACUUM` 之后立刻把 WAL 回写并截断。
+    ///
+    /// **只 `VACUUM` 是看不见效果的**。WAL 模式下 `VACUUM` 重建出来的那份库先写进
+    /// `-wal`，主文件一个字节都不动——本机实测一份 8,654,848 B 的库，删空并
+    /// `VACUUM` 之后 `zigzag.db` 仍是 8,654,848 B，而 `-wal` 涨到 8,705,592 B，
+    /// **磁盘占用当场翻倍**；直到连接关闭做检查点，主文件才落回 8,192 B。而这个
+    /// 连接是跟着进程走的（`AppState` 里就一份），于是「点完成 → 数据目录缩回去」
+    /// 在用户退出应用之前根本不会发生，用户看到的只有变大。
+    ///
+    /// `wal_checkpoint(TRUNCATE)` 把 WAL 回写主库并截到 0：同一份库当场从
+    /// 8.6 MB 落到 8,192 B。只在真删掉了东西之后调，代价才对得起收益。
+    fn vacuum(conn: &Connection) -> Result<()> {
+        conn.execute_batch("VACUUM")?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        Ok(())
+    }
+
     pub fn create_job(
         &self,
         name: &str,
@@ -215,8 +245,9 @@ impl Db {
         {
             let mut stmt = tx.prepare_cached(
                 "INSERT OR IGNORE INTO items
-                   (job_id, src_path, src_size, src_mtime, src_inode, kind, status, skip_reason)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+                   (job_id, src_path, src_size, src_mtime, src_inode, kind, status, skip_reason,
+                    est_secs)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
             )?;
             for it in items {
                 added += stmt.execute(params![
@@ -227,6 +258,7 @@ impl Db {
                     it.src_inode.map(|v| v as i64),
                     it.kind.as_str(),
                     it.skip_reason,
+                    it.est_secs,
                 ])?;
             }
         }
@@ -288,20 +320,64 @@ impl Db {
         Ok(p)
     }
 
-    /// 取一批待处理条目并标记为 running，原子完成，避免两个工作线程抢到同一条。
-    pub fn claim_pending(&self, job_id: i64, limit: usize) -> Result<Vec<Claimed>> {
-        self.claim_pending_of(job_id, &[MediaKind::Image, MediaKind::Video, MediaKind::Audio], limit)
+    /// 还没落定的条目一共有多少预估工作量，分成 **(视频, 轻活)** 两条队列。
+    ///
+    /// 单位是串行秒、未折并发——和 `estimate::item` 的口径一致，折并发是
+    /// `estimate::wall_seconds` 的事。记账线程开跑时问一次，之后自己扣减。
+    ///
+    /// 分队方式必须与 [`crate::core::orchestrator`] 一致：视频一条，图片与音频一条。
+    pub fn pending_work(&self, job_id: i64) -> Result<(f64, f64)> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT
+               coalesce(sum(CASE WHEN kind='video' THEN est_secs END), 0),
+               coalesce(sum(CASE WHEN kind<>'video' THEN est_secs END), 0)
+             FROM items WHERE job_id=?1 AND status IN ('pending','running')",
+            params![job_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(Into::into)
     }
 
-    /// 只认领指定类型的条目。
+    /// 取一批待处理条目。`after_id` 传 0 表示从头取。
+    pub fn take_pending(&self, job_id: i64, after_id: i64, limit: usize) -> Result<Vec<Claimed>> {
+        let all = [MediaKind::Image, MediaKind::Video, MediaKind::Audio];
+        self.take_pending_of(job_id, &all, after_id, limit)
+    }
+
+    /// 测试专用：把这几条标成「正在编码」，等同于产品代码里
+    /// [`ItemResult::Started`] 落库那一下。
+    #[cfg(test)]
+    pub fn mark_running(&self, ids: &[i64]) {
+        let rows: Vec<_> = ids.iter().map(|id| ItemResult::Started { id: *id }).collect();
+        self.apply_results(&rows).unwrap();
+    }
+
+    /// 只取指定类型的条目，取 id 大于 `after_id` 的头 `limit` 条。
     ///
     /// 调度器把重活和轻活分成两条队列（[`crate::core::orchestrator`]），两条的
-    /// **供给端也要各自独立**：一个认领循环喂视频、一个喂图片与音频。共用一个
-    /// 认领循环的话，取到一串视频就会把图片那条队列饿着。
-    pub fn claim_pending_of(
+    /// **供给端也要各自独立**：一条供给循环喂视频、一条喂图片与音频。共用一条
+    /// 的话，取到一串视频就会把图片那条队列饿着。
+    ///
+    /// ## 为什么只读、不标记（ADR-030）
+    ///
+    /// 从前这里顺手把取到的整批标成 `status='running'`，于是库里的 running
+    /// 是「供给端的缓冲」而不是「正在编码的」——一批 32 条 × 两条队列，25 个
+    /// 文件的任务开跑一瞬间就全成了 running，界面上「待处理」当场归零、
+    /// 「处理中」一大堆，而真正在跑的只有闸门那几件。
+    ///
+    /// 现在 running 由 [`ItemResult::Started`] 在闸门放行之后才写。取重复行靠
+    /// **游标**而不是靠改状态：一趟之内 id 单调递增地往下取，取过的不再回头。
+    /// 掉队的那几条（暂停时退回队列的）id 更小，但退回只发生在一趟收尾，
+    /// 下一趟是新的供给循环、游标从 0 起，捡得回来。
+    ///
+    /// 每件的写次数没变：从前是「认领一次 + 结果一次」，现在是「开跑一次 +
+    /// 结果一次」，而且两者走的是同一条攒批通道（[`Db::apply_results`]）。
+    pub fn take_pending_of(
         &self,
         job_id: i64,
         kinds: &[MediaKind],
+        after_id: i64,
         limit: usize,
     ) -> Result<Vec<Claimed>> {
         if kinds.is_empty() {
@@ -311,34 +387,27 @@ impl Db {
         // 没有注入面；换成占位符反而要按长度动态生成，更绕。
         let list =
             kinds.iter().map(|k| format!("'{}'", k.as_str())).collect::<Vec<_>>().join(",");
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        let rows: Vec<Claimed> = {
-            let mut stmt = tx.prepare_cached(&format!(
-                "SELECT id, src_path, src_size, src_mtime, kind, skip_reason FROM items
-                 WHERE job_id=?1 AND status='pending' AND kind IN ({list})
-                 ORDER BY id LIMIT ?2"
-            ))?;
-            // 先落到变量再离开作用域：直接把 collect 当作块的尾表达式会让借用
-            // 活过 stmt 的生命周期。
-            let rows = stmt
-                .query_map(params![job_id, limit as i64], |r| {
-                    Ok(Claimed {
-                        id: r.get(0)?,
-                        src_path: r.get(1)?,
-                        src_size: r.get::<_, i64>(2)? as u64,
-                        src_mtime: r.get(3)?,
-                        kind: MediaKind::from_str(&r.get::<_, String>(4)?),
-                        skip_reason: r.get(5)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            rows
-        };
-        for it in &rows {
-            tx.execute("UPDATE items SET status='running' WHERE id=?1", params![it.id])?;
-        }
-        tx.commit()?;
+        let conn = self.lock();
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT id, src_path, src_size, src_mtime, kind, skip_reason, est_secs FROM items
+             WHERE job_id=?1 AND status='pending' AND id>?2 AND kind IN ({list})
+             ORDER BY id LIMIT ?3"
+        ))?;
+        // 先落到变量再离开作用域：直接把 collect 当作块的尾表达式会让借用
+        // 活过 stmt 的生命周期。
+        let rows = stmt
+            .query_map(params![job_id, after_id, limit as i64], |r| {
+                Ok(Claimed {
+                    id: r.get(0)?,
+                    src_path: r.get(1)?,
+                    src_size: r.get::<_, i64>(2)? as u64,
+                    src_mtime: r.get(3)?,
+                    kind: MediaKind::from_str(&r.get::<_, String>(4)?),
+                    skip_reason: r.get(5)?,
+                    est_secs: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -356,6 +425,12 @@ impl Db {
         let tx = conn.transaction()?;
         for r in rows {
             match r {
+                // 只从 pending 迁移：这一件要是已经落定了（同一批里排在后面的
+                // Done 先到过库，或者重复的消息），不能被这条拖回 running。
+                ItemResult::Started { id } => tx.execute(
+                    "UPDATE items SET status='running' WHERE id=?1 AND status='pending'",
+                    params![id],
+                )?,
                 ItemResult::Done { id, dst_path, dst_size, elapsed_ms } => tx.execute(
                     "UPDATE items SET status='done', dst_path=?2, dst_size=?3, elapsed_ms=?4,
                                       skip_reason=NULL, error_code=NULL, error_msg=NULL
@@ -538,9 +613,10 @@ impl Db {
     /// `running` 额外挡一道：它是唯一可能有进程正在写的状态。`items`、
     /// `dedup_groups`、`dedup_members` 上都有 `ON DELETE CASCADE`，删父行即带走全部。
     ///
-    /// 删完 `VACUUM`：SQLite 删行只是把页标成空闲留着复用，文件不会自己变小。
-    /// 用户去 `Application Support` 里看到的还是那 25 MB，等于没删。只在真删掉了
-    /// 东西时才做，25 MB 的库实测几十毫秒。
+    /// 删完走 [`Db::vacuum`]：SQLite 删行只是把页标成空闲留着复用，文件不会自己
+    /// 变小；而 WAL 模式下单靠 `VACUUM` 也还是不变小。用户去 `Application Support`
+    /// 里看到的还是那 25 MB，等于没删。只在真删掉了东西时才做，25 MB 的库实测
+    /// 几十毫秒。
     pub fn prune_history(&self) -> Result<usize> {
         // 先问，再上锁：`resumable_job` 自己要锁，这把锁不可重入。
         let keep = self.resumable_job()?;
@@ -556,7 +632,7 @@ impl Db {
             [],
         )?;
         if n > 0 {
-            conn.execute_batch("VACUUM")?;
+            Self::vacuum(&conn)?;
             tracing::info!(count = n, "清掉了读不到的历史数据");
         }
         Ok(n)
@@ -569,13 +645,13 @@ impl Db {
     /// 没有（tasks.md #3）。删掉的只是「还没干的那份清单」，重扫一遍就能再有；
     /// 已经压好的文件在盘上，一个都不动。
     ///
-    /// `VACUUM` 的理由同 [`Db::prune_history`]：不做的话用户点完取消去看数据目录，
-    /// 那 25 MB 还在。
+    /// 收地（[`Db::vacuum`]）的理由同 [`Db::prune_history`]：不做的话用户点完取消
+    /// 去看数据目录，那 25 MB 还在。
     pub fn discard_job(&self, job_id: i64) -> Result<()> {
         let conn = self.lock();
         let n = conn.execute("DELETE FROM jobs WHERE id=?1", params![job_id])?;
         if n > 0 {
-            conn.execute_batch("VACUUM")?;
+            Self::vacuum(&conn)?;
             tracing::info!(job_id, "任务已放弃");
         }
         Ok(())
@@ -736,6 +812,7 @@ mod tests {
             src_inode: None,
             kind: MediaKind::Image,
             skip_reason: None,
+            est_secs: 0.0,
         }
     }
 
@@ -753,7 +830,7 @@ mod tests {
     fn progress_counts_and_bytes() {
         let (db, job) = db_with_job();
         db.add_items(job, &[item("/a.jpg"), item("/b.jpg"), item("/c.jpg")]).unwrap();
-        let claimed = db.claim_pending(job, 3).unwrap();
+        let claimed = db.take_pending(job, 0, 3).unwrap();
         db.finish_item(claimed[0].id, "/out/a.avif", 100, 50).unwrap();
         db.skip_item(claimed[1].id, "no_gain").unwrap();
         db.fail_item(claimed[2].id, &crate::error::ZzError::Other("boom".into())).unwrap();
@@ -772,22 +849,58 @@ mod tests {
     }
 
     #[test]
-    fn claim_does_not_hand_out_the_same_item_twice() {
+    fn the_cursor_walks_the_queue_without_repeating() {
+        // 取不改状态了（ADR-030），去重全靠游标。游标要是没往前走，供给循环
+        // 会把队头那一批反复喂进调度器，同一个文件被压好几遍。
         let (db, job) = db_with_job();
         db.add_items(job, &[item("/a.jpg"), item("/b.jpg")]).unwrap();
-        let first = db.claim_pending(job, 1).unwrap();
-        let second = db.claim_pending(job, 1).unwrap();
+        let first = db.take_pending(job, 0, 1).unwrap();
         assert_eq!(first.len(), 1);
+        let second = db.take_pending(job, first[0].id, 1).unwrap();
         assert_eq!(second.len(), 1);
-        assert_ne!(first[0].id, second[0].id, "两次认领不能拿到同一条");
-        assert!(db.claim_pending(job, 10).unwrap().is_empty(), "取完就该是空的");
+        assert_ne!(first[0].id, second[0].id, "游标之后不该再拿到同一条");
+        assert!(db.take_pending(job, second[0].id, 10).unwrap().is_empty(), "取完就该是空的");
+        // 而且它们还留在队列里——真正的 running 由 `ItemResult::Started` 写。
+        assert_eq!(db.job_progress(job).unwrap().pending, 2);
+    }
+
+    #[test]
+    fn running_starts_when_the_gate_lets_it_through_not_when_it_is_taken() {
+        // 这条钉的正是 ADR-030 那个 bug：整批一取就全成了 running，
+        // 于是「待处理」当场归零、「处理中」堆着一大批根本没在跑的。
+        let (db, job) = db_with_job();
+        db.add_items(job, &[item("/a.jpg"), item("/b.jpg")]).unwrap();
+        let taken = db.take_pending(job, 0, 2).unwrap();
+        assert_eq!(db.job_progress(job).unwrap().running, 0, "取出来不等于在跑");
+
+        db.mark_running(&[taken[0].id]);
+        let p = db.job_progress(job).unwrap();
+        assert_eq!((p.running, p.pending), (1, 1));
+    }
+
+    #[test]
+    fn a_finished_item_is_not_dragged_back_to_running() {
+        // 同一批里 Started 排在 Done 前面是常态（图片几百毫秒就跑完）。
+        // 迟到的 Started 要是能盖回去，这一条就永远挂在「处理中」了。
+        let (db, job) = db_with_job();
+        db.add_items(job, &[item("/a.jpg")]).unwrap();
+        let id = db.take_pending(job, 0, 1).unwrap()[0].id;
+        db.apply_results(&[
+            ItemResult::Started { id },
+            ItemResult::Done { id, dst_path: "/out/a.avif".into(), dst_size: 1, elapsed_ms: 1 },
+            ItemResult::Started { id },
+        ])
+        .unwrap();
+        let p = db.job_progress(job).unwrap();
+        assert_eq!((p.done, p.running), (1, 0));
     }
 
     #[test]
     fn recover_puts_running_items_back_in_queue() {
         let (db, job) = db_with_job();
         db.add_items(job, &[item("/a.jpg"), item("/b.jpg")]).unwrap();
-        db.claim_pending(job, 2).unwrap();
+        let ids: Vec<_> = db.take_pending(job, 0, 2).unwrap().iter().map(|c| c.id).collect();
+        db.mark_running(&ids);
         assert_eq!(db.job_progress(job).unwrap().running, 2);
 
         // 模拟崩溃后重启。
@@ -800,7 +913,7 @@ mod tests {
     fn recover_leaves_finished_items_alone() {
         let (db, job) = db_with_job();
         db.add_items(job, &[item("/a.jpg"), item("/b.jpg")]).unwrap();
-        let claimed = db.claim_pending(job, 2).unwrap();
+        let claimed = db.take_pending(job, 0, 2).unwrap();
         db.finish_item(claimed[0].id, "/out/a.avif", 100, 10).unwrap();
 
         db.recover_interrupted().unwrap();
@@ -866,7 +979,7 @@ mod tests {
     fn failure_records_a_stable_error_code() {
         let (db, job) = db_with_job();
         db.add_items(job, &[item("/a.jpg")]).unwrap();
-        let id = db.claim_pending(job, 1).unwrap()[0].id;
+        let id = db.take_pending(job, 0, 1).unwrap()[0].id;
         db.fail_item(id, &crate::error::ZzError::ToolNotFound("ffmpeg")).unwrap();
 
         let code: String = db
@@ -890,10 +1003,43 @@ mod tests {
             src_inode: Some(9),
             kind: MediaKind::Video,
             skip_reason: None,
+            est_secs: 0.0,
         }])
         .unwrap();
-        let c = &db.claim_pending(job, 1).unwrap()[0];
+        let c = &db.take_pending(job, 0, 1).unwrap()[0];
         assert_eq!((c.src_size, c.src_mtime, c.kind), (4242, 777, MediaKind::Video));
+    }
+
+    #[test]
+    fn est_secs_survives_a_claim() {
+        // 剩余时间是按这个数加权的（ADR-029）。它要是在入库或认领的路上掉了，
+        // 记账线程扣减的就是 0，ETA 会一路不动然后突然归零。
+        let (db, job) = db_with_job();
+        db.add_items(job, &[NewItem { est_secs: 12.5, ..item("/a.jpg") }]).unwrap();
+        assert_eq!(db.take_pending(job, 0, 1).unwrap()[0].est_secs, 12.5);
+    }
+
+    #[test]
+    fn pending_work_splits_video_from_the_rest() {
+        // 分队方式必须和调度器一致：视频一条，图片与音频一条。分错了，
+        // 折并发时视频会被当成能开八路的轻活，剩余时间直接少一个量级。
+        let (db, job) = db_with_job();
+        db.add_items(job, &[
+            NewItem { kind: MediaKind::Video, est_secs: 100.0, ..item("/v.mp4") },
+            NewItem { est_secs: 3.0, ..item("/a.jpg") },
+            NewItem { kind: MediaKind::Audio, est_secs: 1.0, ..item("/b.mp3") },
+        ])
+        .unwrap();
+        assert_eq!(db.pending_work(job).unwrap(), (100.0, 4.0));
+
+        // 认领了还没干完的仍然算在里面——它们还欠着这些时间。
+        db.take_pending_of(job, &[MediaKind::Video], 0, 1).unwrap();
+        assert_eq!(db.pending_work(job).unwrap(), (100.0, 4.0));
+
+        // 落定了的就不算了。
+        let jpg = db.take_pending_of(job, &[MediaKind::Image], 0, 1).unwrap()[0].id;
+        db.finish_item(jpg, "/out/a.avif", 1000, 100).unwrap();
+        assert_eq!(db.pending_work(job).unwrap(), (100.0, 1.0));
     }
 
     #[test]
@@ -908,7 +1054,7 @@ mod tests {
         db.add_items(job, &vids).unwrap();
 
         let light = db
-            .claim_pending_of(job, &[MediaKind::Image, MediaKind::Audio], 10)
+            .take_pending_of(job, &[MediaKind::Image, MediaKind::Audio], 0, 10)
             .unwrap();
         assert_eq!(
             light.iter().map(|c| c.src_path.as_str()).collect::<Vec<_>>(),
@@ -916,16 +1062,16 @@ mod tests {
             "轻活认领不该被队头的视频挡住"
         );
 
-        let heavy = db.claim_pending_of(job, &[MediaKind::Video], 10).unwrap();
+        let heavy = db.take_pending_of(job, &[MediaKind::Video], 0, 10).unwrap();
         assert_eq!(heavy.len(), 3);
-        assert!(db.claim_pending(job, 10).unwrap().is_empty(), "两条加起来就是全部");
+        assert_eq!(heavy.len() + light.len(), 5, "两条加起来就是全部");
     }
 
     #[test]
     fn claiming_no_kind_at_all_is_not_a_query() {
         let (db, job) = db_with_job();
         db.add_items(job, &[item("/a.jpg")]).unwrap();
-        assert!(db.claim_pending_of(job, &[], 10).unwrap().is_empty());
+        assert!(db.take_pending_of(job, &[], 0, 10).unwrap().is_empty());
         // 空列表拼出来的 `IN ()` 是语法错误，所以必须提前短路；
         // 而且不能顺手把条目标成 running。
         assert_eq!(db.job_progress(job).unwrap().pending, 1);
@@ -936,7 +1082,7 @@ mod tests {
         let (db, job) = db_with_job();
         db.add_items(job, &[item("/a.jpg"), item("/b.jpg"), item("/c.jpg"), item("/d.jpg")])
             .unwrap();
-        let c = db.claim_pending(job, 4).unwrap();
+        let c = db.take_pending(job, 0, 4).unwrap();
         db.apply_results(&[
             ItemResult::Done { id: c[0].id, dst_path: "/o/a.avif".into(), dst_size: 300, elapsed_ms: 12 },
             ItemResult::Skipped { id: c[1].id, reason: "no_gain".into() },
@@ -956,7 +1102,7 @@ mod tests {
         // 「重试次数用尽」这类将来才会有的策略。
         let (db, job) = db_with_job();
         db.add_items(job, &[item("/a.jpg")]).unwrap();
-        let id = db.claim_pending(job, 1).unwrap()[0].id;
+        let id = db.take_pending(job, 0, 1).unwrap()[0].id;
         db.apply_results(&[ItemResult::Requeued { id }]).unwrap();
 
         let attempt: i64 = db
@@ -965,7 +1111,7 @@ mod tests {
             .unwrap();
         assert_eq!(attempt, 0);
         // 崩溃恢复那条路才该记账。
-        db.claim_pending(job, 1).unwrap();
+        db.mark_running(&[id]);
         db.recover_interrupted().unwrap();
         let attempt: i64 = db
             .lock()
@@ -1002,7 +1148,8 @@ mod tests {
     fn release_running_is_the_gentle_version_of_recover() {
         let (db, job) = db_with_job();
         db.add_items(job, &[item("/a.jpg"), item("/b.jpg")]).unwrap();
-        db.claim_pending(job, 2).unwrap();
+        let ids: Vec<_> = db.take_pending(job, 0, 2).unwrap().iter().map(|c| c.id).collect();
+        db.mark_running(&ids);
         assert_eq!(db.release_running(job).unwrap(), 2);
         assert_eq!(db.job_progress(job).unwrap().pending, 2);
     }
@@ -1011,7 +1158,7 @@ mod tests {
     fn retry_clears_the_old_error_so_the_list_does_not_lie() {
         let (db, job) = db_with_job();
         db.add_items(job, &[item("/a.jpg")]).unwrap();
-        let id = db.claim_pending(job, 1).unwrap()[0].id;
+        let id = db.take_pending(job, 0, 1).unwrap()[0].id;
         db.fail_item(id, &crate::error::ZzError::Other("盘满了".into())).unwrap();
 
         assert_eq!(db.retry_failed(job).unwrap(), 1);
@@ -1025,7 +1172,7 @@ mod tests {
         let (db, job) = db_with_job();
         let batch: Vec<_> = (0..5).map(|i| item(&format!("/{i}.jpg"))).collect();
         db.add_items(job, &batch).unwrap();
-        let c = db.claim_pending(job, 5).unwrap();
+        let c = db.take_pending(job, 0, 5).unwrap();
         db.apply_results(&[
             ItemResult::Failed { id: c[1].id, code: "io".into(), msg: "读不到".into() },
             ItemResult::Failed { id: c[3].id, code: "io".into(), msg: "读不到".into() },
@@ -1053,7 +1200,7 @@ mod tests {
         // 孤儿 .zz-tmp 的清理要靠这批路径定位目录，所以必须在 recover 之前拿到。
         let (db, job) = db_with_job();
         db.add_items(job, &[item("/a.jpg")]).unwrap();
-        db.claim_pending(job, 1).unwrap();
+        db.mark_running(&[db.take_pending(job, 0, 1).unwrap()[0].id]);
         assert_eq!(db.running_items().unwrap(), [(job, "/a.jpg".to_string())]);
         db.recover_interrupted().unwrap();
         assert!(db.running_items().unwrap().is_empty());
@@ -1066,7 +1213,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let done = db.create_job("跑完了", &[], None, &Profile::default()).unwrap();
         db.add_items(done, &[item("/a.jpg")]).unwrap();
-        let id = db.claim_pending(done, 1).unwrap()[0].id;
+        let id = db.take_pending(done, 0, 1).unwrap()[0].id;
         db.apply_results(&[ItemResult::Done { id, dst_path: "/o".into(), dst_size: 1, elapsed_ms: 1 }])
             .unwrap();
         db.set_job_status(done, "done").unwrap();
@@ -1076,7 +1223,7 @@ mod tests {
 
         let resumable = db.create_job("跑了一半", &[], None, &Profile::default()).unwrap();
         db.add_items(resumable, &[item("/c.jpg"), item("/d.jpg")]).unwrap();
-        let id = db.claim_pending(resumable, 1).unwrap()[0].id;
+        let id = db.take_pending(resumable, 0, 1).unwrap()[0].id;
         db.apply_results(&[ItemResult::Done { id, dst_path: "/o".into(), dst_size: 1, elapsed_ms: 1 }])
             .unwrap();
         db.set_job_status(resumable, "paused").unwrap();
@@ -1097,7 +1244,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let job = db.create_job("正在跑", &[], None, &Profile::default()).unwrap();
         db.add_items(job, &[item("/a.jpg")]).unwrap();
-        db.claim_pending(job, 1).unwrap();
+        db.take_pending(job, 0, 1).unwrap();
         db.set_job_status(job, "running").unwrap();
 
         assert_eq!(db.prune_history().unwrap(), 0);
@@ -1111,7 +1258,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let job = db.create_job("不想跑了", &[], None, &Profile::default()).unwrap();
         db.add_items(job, &[item("/a.jpg"), item("/b.jpg")]).unwrap();
-        db.claim_pending(job, 1).unwrap();
+        db.take_pending(job, 0, 1).unwrap();
         db.set_job_status(job, "paused").unwrap();
         assert_eq!(db.resumable_job().unwrap(), Some(job));
 
@@ -1120,6 +1267,43 @@ mod tests {
         assert!(db.get_job(job).is_err());
         // CASCADE 要把条目一起带走，否则删了个寂寞——占地方的正是它们。
         assert_eq!(db.job_progress(job).unwrap().total, 0);
+    }
+
+    #[test]
+    fn cleaning_up_shrinks_the_file_on_disk_right_away() {
+        // 这条必须落在**真文件**上：内存库量不出字节数，而这个 bug 只在文件上出现。
+        // 真机验 ADR-024 §7 #2 时抓到的——点「完成」之后 `zigzag.db` 一个字节没少，
+        // `-wal` 反倒涨了。WAL 模式下 `VACUUM` 重建的库先落在 WAL 里，主文件要等
+        // 检查点；而应用的连接跟着进程走，不退出就永远等不到。
+        let dir = std::env::temp_dir().join("zigzag-vacuum-shrinks");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+
+        let db = Db::open(&path).unwrap();
+        let job = db.create_job("大任务", &[], None, &Profile::default()).unwrap();
+        // 三万条路径，撑到 MB 级——十万文件的归档盘实测 25 MB，这里取个零头。
+        let items: Vec<_> = (0..30_000)
+            .map(|i| item(&format!("/很长很长的一段路径用来占地方/{i}.jpg")))
+            .collect();
+        db.add_items(job, &items).unwrap();
+        let before = total_bytes(&path);
+        assert!(before > 1 << 20, "样本得先真的占地方，实测 {before} B");
+
+        db.discard_job(job).unwrap();
+        let after = total_bytes(&path);
+        // 连接还开着就要看得见——这正是 bug 的所在。
+        assert!(after * 8 < before, "取消之后磁盘占用要当场落下来：{before} B → {after} B");
+
+        drop(db);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 库在盘上一共占多少：主文件 + WAL。少算 WAL 就会把「搬到 WAL 里去了」
+    /// 误判成「省下来了」。
+    fn total_bytes(path: &Path) -> u64 {
+        let one = |p: std::path::PathBuf| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        one(path.to_path_buf()) + one(path.with_extension("db-wal"))
     }
 
     #[test]
@@ -1152,7 +1336,7 @@ mod tests {
         db.set_job_status(job, "running").unwrap();
         assert_eq!(db.resumable_job().unwrap(), Some(job));
 
-        let id = db.claim_pending(job, 1).unwrap()[0].id;
+        let id = db.take_pending(job, 0, 1).unwrap()[0].id;
         db.apply_results(&[ItemResult::Done { id, dst_path: "/o".into(), dst_size: 1, elapsed_ms: 1 }])
             .unwrap();
         assert_eq!(db.resumable_job().unwrap(), Some(job), "还剩一条就还能续");
@@ -1161,7 +1345,7 @@ mod tests {
         db.set_job_status(job, "paused").unwrap();
         assert_eq!(db.resumable_job().unwrap(), Some(job));
 
-        let id = db.claim_pending(job, 1).unwrap()[0].id;
+        let id = db.take_pending(job, 0, 1).unwrap()[0].id;
         db.apply_results(&[ItemResult::Done { id, dst_path: "/o".into(), dst_size: 1, elapsed_ms: 1 }])
             .unwrap();
         assert_eq!(db.resumable_job().unwrap(), None, "跑完了就不该再提示继续");

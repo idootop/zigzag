@@ -7,7 +7,20 @@
  * 的全表聚合，十万行乘以 10 Hz 就是把 SQLite 当秒表用。开跑时查一次做种，
  * 之后自己加。
  */
-export type JobUpdate = { job_id: number, total: number, done: number, failed: number, skipped: number, pending: number, 
+export type JobUpdate = { job_id: number, total: number, done: number, failed: number, skipped: number, 
+/**
+ * 还没处理完的条目数，**含在飞的那几件**（= `total - done - failed - skipped`）。
+ */
+pending: number, 
+/**
+ * 其中**此刻真的在编码**的条数，至多闸门那么宽（视频 2 + 轻活 `ncpu-2`）。
+ *
+ * 单列出来是为了让界面上的数和列表对得上：队列页「待处理」那一栏查的是
+ * `status='pending'`，不含在飞的，所以它的徽标必须是 `pending - running`
+ * （ADR-029）。恒等式 `pending - running == 库里 pending 的条数` 由「库里的
+ * `running` 也在闸门放行那一刻写」保证（ADR-030）。
+ */
+running: number, 
 /**
  * 已完成条目的源字节总和。
  */
@@ -29,10 +42,16 @@ current_fraction: number, paused: boolean,
  */
 volume_lost: string | null, 
 /**
- * 剩余秒数。**样本不足时为 `None`**——开头几秒的速率毫无参考价值，
- * 显示一个乱跳的数字比不显示更糟。
+ * 剩余秒数。跑完时、或者库里没有逐件预估时（v5 之前扫的任务）为 `None`。
  */
 eta_secs: number | null, 
+/**
+ * 这个任务**干了**多久，扣掉停着的那些段。跑完那一帧显示「耗时」用。
+ *
+ * 从进程这一次接手这个任务算起：中途退出应用再回来接着跑，这个数从头计。
+ * 记在内存里而不是库里——为了一个展示用的数字，每 100 ms 写一次库不值当。
+ */
+elapsed_secs: number, 
 /**
  * 最后一帧。界面靠它把「正在处理」那一行收掉。
  */

@@ -162,11 +162,12 @@ mod tests {
                 src_inode: None,
                 kind: MediaKind::Image,
                 skip_reason: None,
+                est_secs: 0.0,
             }],
         )
         .unwrap();
-        // 认领 = 标成 running，正是崩溃时留下的状态。
-        db.claim_pending(job, 10).unwrap();
+        // 开跑 = 标成 running，正是崩溃时留下的状态。
+        db.mark_running(&[db.take_pending(job, 0, 10).unwrap()[0].id]);
         Scene { db, job, src, out }
     }
 

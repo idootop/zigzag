@@ -146,7 +146,7 @@ fn trash_one(t: &Target) -> Outcome {
     }
 
     // 必须走 platform 那层包装，不能直接 `trash::delete`：crate 在 macOS 上默认用
-    // Finder（AppleScript），第一次删就会弹「zigzag 想要控制"访达"」的自动化授权，
+    // Finder（AppleScript），第一次删就会弹「ZigZag 想要控制"访达"」的自动化授权，
     // 拒绝之后查重删除永久失效。理由见 [`crate::platform::trash`] 的模块文档。
     match crate::platform::trash::to_trash(&t.path) {
         Ok(()) => Outcome::Trashed,

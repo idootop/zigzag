@@ -109,7 +109,7 @@ pub async fn run(
         for (found, probed) in &analyzed {
             // 被排除的也入队，带上原因（D-101）。它们不会被压，但镜像模式下
             // 还欠一份原文件——不落库就没人知道要补，输出树从此缺一块。
-            let skip_reason = agg.add(&found.path, probed).map(|r| r.as_str());
+            let added = agg.add(&found.path, probed);
             queued.push(NewItem {
                 src_path: found.path.display().to_string(),
                 src_size: found.size,
@@ -117,7 +117,10 @@ pub async fn run(
                 // 0 不是合法 inode，出现即表示读属性失败，别把它当真。
                 src_inode: (found.inode != 0).then_some(found.inode),
                 kind: probed.class.media_kind(),
-                skip_reason,
+                skip_reason: added.skip.map(|r| r.as_str()),
+                // 逐件预估顺手落库：跑动中的「剩余时间」全靠它，而这里是唯一
+                // 算得起这个数的地方——重算一遍等于把整块盘重扫一次。
+                est_secs: added.est_secs,
             });
             current = found.path.display().to_string();
         }
@@ -499,7 +502,7 @@ mod tests {
 
         let first =
             run(db.clone(), cfg.clone(), vec![t.0.clone()], Arc::new(AtomicBool::new(false)), |_| {}).await;
-        let id = db.claim_pending(first.job_id, 1).unwrap()[0].id;
+        let id = db.take_pending(first.job_id, 0, 1).unwrap()[0].id;
         db.finish_item(id, "/out/a.avif", 1, 1).unwrap();
         // 用户按了暂停——`job::run` 收尾时留的就是这个状态。
         db.set_job_status(first.job_id, "paused").unwrap();

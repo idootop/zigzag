@@ -117,10 +117,6 @@ impl Range {
         self.mid += o.mid;
         self.high += o.high;
     }
-    /// 逐项取上界。两条队列跑在不同硅片上时，总耗时取较慢的一条而非相加。
-    fn max(self, o: Range) -> Range {
-        Range::new(self.low.max(o.low), self.mid.max(o.mid), self.high.max(o.high))
-    }
     fn div(self, k: f64) -> Range {
         Range::new(self.low / k, self.mid / k, self.high / k)
     }
@@ -195,15 +191,12 @@ impl Estimate {
     /// 与 [`Estimate::seconds`] 合得起来（软编相加、硬编取 max），界面要在同一屏上
     /// 既显示分条又显示总计时，必须用这一对，否则分条加起来对不上总计。
     pub fn lane_walls(&self) -> (Range, Range) {
-        let g = gates();
-        let video = self
-            .video_seconds
-            .div(if self.hw_video || g.video <= 1 { 1.0 } else { VIDEO_CONCURRENCY });
-        let light = self.light_seconds.div((g.light as f64).powf(LIGHT_SCALING_EXP));
+        let video = self.video_seconds.div(video_divisor(self.hw_video));
+        let light = self.light_seconds.div(light_divisor());
         (video, light)
     }
 
-    /// 把两条队列的串行耗时折算成墙钟。
+    /// 把两条队列的串行耗时折算成墙钟。逐分量调 [`wall_seconds`]。
     ///
     /// 两步，各有一条实测依据：
     ///
@@ -215,14 +208,13 @@ impl Estimate {
     /// 这一步以前不存在：调度器还没实现时按「单线程串行求和」报数，图片多的
     /// 任务会把 ETA 报大六七倍。
     fn wall_clock(&self) -> Range {
-        let (video, light) = self.lane_walls();
-        if self.hw_video {
-            video.max(light)
-        } else {
-            let mut total = video;
-            total.add(light);
-            total
-        }
+        let (v, l) = (self.video_seconds, self.light_seconds);
+        let hw = self.hw_video;
+        Range::new(
+            wall_seconds(v.low, l.low, hw),
+            wall_seconds(v.mid, l.mid, hw),
+            wall_seconds(v.high, l.high, hw),
+        )
     }
 
     /// 能省下的字节。产物反而更大时算 0，不显示负数。
@@ -237,6 +229,28 @@ impl Estimate {
 fn gates() -> Gates {
     static G: OnceLock<Gates> = OnceLock::new();
     *G.get_or_init(Gates::detect)
+}
+
+/// 视频队列开到闸门宽度之后，串行耗时该除以多少。
+fn video_divisor(hw: bool) -> f64 {
+    if hw || gates().video <= 1 { 1.0 } else { VIDEO_CONCURRENCY }
+}
+
+/// 轻活队列同理。
+fn light_divisor() -> f64 {
+    (gates().light as f64).powf(LIGHT_SCALING_EXP)
+}
+
+/// 把两条队列的串行工作量折成墙钟。[`Estimate::wall_clock`] 的标量版本。
+///
+/// **扫描期的预估和跑动中的「剩余时间」必须共用这一个模型**，否则同一批文件在
+/// 报告页和队列页会给出两个数。跑动中那一头见 `core::job` 的 `Book::eta`。
+///
+/// 两步，各有一条实测依据，展开在 [`Estimate::lane_walls`] 与 [`Estimate::wall_clock`]。
+pub fn wall_seconds(video: f64, light: f64, hw: bool) -> f64 {
+    let (v, l) = (video / video_divisor(hw), light / light_divisor());
+    // 软编时两条队列抢同一批核，墙钟相加；只有视频走媒体引擎才是两块独立的硅。
+    if hw { v.max(l) } else { v + l }
 }
 
 // ---------------------------------------------------------------- 估算
@@ -558,6 +572,30 @@ mod tests {
         let wide = (gates().light as f64).powf(LIGHT_SCALING_EXP);
         let expect = hw.video_seconds.mid.max(hw.light_seconds.mid / wide);
         assert!((hw.seconds.mid - expect).abs() < 1e-9, "硬编该取 max：{:?}", hw.seconds);
+    }
+
+    #[test]
+    fn wall_seconds_agrees_with_wall_clock() {
+        // 跑动中的「剩余时间」用的是标量那个入口，报告页用的是 Range 那个。
+        // 两者只要有一处走岔，同一批文件在两屏上就会给出两个数。
+        let img = Probed { width: 4032, height: 3024, ..Probed::new(Class::Image, "jpg", 4 << 20) };
+        let vid = video_probe(1920, 1080, 30.0, 60.0, 100_000_000);
+        let mut hw_cfg = Profile::default();
+        hw_cfg.video.lane = Lane::MediaEngine;
+
+        for (cfg, hw) in [(Profile::default(), false), (hw_cfg, true)] {
+            let mut est = Estimate::default();
+            est.push(4 << 20, item(&img, &cfg));
+            est.push(100_000_000, item(&vid, &cfg));
+            let (v, l) = (est.video_seconds, est.light_seconds);
+            for (a, b) in [
+                (est.seconds.low, wall_seconds(v.low, l.low, hw)),
+                (est.seconds.mid, wall_seconds(v.mid, l.mid, hw)),
+                (est.seconds.high, wall_seconds(v.high, l.high, hw)),
+            ] {
+                assert!((a - b).abs() < 1e-9, "hw={hw}: {a} vs {b}");
+            }
+        }
     }
 
     #[test]
