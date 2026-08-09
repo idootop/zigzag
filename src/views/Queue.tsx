@@ -17,8 +17,6 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   AlertTriangle,
   Check,
-  History,
-  ListChecks,
   Loader2,
   Pause,
   Play,
@@ -28,12 +26,14 @@ import {
 } from "lucide-react";
 
 import { Compare } from "@/components/Compare";
+import { Notice } from "@/components/Notice";
 import { Thumb } from "@/components/Thumb";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { ipc, type ItemRow, type JobUpdate } from "@/lib/ipc";
 import { cn, formatBytes, formatCount, formatDuration, formatEta, formatSaving } from "@/lib/utils";
 import { useJob } from "@/store/job";
+import { resetCompress } from "@/store/ui";
 
 import { PathText } from "./parts/PathText";
 
@@ -48,19 +48,32 @@ const PAGE = 200;
  */
 const ROW_H = 52;
 
-/** 筛选栏。`status` 为 `null` 表示不筛。 */
-const FILTERS: { id: string; status: string | null; label: string }[] = [
-  { id: "all", status: null, label: "全部" },
-  { id: "pending", status: "pending", label: "待处理" },
-  { id: "done", status: "done", label: "已完成" },
-  { id: "skipped", status: "skipped", label: "没动" },
-  { id: "failed", status: "failed", label: "失败" },
+/**
+ * 筛选栏。`status` 为 `null` 表示不筛。
+ *
+ * `count` 让这一行同时充当从前那条独立的统计行——两者本来就是同五个类别、
+ * 同一份 `JobUpdate`，渲染两遍是重复了一个概念，不只是多占 30px。
+ */
+const FILTERS: {
+  id: string;
+  status: string | null;
+  label: string;
+  count: (u: JobUpdate) => number;
+  tone?: "good" | "bad";
+}[] = [
+  { id: "all", status: null, label: "全部", count: (u) => u.total },
+  { id: "pending", status: "pending", label: "待处理", count: (u) => u.pending },
+  { id: "done", status: "done", label: "已完成", count: (u) => u.done, tone: "good" },
+  { id: "skipped", status: "skipped", label: "跳过", count: (u) => u.skipped },
+  { id: "failed", status: "failed", label: "失败", count: (u) => u.failed, tone: "bad" },
 ];
 
 export function Queue() {
-  const { phase, jobId, update } = useJob();
+  const jobId = useJob((s) => s.jobId);
+  const update = useJob((s) => s.update);
 
-  if (phase === "idle" || jobId === null) return <Empty />;
+  // 阶段路由已经保证了 phase !== idle 才会走到这儿（store/ui.ts）。
+  if (jobId === null) return null;
 
   return (
     <div className="flex h-full flex-col">
@@ -70,29 +83,125 @@ export function Queue() {
   );
 }
 
-function Empty() {
+/**
+ * 队列阶段的主操作，摆进工具栏右槽。
+ *
+ * 「再压一批」走 `resetCompress()` 而不是裸的 `job.reset()`：只清任务的话，
+ * 阶段优先级会掉到 `scan.phase === "done"`，那份已经被消费掉的报告会原路返回
+ * （store/ui.ts）。
+ */
+export function QueueActions() {
+  const phase = useJob((s) => s.phase);
+  const jobId = useJob((s) => s.jobId);
+  const paused = useJob((s) => s.update?.paused ?? false);
+  const failed = useJob((s) => s.update?.failed ?? 0);
+  const start = useJob((s) => s.start);
+  const pause = useJob((s) => s.pause);
+  const resume = useJob((s) => s.resume);
+  const cancel = useJob((s) => s.cancel);
+  const retry = useJob((s) => s.retry);
+  const [retried, setRetried] = useState<number | null>(null);
+
+  if (phase === "running") {
+    return (
+      <>
+        {paused ? (
+          <Button size="sm" onClick={() => void resume()} className="gap-1.5">
+            <Play className="size-3.5" />
+            继续
+          </Button>
+        ) : (
+          <Button size="sm" variant="outline" onClick={() => void pause()} className="gap-1.5">
+            <Pause className="size-3.5" />
+            暂停
+          </Button>
+        )}
+        <Button size="sm" variant="ghost" onClick={() => void cancel()} className="gap-1.5">
+          <X className="size-3.5" />
+          停止
+        </Button>
+      </>
+    );
+  }
+
+  if (phase === "resumable") {
+    return (
+      <>
+        {/* 输出目录传 null：后端会用库里记着的那个，用户不必再选一遍。 */}
+        <Button
+          size="sm"
+          onClick={() => void (jobId !== null && start(jobId, null))}
+          className="gap-1.5"
+        >
+          <Play className="size-3.5" />
+          接着跑
+        </Button>
+        <Button size="sm" variant="ghost" onClick={resetCompress}>
+          关闭
+        </Button>
+      </>
+    );
+  }
+
+  // 中断的任务只给一条退路。**不给「再试一次」**：能让它死在启动上的多半是
+  // 配置问题（镜像模式没输出目录之类），原样再点一次只会再死一次；库里的进度
+  // 一条不少，下次打开由续跑接住。
+  if (phase === "failed") {
+    return (
+      <Button size="sm" onClick={resetCompress}>
+        关闭
+      </Button>
+    );
+  }
+
   return (
-    <div className="grid h-full place-items-center">
-      <div className="flex flex-col items-center gap-2 text-muted-foreground">
-        <ListChecks className="size-8" strokeWidth={1.5} />
-        <p className="text-sm">还没有任务</p>
-        <p className="text-xs">在「开始」里选择目录并扫描</p>
-      </div>
-    </div>
+    <>
+      {retried !== null && (
+        <span className="text-xs text-muted-foreground">
+          {retried > 0 ? `已退回 ${formatCount(retried)} 项` : "没有可重试的项目"}
+        </span>
+      )}
+      {failed > 0 && (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => void retry().then(setRetried)}
+          className="gap-1.5"
+        >
+          <RotateCcw className="size-3.5" />
+          重试失败项 {formatCount(failed)}
+        </Button>
+      )}
+      <Button size="sm" onClick={resetCompress}>
+        再压一批
+      </Button>
+    </>
   );
 }
 
-/** 顶部：进度、数字、控制按钮。 */
+/**
+ * 顶部：进度与数字。控制按钮已经上了工具栏，这里只剩「现在怎么样了」。
+ */
 function Header({ update }: { update: JobUpdate | null }) {
-  const { phase, jobId, start, pause, resume, cancel, retry, reset } = useJob();
-  const [retried, setRetried] = useState<number | null>(null);
+  const phase = useJob((s) => s.phase);
 
   // 还没收到第一帧。不画 0%，那会让人以为任务卡在开头。
+  // 一帧都没收到就断了（配置不对是最常见的一种），这时更不能画「正在启动…」——
+  // 那个圈会一直转下去。原因由提示条说，这里只交代它没在跑。
   if (!update) {
     return (
       <div className="flex shrink-0 items-center gap-2 border-b border-border px-6 py-4 text-sm text-muted-foreground">
-        <Loader2 className="size-4 animate-spin" />
-        正在启动…
+        {phase === "failed" ? (
+          <>
+            <AlertTriangle className="size-4 text-destructive" />
+            任务没能开始
+          </>
+        ) : (
+          <>
+            <Loader2 className="size-4 animate-spin" />
+            正在启动…
+          </>
+        )}
       </div>
     );
   }
@@ -101,157 +210,106 @@ function Header({ update }: { update: JobUpdate | null }) {
   const pct = update.total > 0 ? (settled / update.total) * 100 : 0;
   const saved = update.src_bytes - update.dst_bytes;
   const running = phase === "running";
-  const resumable = phase === "resumable";
-
-  async function onRetry() {
-    setRetried(await retry());
-  }
 
   return (
     <header className="flex shrink-0 flex-col gap-3 border-b border-border px-6 py-4">
       {/* 上次没跑完。说清还剩多少，别让用户自己拿总数减一减。 */}
-      {resumable && (
-        <div className="flex items-center gap-2 rounded-lg border border-border bg-secondary/60 px-3 py-2 text-sm">
-          <History className="size-4 shrink-0 text-muted-foreground" />
-          <span className="min-w-0 flex-1">
-            上次还剩 {formatCount(update.pending)} 个没处理完，进度都在。
-          </span>
-        </div>
+      {phase === "resumable" && (
+        <Notice>上次还剩 {formatCount(update.pending)} 个没处理完，进度都在。</Notice>
       )}
 
       {update.volume_lost && (
-        <div className="flex items-center gap-2 rounded-lg border border-warn/30 bg-warn/10 px-3 py-2 text-sm">
-          <AlertTriangle className="size-4 shrink-0 text-warn" />
-          <span className="min-w-0 flex-1">
-            找不到 <span className="font-mono">{update.volume_lost}</span> 了，任务已自动暂停。
-            把硬盘插回去再点「继续」，进度都在。
+        <Notice tone="warn">
+          找不到 <span className="font-mono">{update.volume_lost}</span> 了，任务已自动暂停。
+          把硬盘插回去再点「继续」，进度都在。
+        </Notice>
+      )}
+
+      {phase === "failed" ? (
+        /* 中途死了。**不报「已完成」**——数字停在断掉那一刻，已经压好的都在库里，
+           下次打开会被续跑捞出来。出了什么事由上面的提示条说。 */
+        <div className="flex items-baseline gap-2 text-sm">
+          <AlertTriangle className="size-4 shrink-0 self-center text-destructive" />
+          <span className="font-medium">任务中断</span>
+          <span className="tabular-nums text-muted-foreground">
+            已压缩 {formatCount(update.done)} · 还剩 {formatCount(update.pending)}，
+            进度都在，下次打开可以接着跑
           </span>
+        </div>
+      ) : phase === "finished" ? (
+        /* 跑完了就换成一句小结，取代那个 12px 的「已结束」。**列表留着**——
+           跑完第一件事是点「失败 N」，拿一屏成功公告挡在用户和他唯一想看的
+           东西之间是没道理的。 */
+        <div className="flex items-baseline gap-2 text-sm">
+          <Check className="size-4 shrink-0 self-center text-good" />
+          <span className="font-medium">已完成</span>
+          <span className="tabular-nums text-muted-foreground">
+            压缩 {formatCount(update.done)} · 跳过 {formatCount(update.skipped)}
+          </span>
+          {update.failed > 0 && (
+            <span className="tabular-nums text-destructive">
+              失败 {formatCount(update.failed)}
+            </span>
+          )}
+          <div className="flex-1" />
+          {saved > 0 && (
+            <span className="text-good">
+              省下 {formatBytes(saved)}
+              <span className="text-muted-foreground">
+                {" · "}
+                {formatSaving(update.src_bytes, update.dst_bytes)}
+              </span>
+            </span>
+          )}
+        </div>
+      ) : (
+        <div className="flex items-baseline gap-3">
+          <span className="text-2xl font-semibold tabular-nums">
+            {formatCount(settled)}
+            <span className="text-base font-normal text-muted-foreground">
+              {" / "}
+              {formatCount(update.total)}
+            </span>
+          </span>
+          {saved > 0 && (
+            <span className="text-sm text-good">
+              已省 {formatBytes(saved)}
+              <span className="text-muted-foreground">
+                {" · "}
+                {formatSaving(update.src_bytes, update.dst_bytes)}
+              </span>
+            </span>
+          )}
+          <div className="flex-1" />
+          {/* 样本不足时后端给 null。宁可不显示，也不显示一个乱跳的数字。 */}
+          {running && !update.paused && update.eta_secs !== null && (
+            <span className="text-xs tabular-nums text-muted-foreground">
+              剩余 {formatEta(update.eta_secs)}
+            </span>
+          )}
         </div>
       )}
 
-      <div className="flex items-baseline gap-3">
-        <span className="text-2xl font-semibold tabular-nums">
-          {formatCount(settled)}
-          <span className="text-base font-normal text-muted-foreground">
-            {" / "}
-            {formatCount(update.total)}
-          </span>
-        </span>
-        {saved > 0 && (
-          <span className="text-sm text-good">
-            已省 {formatBytes(saved)}
-            <span className="text-muted-foreground">
-              {" · "}
-              {formatSaving(update.src_bytes, update.dst_bytes)}
-            </span>
-          </span>
-        )}
-        <div className="flex-1" />
-        {running ? (
-          <>
-            {update.paused ? (
-              <Button size="sm" onClick={() => void resume()} className="gap-1.5">
-                <Play className="size-3.5" />
-                继续
-              </Button>
-            ) : (
-              <Button size="sm" variant="outline" onClick={() => void pause()} className="gap-1.5">
-                <Pause className="size-3.5" />
-                暂停
-              </Button>
-            )}
-            <Button size="sm" variant="ghost" onClick={() => void cancel()} className="gap-1.5">
-              <X className="size-3.5" />
-              停止
-            </Button>
-          </>
-        ) : resumable ? (
-          <>
-            {/* 输出目录传 null：后端会用库里记着的那个，用户不必再选一遍。 */}
-            <Button
-              size="sm"
-              onClick={() => void (jobId !== null && start(jobId, null))}
-              className="gap-1.5"
-            >
-              <Play className="size-3.5" />
-              接着跑
-            </Button>
-            <Button size="sm" variant="ghost" onClick={reset}>
-              关闭
-            </Button>
-          </>
-        ) : (
-          <>
-            {update.failed > 0 && (
-              <Button size="sm" variant="outline" onClick={() => void onRetry()} className="gap-1.5">
-                <RotateCcw className="size-3.5" />
-                重试失败项
-              </Button>
-            )}
-            <Button size="sm" variant="ghost" onClick={reset}>
-              关闭
-            </Button>
-          </>
-        )}
-      </div>
-
       <Progress value={pct} />
 
-      <div className="flex items-center gap-4 text-xs text-muted-foreground">
-        <Tally icon={Check} tone="good" label="已压缩" n={update.done} />
-        <Tally icon={SkipForward} label="没动" n={update.skipped} />
-        <Tally icon={AlertTriangle} tone="bad" label="失败" n={update.failed} />
-        <div className="flex-1" />
-        {/* 样本不足时后端给 null。宁可不显示，也不显示一个乱跳的数字。 */}
-        {running && !update.paused && update.eta_secs !== null && (
-          <span className="tabular-nums">剩余 {formatEta(update.eta_secs)}</span>
-        )}
-        {phase === "finished" && <span>已结束</span>}
-      </div>
-
-      {/* 当前文件那一行定高，免得它出现/消失时整块版面上下抖。 */}
-      <div className="flex h-5 items-center gap-2 text-xs text-muted-foreground">
-        {running && !update.finished && update.current && (
-          <>
-            <Loader2 className="size-3 shrink-0 animate-spin" />
-            <PathText path={update.current} className="min-w-0 flex-1" />
-            {update.current_fraction > 0 && (
-              <span className="shrink-0 tabular-nums">
-                {Math.round(update.current_fraction * 100)}%
-              </span>
-            )}
-          </>
-        )}
-        {retried !== null && (
-          <span>{retried > 0 ? `${formatCount(retried)} 项已退回队列` : "没有可重试的项目"}</span>
-        )}
-      </div>
-    </header>
-  );
-}
-
-function Tally({
-  icon: Icon,
-  label,
-  n,
-  tone,
-}: {
-  icon: typeof Check;
-  label: string;
-  n: number;
-  tone?: "good" | "bad";
-}) {
-  return (
-    <span
-      className={cn(
-        "flex items-center gap-1 tabular-nums",
-        n > 0 && tone === "good" && "text-good",
-        n > 0 && tone === "bad" && "text-destructive",
+      {/* 只在跑动时占这一行：`resumable` 下 current / eta 都是 null（D-158），
+          那 20px 是纯空白。定高是为了免得它出现/消失时整块版面上下抖。 */}
+      {running && (
+        <div className="flex h-5 items-center gap-2 text-xs text-muted-foreground">
+          {!update.finished && update.current && (
+            <>
+              <Loader2 className="size-3 shrink-0 animate-spin" />
+              <PathText path={update.current} className="min-w-0 flex-1" />
+              {update.current_fraction > 0 && (
+                <span className="shrink-0 tabular-nums">
+                  {Math.round(update.current_fraction * 100)}%
+                </span>
+              )}
+            </>
+          )}
+        </div>
       )}
-    >
-      <Icon className="size-3.5" />
-      {label} {formatCount(n)}
-    </span>
+    </header>
   );
 }
 
@@ -370,20 +428,27 @@ function Items({ jobId, update }: { jobId: number; update: JobUpdate | null }) {
             key={f.id}
             onClick={() => setFilter(f)}
             className={cn(
-              "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
+              "flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
               filter.id === f.id
                 ? "bg-secondary text-foreground"
                 : "text-muted-foreground hover:text-foreground",
             )}
           >
             {f.label}
+            {update && (
+              <span
+                className={cn(
+                  "tabular-nums",
+                  f.count(update) > 0 && f.tone === "good" && "text-good",
+                  f.count(update) > 0 && f.tone === "bad" && "text-destructive",
+                  f.count(update) === 0 && "text-muted-foreground/50",
+                )}
+              >
+                {formatCount(f.count(update))}
+              </span>
+            )}
           </button>
         ))}
-        {total !== null && total > 0 && (
-          <span className="ml-auto text-xs tabular-nums text-muted-foreground">
-            {formatCount(total)} 条
-          </span>
-        )}
       </div>
 
       <div ref={viewport} className="min-h-0 flex-1 overflow-y-auto">

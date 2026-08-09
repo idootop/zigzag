@@ -87,7 +87,7 @@ function Empty() {
 
 /** 顶部：这次查到了什么、打算删什么、以及删除本身。 */
 function Header() {
-  const { phase, report, groups, policy, pending, choosePolicy, discard, apply } = useDedup();
+  const { phase, report, groups, policy, pending, choosePolicy, apply } = useDedup();
   const [confirming, setConfirming] = useState(false);
 
   if (phase === "applying") return <Applying />;
@@ -108,10 +108,6 @@ function Header() {
             {formatCount(report.errors)} 个文件读不动，已排除
           </span>
         )}
-        <div className="flex-1" />
-        <Button variant="ghost" size="sm" onClick={() => void discard()}>
-          丢弃结果
-        </Button>
       </div>
 
       {groups.length > 0 && (
@@ -167,7 +163,6 @@ function Header() {
       <p className="text-xs text-muted-foreground">
         打勾的会被移到废纸篓，随时能从废纸篓捞回来。每组至少留一个，全勾上的那一组会被整组跳过。
       </p>
-      <ErrorLine />
     </header>
   );
 }
@@ -199,7 +194,7 @@ function Applying() {
  * 混进失败里只会让人以为工具坏了。
  */
 function Summary() {
-  const { summary, reset } = useDedup();
+  const summary = useDedup((s) => s.summary);
   if (!summary) return null;
   return (
     <header className="flex shrink-0 flex-col gap-2 border-b border-border px-6 py-4">
@@ -219,10 +214,6 @@ function Summary() {
         {summary.failed > 0 && (
           <span className="text-sm text-destructive">失败 {formatCount(summary.failed)}</span>
         )}
-        <div className="flex-1" />
-        <Button size="sm" onClick={reset}>
-          完成
-        </Button>
       </div>
       {summary.notes.length > 0 && (
         <ul className="flex flex-col gap-0.5 text-xs text-muted-foreground">
@@ -231,15 +222,8 @@ function Summary() {
           ))}
         </ul>
       )}
-      <ErrorLine />
     </header>
   );
-}
-
-function ErrorLine() {
-  const error = useDedup((s) => s.error);
-  if (!error) return null;
-  return <p className="selectable text-xs text-destructive">{error.message}</p>;
 }
 
 /** 一组重复。缩略图排一行，勾选和路径在下面。 */

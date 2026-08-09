@@ -1,8 +1,9 @@
 /**
  * 全局状态。
  *
- * 只放「跨视图共享且需要和后端同步」的东西——配置、工具就绪情况、当前视图。
+ * 只放「跨视图共享且需要和后端同步」的东西——配置、工具就绪情况。
  * 组件自己的临时状态（展开/折叠、输入草稿）留在组件里，不往这儿塞。
+ * 导航不在这儿，在 {@link useUI}：那是纯前端状态，和后端一个字段都不沾。
  */
 import { create } from "zustand";
 
@@ -16,12 +17,7 @@ import {
   type ToolStatus,
 } from "@/lib/ipc";
 
-export type View = "home" | "queue" | "dedup" | "settings";
-
 interface AppState {
-  view: View;
-  setView: (v: View) => void;
-
   profile: Profile | null;
   activePreset: Preset | null;
   presets: PresetInfo[];
@@ -42,9 +38,6 @@ interface AppState {
 }
 
 export const useApp = create<AppState>((set, get) => ({
-  view: "home",
-  setView: (view) => set({ view }),
-
   profile: null,
   activePreset: null,
   presets: [],

@@ -44,9 +44,10 @@ export function PresetPicker() {
           </button>
         );
       })}
+      {/* 「设置」那个 tab 已经没有了，指路必须指到还在的地方——⌘, 那块面板。 */}
       {activePreset === null && (
         <p className="col-span-full text-center text-xs text-muted-foreground">
-          当前为自定义参数，可在「设置」里查看
+          当前为自定义参数，按 ⌘, 查看
         </p>
       )}
     </div>

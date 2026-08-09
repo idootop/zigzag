@@ -101,9 +101,16 @@ pub fn job_start(
         .await;
         // 出错时前端不会收到 `finished=true`（那一帧由记账线程发），
         // 所以这里补一帧，否则界面会永远停在「正在处理」。
+        //
+        // **这一帧必须带上原因。** 它的计数字段全是零，只凭 `finished=true`
+        // 前端会把它当成一次跑完，于是「配置无效: 镜像模式还没选输出目录」
+        // 显示成「✓ 已完成 · 压缩 0」——任务死了却报成功，是这里最坏的一种谎。
         if let Err(e) = &r {
             tracing::error!(%e, job_id, "任务异常结束");
-            let _ = app.emit(EVENT_UPDATE, JobUpdate { job_id, finished: true, ..Default::default() });
+            let _ = app.emit(
+                EVENT_UPDATE,
+                JobUpdate { job_id, finished: true, error: Some(e.to_string()), ..Default::default() },
+            );
         }
         let state = tauri::Manager::state::<AppState>(&app);
         state.job.lock().expect("任务锁中毒").finish(job_id);

@@ -91,9 +91,16 @@ pub struct ScanProgress {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, TS)]
 #[ts(export, export_to = "../../src/lib/bindings/")]
 pub struct ScanReport {
-    /// 这次扫描落下的任务 id。处理计划已经写进库了，按「开始」就是跑它。
+    /// 这次扫描落下的任务 id。处理计划已经写进库了，按「开始压缩」就是跑它。
     #[ts(type = "number")] pub job_id: i64,
     pub roots: Vec<String>,
+    /// 算出这份报告的那套参数，也正是任务开跑时会用的那套（`jobs.profile`）。
+    ///
+    /// **报告和任务是绑在一起的一对，绑的就是扫描那一刻的配置。** 界面必须照
+    /// 这份而不是「当前设置」来决定主按钮的文案和要不要问输出目录——两者不一致
+    /// 时，按当前设置画出来的按钮点下去就是一次必然失败的启动。同时它也让界面
+    /// 认得出「参数改过了，这份报告已经过期」。
+    pub profile: Profile,
     /// 遍历到的普通文件总数（含非媒体）。
     #[ts(type = "number")] pub files_seen: u64,
     /// 其中被认作媒体的。
@@ -251,6 +258,7 @@ impl Aggregator {
             // 聚合器不认识数据库，任务 id 由 `scan::session` 扫完回填。
             job_id: 0,
             roots: self.roots.iter().map(|p| p.display().to_string()).collect(),
+            profile: self.cfg,
             files_seen: self.files_seen,
             media_found: self.media_found,
             errors: self.errors,

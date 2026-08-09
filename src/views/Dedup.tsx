@@ -1,25 +1,30 @@
 /**
- * 「查重」这一路的入口，同时也是流程路由：选目录 → 查找中 → 复核/删除。
+ * 查重这条线的容器：工具栏 + 提示条 + 当前阶段的画布。
  *
- * 和「开始」那一路同构（三个阶段共用一块画布依次替换），但两者的**目的相反**：
- * 压缩是可逆的（原文件可保留），查重是**减法**——最后那一下会让文件从原地消失。
+ * 和压缩那条线同构（选目录 → 查找中 → 复核），但两者的**目的相反**：压缩是
+ * 可逆的（原文件可保留），查重是**减法**——最后那一下会让文件从原地消失。
  * 所以这一路多了一道结构性的闸：查找和删除是两个命令，中间隔着一屏必须人工
  * 过目的复核，而复核那一屏的默认状态是「什么都不删」。
+ *
+ * 也正因如此，「移到废纸篓」**不上工具栏**（Toolbar 规则 3）：不可逆操作留在
+ * 画布里、挨着它自己的计数和两步确认，不能放到离红绿灯一像素的地方。
+ *
+ * 这条线可以和压缩同时跑（D-102），切过去切回来什么都不丢。
  */
-import { useEffect, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
-import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { Copy, FolderOpen, Images, Loader2, X } from "lucide-react";
+import { Copy, Images, Loader2 } from "lucide-react";
 
+import { Notice, NoticeStrip } from "@/components/Notice";
+import { Toolbar } from "@/components/Toolbar";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Slider } from "@/components/ui/slider";
 import { cn, formatCount } from "@/lib/utils";
 import type { DedupMode } from "@/lib/ipc";
+import { useApp } from "@/store/app";
 import { useDedup } from "@/store/dedup";
 
 import { DedupReview } from "./parts/DedupReview";
-import { PathText } from "./parts/PathText";
+import { Picker } from "./parts/Picker";
 
 const MODES: { id: DedupMode; icon: typeof Copy; label: string; hint: string }[] = [
   {
@@ -37,128 +42,135 @@ const MODES: { id: DedupMode; icon: typeof Copy; label: string; hint: string }[]
 ];
 
 export function Dedup() {
-  const phase = useDedup((s) => s.phase);
-
   // 上次没看完的结果由 App 在启动时捞回来（查重结果连同勾选状态都在库里，
   // 退出应用不丢），这里只负责按阶段分屏。
-  if (phase === "scanning") return <Searching />;
-  if (phase === "idle") return <Picker />;
-  return <DedupReview />;
-}
-
-function Picker() {
-  const { roots, mode, threshold, error, addRoots, removeRoot, setMode, setThreshold, start } =
-    useDedup();
-  const [hovering, setHovering] = useState(false);
-
-  // 系统级拖放。理由同 Home：HTML5 的 drag 事件在 WebView 里拿不到真实路径。
-  useEffect(() => {
-    const pending = getCurrentWebview().onDragDropEvent((e) => {
-      if (e.payload.type === "over") setHovering(true);
-      else if (e.payload.type === "leave") setHovering(false);
-      else if (e.payload.type === "drop") {
-        setHovering(false);
-        addRoots(e.payload.paths);
-      }
-    });
-    return () => void pending.then((un) => un());
-  }, [addRoots]);
-
-  async function pick() {
-    const picked = await open({ directory: true, multiple: true });
-    if (!picked) return;
-    addRoots(Array.isArray(picked) ? picked : [picked]);
-  }
+  const phase = useDedup((s) => s.phase);
 
   return (
-    <div className="flex h-full flex-col overflow-y-auto">
-      <div className="mx-auto flex w-full max-w-2xl flex-1 flex-col items-center justify-center gap-7 p-8">
-        <button
-          onClick={pick}
-          className={cn(
-            "flex w-full flex-col items-center gap-3 rounded-xl border-2 border-dashed px-8 py-12 transition-colors",
-            hovering
-              ? "border-primary bg-accent"
-              : "border-border hover:border-primary/50 hover:bg-secondary/50",
-          )}
-        >
-          <FolderOpen className="size-9 text-muted-foreground" strokeWidth={1.5} />
-          <span className="text-base font-medium">把文件夹拖到这里</span>
-          <span className="text-sm text-muted-foreground">或点击选择要查重的目录</span>
-        </button>
+    <div className="flex h-full flex-col">
+      <Toolbar>
+        <DedupActions />
+      </Toolbar>
 
-        {roots.length > 0 && (
-          <div className="w-full space-y-1">
-            {roots.map((r) => (
-              <div
-                key={r}
-                className="group flex items-center gap-2 rounded-md bg-secondary px-3 py-1.5"
-              >
-                <PathText path={r} className="min-w-0 flex-1 text-xs" />
-                <button
-                  onClick={() => removeRoot(r)}
-                  title="移除"
-                  className="text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 hover:text-foreground"
-                >
-                  <X className="size-3.5" />
-                </button>
-              </div>
-            ))}
-          </div>
+      <Notices />
+
+      <div className="min-h-0 flex-1 overflow-hidden">
+        {phase === "scanning" ? (
+          <Searching />
+        ) : phase === "idle" ? (
+          <DedupPicker />
+        ) : (
+          <DedupReview />
         )}
-
-        <div className="grid w-full grid-cols-2 gap-2">
-          {MODES.map((m) => (
-            <button
-              key={m.id}
-              onClick={() => setMode(m.id)}
-              className={cn(
-                "flex flex-col gap-1.5 rounded-lg border px-4 py-3 text-left transition-colors",
-                mode === m.id
-                  ? "border-primary bg-accent"
-                  : "border-border hover:border-primary/40 hover:bg-secondary/50",
-              )}
-            >
-              <span className="flex items-center gap-2 text-[13px] font-medium">
-                <m.icon className="size-4" strokeWidth={1.75} />
-                {m.label}
-              </span>
-              <span className="text-xs leading-snug text-muted-foreground">{m.hint}</span>
-            </button>
-          ))}
-        </div>
-
-        {/* 阈值只在感知模式下有意义，精确模式不显示——摆一个调了没反应的控件
-            比不摆更让人困惑。 */}
-        {mode === "perceptual" && (
-          <div className="flex w-full items-center gap-4 rounded-lg border border-border bg-card px-3 py-2.5">
-            <div className="min-w-0 flex-1">
-              <div className="text-[13px]">相似程度</div>
-              <div className="text-xs leading-snug text-muted-foreground">
-                往左更严（只找几乎一样的），往右更松（会带出更多误判）
-              </div>
-            </div>
-            <Slider
-              className="w-40 shrink-0"
-              value={[threshold]}
-              min={2}
-              max={16}
-              step={1}
-              onValueChange={([v]) => setThreshold(v)}
-            />
-            <span className="w-8 shrink-0 text-right font-mono text-xs text-muted-foreground">
-              {threshold}
-            </span>
-          </div>
-        )}
-
-        {error && <p className="text-center text-sm text-destructive">{error.message}</p>}
-
-        <Button size="lg" disabled={roots.length === 0} onClick={() => void start()} className="min-w-40">
-          查找重复
-        </Button>
       </div>
     </div>
+  );
+}
+
+/** 工具栏右槽。**只有退出路径**——真正动文件的那个按钮在画布里。 */
+function DedupActions() {
+  const phase = useDedup((s) => s.phase);
+  const discard = useDedup((s) => s.discard);
+  const reset = useDedup((s) => s.reset);
+
+  if (phase === "review") {
+    return (
+      <Button variant="ghost" size="sm" onClick={() => void discard()}>
+        丢弃结果
+      </Button>
+    );
+  }
+  if (phase === "done") {
+    return (
+      <Button size="sm" onClick={reset}>
+        完成
+      </Button>
+    );
+  }
+  return null;
+}
+
+function Notices() {
+  const appError = useApp((s) => s.error);
+  const dismissApp = useApp((s) => s.dismissError);
+  const error = useDedup((s) => s.error);
+  const dismissError = useDedup((s) => s.dismissError);
+
+  return (
+    <NoticeStrip>
+      {appError && (
+        <Notice tone="bad" onDismiss={dismissApp}>
+          {appError.message}
+        </Notice>
+      )}
+      {error && (
+        <Notice tone="bad" onDismiss={dismissError}>
+          {error.message}
+        </Notice>
+      )}
+    </NoticeStrip>
+  );
+}
+
+function DedupPicker() {
+  const { roots, mode, threshold, addRoots, removeRoot, setMode, setThreshold, start } = useDedup();
+
+  return (
+    <Picker
+      roots={roots}
+      addRoots={addRoots}
+      removeRoot={removeRoot}
+      cta="查找重复"
+      onStart={() => void start()}
+      options={
+        <>
+          <div className="grid w-full grid-cols-2 gap-2">
+            {MODES.map((m) => (
+              <button
+                key={m.id}
+                onClick={() => setMode(m.id)}
+                className={cn(
+                  "flex flex-col gap-1.5 rounded-lg border px-4 py-3 text-left transition-colors",
+                  mode === m.id
+                    ? "border-primary bg-accent"
+                    : "border-border hover:border-primary/40 hover:bg-secondary/50",
+                )}
+              >
+                <span className="flex items-center gap-2 text-[13px] font-medium">
+                  <m.icon className="size-4" strokeWidth={1.75} />
+                  {m.label}
+                </span>
+                <span className="text-xs leading-snug text-muted-foreground">{m.hint}</span>
+              </button>
+            ))}
+          </div>
+
+          {/* 阈值只在感知模式下有意义，精确模式不显示——摆一个调了没反应的控件
+              比不摆更让人困惑。 */}
+          {mode === "perceptual" && (
+            <div className="flex w-full items-center gap-4 rounded-lg border border-border bg-card px-3 py-2.5">
+              <div className="min-w-0 flex-1">
+                <div className="text-[13px]">相似程度</div>
+                <div className="text-xs leading-snug text-muted-foreground">
+                  往左更严（只找几乎一样的），往右更松（会带出更多误判）
+                </div>
+              </div>
+              <Slider
+                className="w-40 shrink-0"
+                value={[threshold]}
+                min={2}
+                max={16}
+                step={1}
+                onValueChange={([v]) => setThreshold(v)}
+              />
+              <span className="w-8 shrink-0 text-right font-mono text-xs text-muted-foreground">
+                {threshold}
+              </span>
+            </div>
+          )}
+        </>
+      }
+    />
   );
 }
 

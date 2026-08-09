@@ -10,8 +10,13 @@
  *          │                                    v
  * idle ────┴──────── start() ───────────> running ──finished 那一帧──> finished
  *   ^                                        │                            │
+ *   │                                        └──带 error 那一帧──> failed │
  *   └──────────────── reset() ───────────────┴────────────────────────────┘
  * ```
+ *
+ * `failed` 必须和 `finished` 分开：后端异常结束时补发的那一帧 `finished=true`
+ * 而计数全零（`commands/job.rs`），并成一个状态就会把「任务死了」画成
+ * 「✓ 已完成 · 压缩 0」。
  *
  * `resumable` 是**上次的进度，还没接着跑**：库里有一个 `running`/`paused` 且还
  * 剩东西的任务。它必须是一个独立状态而不是 `idle` 的一种——`idle` 那一屏画的是
@@ -24,7 +29,7 @@ import { create } from "zustand";
 
 import { ipc, onJob, toIpcError, type IpcError, type JobUpdate } from "@/lib/ipc";
 
-export type JobPhase = "idle" | "resumable" | "running" | "finished";
+export type JobPhase = "idle" | "resumable" | "running" | "finished" | "failed";
 
 interface JobState {
   phase: JobPhase;
@@ -51,6 +56,7 @@ interface JobState {
   cancel: () => Promise<void>;
   /** 把失败项退回队列，返回退回的条数。任务在跑时也能调。 */
   retry: () => Promise<number>;
+  dismissError: () => void;
   reset: () => void;
 }
 
@@ -92,6 +98,14 @@ export const useJob = create<JobState>((set, get) => ({
     stopListening();
     set({ phase: "running", jobId, update: null, error: null });
     unlisten = onJob((update) => {
+      // 异常结束那一帧是后端补发的，除了 `job_id` 和错误以外全是零。**不能拿它
+      // 覆盖 `update`**：那会把「压了两百个之后断了」显示成「压缩 0」。只取错误，
+      // 进度停在最后一帧真实数据上。
+      if (update.error) {
+        stopListening();
+        set({ phase: "failed", error: { code: "job_failed", message: update.error } });
+        return;
+      }
       set({ update, phase: update.finished ? "finished" : "running" });
       if (update.finished) stopListening();
     });
@@ -137,12 +151,22 @@ export const useJob = create<JobState>((set, get) => ({
     const { jobId } = get();
     if (jobId === null) return 0;
     try {
-      return await ipc.jobRetry(jobId);
+      const n = await ipc.jobRetry(jobId);
+      // 跑完之后重试是个死胡同：条目确实退回了队列，但任务这一帧停在 finished，
+      // 事件监听也早就退订了，界面上再没有任何按钮能把它们跑起来——用户只能等
+      // 下次启动时被 checkResumable 捞出来。退回 resumable，让「接着跑」出现。
+      if (n > 0 && get().phase === "finished") {
+        const update = await ipc.jobResumable();
+        if (update) set({ phase: "resumable", jobId: update.job_id, update });
+      }
+      return n;
     } catch (e) {
       set({ error: toIpcError(e) });
       return 0;
     }
   },
+
+  dismissError: () => set({ error: null }),
 
   reset: () => {
     stopListening();

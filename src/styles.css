@@ -48,6 +48,11 @@
   --color-warn: var(--warn);
   --color-bad: var(--destructive);
 
+  /* 工具栏分段控件。**选中段在深浅色下都必须比轨道亮**，这是 macOS 分段控件的
+     基本样子；套用 shadcn 的 background/muted 在深色下会得到相反的结果。 */
+  --color-track: var(--track);
+  --color-track-active: var(--track-active);
+
   --radius-sm: calc(var(--radius) * 0.6);
   --radius-md: calc(var(--radius) * 0.8);
   --radius-lg: var(--radius);
@@ -81,6 +86,9 @@
   --border: oklch(0.91 0 0);
   --input: oklch(0.91 0 0);
   --ring: oklch(0.58 0.19 258);
+
+  --track: oklch(0.93 0 0);
+  --track-active: oklch(1 0 0);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -108,6 +116,9 @@
     --border: oklch(1 0 0 / 12%);
     --input: oklch(1 0 0 / 16%);
     --ring: oklch(0.68 0.17 258);
+
+    --track: oklch(0.24 0 0);
+    --track-active: oklch(0.36 0 0);
   }
 }
 
@@ -148,14 +159,4 @@
       transition-duration: 0.01ms !important;
     }
   }
-}
-
-/* 无边框窗口下，顶部这条区域负责拖动窗口；里面的控件要显式声明 no-drag。 */
-.titlebar-drag {
-  -webkit-app-region: drag;
-}
-.titlebar-drag button,
-.titlebar-drag a,
-.no-drag {
-  -webkit-app-region: no-drag;
 }

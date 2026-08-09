@@ -14,15 +14,13 @@
  */
 import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { ArrowLeft, FileQuestion, Film, Image, Music, Zap } from "lucide-react";
+import { FileQuestion, Film, Image, Music, Zap } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { cn, formatBytes, formatCount, formatEta, formatEtaShort, formatSaving } from "@/lib/utils";
 import type { KindGroup, MediaKind, Range, ScanReport } from "@/lib/ipc";
-import { useApp } from "@/store/app";
 import { useJob } from "@/store/job";
-import { useScan } from "@/store/scan";
 
 const KIND_META: Record<MediaKind, { label: string; icon: typeof Image }> = {
   image: { label: "图片", icon: Image },
@@ -31,80 +29,77 @@ const KIND_META: Record<MediaKind, { label: string; icon: typeof Image }> = {
 };
 
 export function Report({ report }: { report: ScanReport }) {
-  const reset = useScan((s) => s.reset);
-  const mirror = useApp((s) => s.profile?.output.mode) === "mirror";
+  // 看 `report.profile` 而不是当前设置：这份报告是按扫描那一刻的参数算出来的，
+  // 待会儿开跑用的也是同一份（`jobs.profile`）。见 `ReportActions`。
+  const mirror = report.profile.output.mode === "mirror";
   const nothingToDo = report.planned_files === 0;
 
   return (
-    <div className="flex h-full flex-col">
-      <header className="flex shrink-0 items-center gap-3 border-b border-border px-4 py-2.5">
-        <Button variant="ghost" size="sm" onClick={reset} className="-ml-2 gap-1.5">
-          <ArrowLeft className="size-4" />
-          重新选择
-        </Button>
-        <div className="flex-1" />
-        <StartButton report={report} />
-      </header>
+    <div className="h-full overflow-y-auto">
+      <div className="mx-auto flex w-full max-w-3xl flex-col gap-7 p-6">
+        {report.cancelled && <Note tone="warn">扫描已取消，下面是取消前已经看过的部分。</Note>}
 
-      <div className="min-h-0 flex-1 overflow-y-auto">
-        <div className="mx-auto flex w-full max-w-3xl flex-col gap-7 p-6">
-          {report.cancelled && (
-            <Note tone="warn">扫描已取消，下面是取消前已经看过的部分。</Note>
-          )}
+        {nothingToDo ? <NothingToDo report={report} /> : <Headline report={report} />}
 
-          {nothingToDo ? <NothingToDo report={report} /> : <Headline report={report} />}
-
-          {!nothingToDo && (
-            <>
-              <Section title="按类型">
-                <KindTable groups={report.groups} />
-              </Section>
-
-              <Section title="耗时" hint="两条队列并行，总耗时取较慢的一条">
-                <Lanes report={report} />
-              </Section>
-            </>
-          )}
-
-          {report.dirs.length > 0 && (
-            <Section title="空间分布" hint="按目录，含跳过的文件">
-              <Dirs report={report} />
+        {!nothingToDo && (
+          <>
+            <Section title="按类型">
+              <KindTable groups={report.groups} />
             </Section>
-          )}
 
-          {report.skipped.length > 0 && (
-            <Section
-              title="不处理"
-              hint={`${formatCount(report.skipped_files)} 个 · ${formatBytes(report.skipped_bytes)}`}
-            >
-              <Skipped report={report} />
+            <Section title="耗时" hint="两条队列并行，总耗时取较慢的一条">
+              <Lanes report={report} />
             </Section>
-          )}
+          </>
+        )}
 
-          {mirror && <Uncopied report={report} />}
+        {report.dirs.length > 0 && (
+          <Section title="空间分布" hint="按目录，含跳过的文件">
+            <Dirs report={report} />
+          </Section>
+        )}
 
-          <Footnotes report={report} />
-        </div>
+        {report.skipped.length > 0 && (
+          <Section
+            title="不处理"
+            hint={`${formatCount(report.skipped_files)} 个 · ${formatBytes(report.skipped_bytes)}`}
+          >
+            <Skipped report={report} />
+          </Section>
+        )}
+
+        {mirror && <Uncopied report={report} />}
+
+        <Footnotes report={report} />
       </div>
     </div>
   );
 }
 
 /**
- * 「开始压缩」。
+ * 报告阶段的主操作，摆进工具栏右槽（Toolbar 规则 2：文档阶段把 CTA 交出去）。
  *
  * 镜像模式要先选输出目录：**它是在这一步问、而不是在设置里问**——设置里选的
  * 目录会一直留着，下次换一块盘时很容易忘了改，结果两块盘的产物混进同一棵树。
  * 目录选完就记进库，跨应用重启续跑时不会再问第二遍。
+ *
+ * 按钮文案跟着**这份报告自己的**「输出方式」（`report.profile`）走，不是跟着
+ * 当前设置。从前读的是 `useApp.profile`，而后端校验的是扫描时快照进 `jobs.profile`
+ * 的那一份——扫完再去设置里把镜像改成原地，这个按钮就变成「开始压缩」、不问输出
+ * 目录、传 `null`，后端当场以「镜像模式还没选输出目录」把任务掐死。实测过一次
+ * （见 PROGRESS D-168）。报告和任务是绑在一起的一对，绑的就是扫描那一刻的配置。
+ *
+ * 那改完设置怎么办？由 `Compress` 那条提示条说「参数改过了，重新扫一遍」——
+ * 报告里的每个数字都是按旧参数算的，光把按钮文案改掉只会让它们一起说谎。
+ *
+ * 这里**不再有跳页**：任务一起来，`useCompressStage()` 的优先级规则会把这条线
+ * 直接推到队列阶段；没起来（多半是空间预检没过，§8）就原地留着，而修它的动作
+ * 恰好就是这个按钮。
  */
-function StartButton({ report }: { report: ScanReport }) {
-  const profile = useApp((s) => s.profile);
-  const setView = useApp((s) => s.setView);
+export function ReportActions({ report }: { report: ScanReport }) {
+  const mirror = report.profile.output.mode === "mirror";
   const start = useJob((s) => s.start);
-  const error = useJob((s) => s.error);
   const [busy, setBusy] = useState(false);
-
-  const mirror = profile?.output.mode === "mirror";
 
   async function go() {
     setBusy(true);
@@ -116,26 +111,16 @@ function StartButton({ report }: { report: ScanReport }) {
         if (!picked) return;
         out = picked;
       }
-      // 没跑起来就留在这一屏。空间预检不过（§8）是最常见的一种，
-      // 而修它的动作——换个输出目录——恰好就是这个按钮，跳走反而离得更远。
-      if (await start(report.job_id, out)) setView("queue");
+      await start(report.job_id, out);
     } finally {
       setBusy(false);
     }
   }
 
   return (
-    <div className="flex items-center gap-3">
-      {error && (
-        <span className="max-w-md text-right text-xs leading-snug text-destructive">
-          {error.message}
-          {error.code === "no_space" && "。可以换一块空间更充裕的盘，或先腾出空间再试。"}
-        </span>
-      )}
-      <Button size="sm" disabled={busy || report.planned_files === 0} onClick={() => void go()}>
-        {mirror ? "选择输出目录并开始" : "开始压缩"}
-      </Button>
-    </div>
+    <Button size="sm" disabled={busy || report.planned_files === 0} onClick={() => void go()}>
+      {mirror ? "选择输出目录并开始" : "开始压缩"}
+    </Button>
   );
 }
 

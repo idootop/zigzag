@@ -36,4 +36,12 @@ eta_secs: number | null,
 /**
  * 最后一帧。界面靠它把「正在处理」那一行收掉。
  */
-finished: boolean, };
+finished: boolean, 
+/**
+ * 任务**异常结束**的原因，正常跑完是 `None`。
+ *
+ * 有它才分得清「跑完了」和「死了」：出错那一帧由 [`crate::commands::job`]
+ * 补发（记账线程已经随错误一起退了，发不出最后一帧），计数字段全是零。
+ * 前端只看 `finished` 的话，会把一次配置错误显示成「✓ 已完成 压缩 0」。
+ */
+error: string | null, };

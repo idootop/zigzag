@@ -76,6 +76,7 @@ interface DedupState {
   choosePolicy: (policy: Policy) => Promise<void>;
   apply: () => Promise<void>;
   discard: () => Promise<void>;
+  dismissError: () => void;
   /** 回到选目录那一屏，保留已选的根目录。 */
   reset: () => void;
 }
@@ -265,6 +266,8 @@ export const useDedup = create<DedupState>((set, get) => ({
     }
     get().reset();
   },
+
+  dismissError: () => set({ error: null }),
 
   reset: () => {
     stopListening();

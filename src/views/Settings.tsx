@@ -6,11 +6,24 @@
  *
  * 保存是即时的：改一下就写盘并回读后端校验后的值，没有「保存」按钮。
  * 归档任务参数不多，多一步确认只会让人忘记点。
+ *
+ * **它是面板，不是页面。** 参数是「下一次压缩怎么跑」的偏好，不是一个可以停留
+ * 的目的地；把它做成导航里的一站，用户就得离开报告页才能改一个数，回来还得自己
+ * 记住刚才改了什么。摆成 ⌘, 模态之后，「输出方式」改完一关，报告页的主按钮文案
+ * 当场就跟着变——那个隔着两个 tab 的隐蔽耦合自己就没了。
+ *
+ * 用模态窗口而不是侧拉抽屉：抽屉是 web/iOS 的花样，macOS 的偏好一向是模态。
  */
 import { useEffect, useState } from "react";
 import { RotateCcw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { ipc, type Profile } from "@/lib/ipc";
 import { useApp } from "@/store/app";
 
@@ -29,7 +42,38 @@ const X265_PRESETS = [
   { value: "veryslow", label: "veryslow" },
 ] as const;
 
-export function Settings() {
+export function SettingsSheet({
+  open,
+  onOpenChange,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  // 配置还没读回来就别开：Radix 要求 DialogContent 里有 DialogTitle，而标题
+  // 在 Settings 里面——让它压根不挂载，比挂一个空壳干净。启动那半秒之外，
+  // profile 永远是有的。
+  const hasProfile = useApp((s) => s.profile !== null);
+
+  return (
+    <Dialog open={open && hasProfile} onOpenChange={onOpenChange}>
+      <DialogContent
+        className="w-[600px] gap-0 overflow-hidden p-0"
+        // Radix 默认把焦点交给第一个可聚焦元素，这里恰好是「恢复默认」——面板
+        // 一开，一个回车就能把用户调了半天的参数全抹掉。改成聚焦滚动区：方向键
+        // 直接翻面板，Tab 照样能走进各个字段，Esc 由 DismissableLayer 挂在
+        // document 上，不依赖焦点在哪。
+        onOpenAutoFocus={(e) => {
+          e.preventDefault();
+          (e.currentTarget as HTMLElement).querySelector<HTMLElement>("[data-scroll]")?.focus();
+        }}
+      >
+        <Settings />
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function Settings() {
   const { profile, activePreset, patchProfile, applyPreset, fixes, clearFixes } = useApp();
   if (!profile) return null;
 
@@ -37,21 +81,26 @@ export function Settings() {
     void patchProfile((p) => ({ ...p, [key]: { ...p[key], ...patch } }));
 
   return (
-    <div className="h-full overflow-y-auto">
-      <div className="mx-auto max-w-2xl space-y-6 px-6 py-6">
-        <header className="flex items-center justify-between">
-          <div>
-            <h1 className="text-lg font-semibold">压缩参数</h1>
-            <p className="text-xs text-muted-foreground">
-              {activePreset ? "当前使用预设" : "已偏离预设，当前为自定义"}
-            </p>
-          </div>
-          <Button variant="ghost" size="sm" onClick={() => void applyPreset("balanced")}>
-            <RotateCcw className="size-3.5" />
-            恢复默认
-          </Button>
-        </header>
+    <>
+      {/* pr-12 给右上角那个关闭 × 让位。 */}
+      <header className="flex shrink-0 items-center justify-between border-b border-border py-3 pr-12 pl-5">
+        <div>
+          <DialogTitle className="text-[15px] font-semibold">压缩参数</DialogTitle>
+          <DialogDescription className="mt-0.5">
+            {activePreset ? "当前使用预设" : "已偏离预设，当前为自定义"}
+          </DialogDescription>
+        </div>
+        <Button variant="ghost" size="sm" onClick={() => void applyPreset("balanced")}>
+          <RotateCcw className="size-3.5" />
+          恢复默认
+        </Button>
+      </header>
 
+      <div
+        data-scroll
+        tabIndex={-1}
+        className="max-h-[70vh] space-y-6 overflow-y-auto px-5 py-5 outline-none"
+      >
         {fixes.length > 0 && (
           <div className="rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 text-xs">
             <div className="mb-1 font-medium">以下取值超出范围，已自动修正：</div>
@@ -276,7 +325,7 @@ export function Settings() {
           />
         </Section>
       </div>
-    </div>
+    </>
   );
 }
 
