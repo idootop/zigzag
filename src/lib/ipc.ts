@@ -93,6 +93,14 @@ export const ipc = {
   checkTools: () => invoke<ToolStatus>("check_tools"),
   jobProgress: (jobId: number) => invoke<JobProgress>("job_progress", { jobId }),
   logPath: () => invoke<string>("log_path"),
+  /**
+   * 把库里再也读不到的历史清掉：跑完/放弃掉的那些任务，和旧的查重结果。
+   *
+   * 十万文件的一份条目表是 25 MB（实测，含索引），一批一份地攒。后端在启动时和
+   * 开扫之前也各清一遍，这个入口只是让「收摊」当场生效（见 {@link resetCompress}）。
+   * 从不 reject。
+   */
+  pruneHistory: () => invoke<void>("prune_history"),
 
   /**
    * 开始扫描。**立刻返回**，进度和结果都走事件（见 {@link onScan}）——
@@ -120,7 +128,13 @@ export const ipc = {
   jobResumable: () => invoke<JobUpdate | null>("job_resumable"),
   jobPause: () => invoke<void>("job_pause"),
   jobResume: () => invoke<void>("job_resume"),
-  jobCancel: () => invoke<void>("job_cancel"),
+  /**
+   * 放弃这个任务：正在跑就先叫停，再把它连同那份没干完的队列从库里删掉。
+   *
+   * 界面上「取消」走这条。**只停不删是不够的**：用户按完取消、退出、再打开，
+   * 「上次还剩 N 个没处理完」原样回来，那个按钮等于没有。已经压好的文件不动。
+   */
+  jobDiscard: (jobId: number) => invoke<void>("job_discard", { jobId }),
   /** 分页读条目。`status` 传 `null` 表示不筛。后端把 limit 钳到 500。 */
   jobItems: (jobId: number, status: string | null, limit: number, offset: number) =>
     invoke<ItemRow[]>("job_items", { jobId, status, limit, offset }),

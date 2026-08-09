@@ -238,13 +238,20 @@ impl Db {
     ///
     /// 这是「退出后可恢复」的关键一步。running 状态意味着有个已经不存在的进程
     /// 正在处理它，不退回就会永远卡住。输出文件写的是临时名，不会污染目标目录。
+    ///
+    /// **只动 `running`，`scanning` 留在原地。** 这两个状态回答的是两个不同的
+    /// 问题：`running` 是「按过开始」，`scanning` 是「扫到一半就退出了」。从前
+    /// 这行把两者一起标成 `paused`，于是一份从没按过开始的残计划长得和跑过一半
+    /// 的任务一模一样，被 [`Db::resumable_job`] 捞进队列页——而它的 `output_root`
+    /// 还是空的，镜像模式下点「继续」必然当场以「镜像模式还没选输出目录」死掉
+    /// （tasks.md #1）。它本身由 [`Db::prune_history`] 在下次扫描时清掉。
     pub fn recover_interrupted(&self) -> Result<usize> {
         let conn = self.lock();
         let n = conn.execute(
             "UPDATE items SET status='pending', attempt=attempt+1 WHERE status='running'",
             [],
         )?;
-        conn.execute("UPDATE jobs SET status='paused' WHERE status IN ('running','scanning')", [])?;
+        conn.execute("UPDATE jobs SET status='paused' WHERE status='running'", [])?;
         if n > 0 {
             tracing::warn!(count = n, "上次退出时有条目未完成，已退回队列");
         }
@@ -499,7 +506,8 @@ impl Db {
     /// 判据是**开跑过且还有剩**：`running` 是上次崩在半路，`paused` 是用户自己
     /// 停下的或跑完一轮还剩失败项。`pending`/`scanning` 不算——那是「扫了但一次
     /// 都没按开始」，它属于报告页那条路，硬塞进队列页只会让用户对着一个 0%
-    /// 的进度条发愣；这类计划由 [`Db::prune_unstarted_jobs`] 负责清掉。
+    /// 的进度条发愣（而且它连输出目录都还没选，点「继续」必死）；这类计划由
+    /// [`Db::prune_history`] 负责清掉。
     pub fn resumable_job(&self) -> Result<Option<i64>> {
         let conn = self.lock();
         let id = conn
@@ -515,24 +523,62 @@ impl Db {
         Ok(id)
     }
 
-    /// 删掉「扫了但一条都没跑过」的旧任务。返回删掉的任务数。
+    /// 清掉再也读不到的历史，返回删掉的行数（任务 + 去重扫描）。
     ///
-    /// 每次扫描都会落一份计划，反复扫同一块盘就会攒下一堆十万行的死计划。
-    /// 判据是**有没有非 pending 的条目**：一条都没动过，删掉不会丢任何进度；
-    /// 只要跑过一条（done/failed/skipped/running），这份计划就是有历史的，留着。
+    /// **界面只认得一个压缩任务和一次去重扫描**：队列页画的是
+    /// [`Db::resumable_job`] 挑出来的那一个，查重页画的是
+    /// [`Db::latest_dedup_run`] 挑出来的那一次。除此之外的行没有任何入口能读到，
+    /// 它们只占地方——而且是**按次攒**的：压一次十万文件的归档盘就留下一份
+    /// 25 MB 的 `items`（本机实测，含索引），扫十遍就是 250 MB。一个卖点是省空间
+    /// 的工具最不该这样。
     ///
-    /// `items` 上有 `ON DELETE CASCADE`，删任务即带走它的条目。
-    pub fn prune_unstarted_jobs(&self) -> Result<usize> {
-        let n = self.lock().execute(
-            "DELETE FROM jobs
-             WHERE status IN ('pending','scanning')
-               AND NOT EXISTS (SELECT 1 FROM items WHERE job_id=jobs.id AND status<>'pending')",
+    /// 判据只有一条：**不是那一个，就删**。从前这里是「删掉一条都没跑过的计划」，
+    /// 只挡住了重复扫描攒下的死计划，跑完的任务反而永远留着——恰好是最大的那一份。
+    ///
+    /// `running` 额外挡一道：它是唯一可能有进程正在写的状态。`items`、
+    /// `dedup_groups`、`dedup_members` 上都有 `ON DELETE CASCADE`，删父行即带走全部。
+    ///
+    /// 删完 `VACUUM`：SQLite 删行只是把页标成空闲留着复用，文件不会自己变小。
+    /// 用户去 `Application Support` 里看到的还是那 25 MB，等于没删。只在真删掉了
+    /// 东西时才做，25 MB 的库实测几十毫秒。
+    pub fn prune_history(&self) -> Result<usize> {
+        // 先问，再上锁：`resumable_job` 自己要锁，这把锁不可重入。
+        let keep = self.resumable_job()?;
+        let conn = self.lock();
+        // `IS NOT` 而不是 `<>`：没有可续任务时 `keep` 是 NULL，`id <> NULL` 恒为
+        // NULL（一条都删不掉），而 `id IS NOT NULL` 才是想要的「全删」。
+        let mut n = conn.execute(
+            "DELETE FROM jobs WHERE status <> 'running' AND id IS NOT ?1",
+            params![keep],
+        )?;
+        n += conn.execute(
+            "DELETE FROM dedup_runs WHERE id <> (SELECT max(id) FROM dedup_runs)",
             [],
         )?;
         if n > 0 {
-            tracing::debug!(count = n, "清掉了没跑过的旧计划");
+            conn.execute_batch("VACUUM")?;
+            tracing::info!(count = n, "清掉了读不到的历史数据");
         }
         Ok(n)
+    }
+
+    /// 放弃一个任务：连它的条目一起删掉（`ON DELETE CASCADE`）。
+    ///
+    /// 这是界面上「取消」的落点。**必须真删**：留着的话它下次启动又会被
+    /// [`Db::resumable_job`] 捞出来变成「上次还剩 N 个没处理完」，那个按钮就等于
+    /// 没有（tasks.md #3）。删掉的只是「还没干的那份清单」，重扫一遍就能再有；
+    /// 已经压好的文件在盘上，一个都不动。
+    ///
+    /// `VACUUM` 的理由同 [`Db::prune_history`]：不做的话用户点完取消去看数据目录，
+    /// 那 25 MB 还在。
+    pub fn discard_job(&self, job_id: i64) -> Result<()> {
+        let conn = self.lock();
+        let n = conn.execute("DELETE FROM jobs WHERE id=?1", params![job_id])?;
+        if n > 0 {
+            conn.execute_batch("VACUUM")?;
+            tracing::info!(job_id, "任务已放弃");
+        }
+        Ok(())
     }
 
     /// 按「开始」时才知道输出目录，扫描时那一格是空的。
@@ -1014,20 +1060,83 @@ mod tests {
     }
 
     #[test]
-    fn pruning_only_takes_plans_that_were_never_touched() {
-        // 判据是「有没有非 pending 的条目」。跑过一条就有历史，删掉等于抹掉进度。
+    fn pruning_keeps_the_one_job_the_ui_can_still_reach() {
+        // 判据是「界面还读不读得到」：队列页只画 `resumable_job` 挑出来的那一个，
+        // 别的行没有任何入口能打开。跑完的那份 items 十万条 25 MB，留着纯占地方。
         let db = Db::open_in_memory().unwrap();
-        let untouched = db.create_job("没跑过", &[], None, &Profile::default()).unwrap();
-        db.add_items(untouched, &[item("/a.jpg")]).unwrap();
-        let started = db.create_job("跑过", &[], None, &Profile::default()).unwrap();
-        db.add_items(started, &[item("/b.jpg")]).unwrap();
-        db.claim_pending(started, 1).unwrap();
+        let done = db.create_job("跑完了", &[], None, &Profile::default()).unwrap();
+        db.add_items(done, &[item("/a.jpg")]).unwrap();
+        let id = db.claim_pending(done, 1).unwrap()[0].id;
+        db.apply_results(&[ItemResult::Done { id, dst_path: "/o".into(), dst_size: 1, elapsed_ms: 1 }])
+            .unwrap();
+        db.set_job_status(done, "done").unwrap();
 
-        assert_eq!(db.prune_unstarted_jobs().unwrap(), 1);
-        assert!(db.get_job(untouched).is_err());
-        assert!(db.get_job(started).is_ok());
+        let unstarted = db.create_job("扫了没跑", &[], None, &Profile::default()).unwrap();
+        db.add_items(unstarted, &[item("/b.jpg")]).unwrap();
+
+        let resumable = db.create_job("跑了一半", &[], None, &Profile::default()).unwrap();
+        db.add_items(resumable, &[item("/c.jpg"), item("/d.jpg")]).unwrap();
+        let id = db.claim_pending(resumable, 1).unwrap()[0].id;
+        db.apply_results(&[ItemResult::Done { id, dst_path: "/o".into(), dst_size: 1, elapsed_ms: 1 }])
+            .unwrap();
+        db.set_job_status(resumable, "paused").unwrap();
+
+        assert_eq!(db.prune_history().unwrap(), 2);
+        assert!(db.get_job(done).is_err(), "跑完的任务是死数据");
+        assert!(db.get_job(unstarted).is_err(), "扫了没跑的计划也是");
+        assert!(db.get_job(resumable).is_ok(), "还能接着跑的那一个必须留着");
         // CASCADE 要把条目一起带走，否则会留下一堆没有主人的行。
-        assert_eq!(db.job_progress(untouched).unwrap().total, 0);
+        assert_eq!(db.job_progress(done).unwrap().total, 0);
+        assert_eq!(db.resumable_job().unwrap(), Some(resumable));
+    }
+
+    #[test]
+    fn pruning_never_touches_a_job_that_is_still_running() {
+        // 扫描是可以和压缩同时发生的（开扫前会清一遍），清理踩到正在跑的那个
+        // 就是把它的 items 从底下抽走。
+        let db = Db::open_in_memory().unwrap();
+        let job = db.create_job("正在跑", &[], None, &Profile::default()).unwrap();
+        db.add_items(job, &[item("/a.jpg")]).unwrap();
+        db.claim_pending(job, 1).unwrap();
+        db.set_job_status(job, "running").unwrap();
+
+        assert_eq!(db.prune_history().unwrap(), 0);
+        assert!(db.get_job(job).is_ok());
+    }
+
+    #[test]
+    fn a_discarded_job_does_not_come_back_next_launch() {
+        // 「取消」得是真的取消（tasks.md #3）。不真删的话，用户按完取消、退出、
+        // 再打开，「上次还剩 N 个没处理完」原样回来——那个按钮等于没有。
+        let db = Db::open_in_memory().unwrap();
+        let job = db.create_job("不想跑了", &[], None, &Profile::default()).unwrap();
+        db.add_items(job, &[item("/a.jpg"), item("/b.jpg")]).unwrap();
+        db.claim_pending(job, 1).unwrap();
+        db.set_job_status(job, "paused").unwrap();
+        assert_eq!(db.resumable_job().unwrap(), Some(job));
+
+        db.discard_job(job).unwrap();
+        assert_eq!(db.resumable_job().unwrap(), None);
+        assert!(db.get_job(job).is_err());
+        // CASCADE 要把条目一起带走，否则删了个寂寞——占地方的正是它们。
+        assert_eq!(db.job_progress(job).unwrap().total, 0);
+    }
+
+    #[test]
+    fn a_scan_that_died_halfway_is_not_a_resumable_job() {
+        // tasks.md #1 的真因。从前 `recover_interrupted` 把 `scanning` 也一起标成
+        // `paused`，于是「扫到一半就退出」的残计划和「跑过一半的任务」在库里长得
+        // 一模一样，被 `resumable_job` 捞进队列页。可它从没按过开始，
+        // `jobs.output_root` 还是空的——镜像模式下点「继续」必然当场以
+        // 「镜像模式还没选输出目录」死掉（`core::job::run`）。
+        let db = Db::open_in_memory().unwrap();
+        let job = db.create_job("扫了一半", &[], None, &Profile::default()).unwrap();
+        db.set_job_status(job, "scanning").unwrap();
+        db.add_items(job, &[item("/a.jpg")]).unwrap();
+
+        db.recover_interrupted().unwrap();
+        assert_eq!(db.resumable_job().unwrap(), None, "扫了一半的残计划不是可续任务");
+        assert_eq!(db.prune_history().unwrap(), 1, "而且它该被清掉，不是攒在库里");
     }
 
     #[test]

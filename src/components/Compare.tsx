@@ -8,6 +8,9 @@
  *   拖动比左右并排强的地方在于**同一块像素**上前后切换，眼睛对「同一位置的
  *   变化」远比对「两个相邻画面的差异」敏感。视频截同一时刻的关键帧，两边
  *   钉在同一个 `atUs` 上，否则比的是两个瞬间而不是两种编码。
+ *   画布可以滚轮缩放、拖动平移（tasks.md #5）：整屏看一张 4000 px 的照片，
+ *   压缩最常留下的那些东西——块效应、色带、涂抹掉的纹理——正好都在缩略之后
+ *   看不见的那个尺度上。
  * - **下半屏是脑子算的**：体积、分辨率、编码、码率、时长，以及省了百分之几。
  *
  * 只有一边时（去重复核屏点开一个成员，D-113 要求人工确认）自动退化成单图大图，
@@ -16,7 +19,7 @@
  * 预览图走 `media_preview` 拿 data URL，不走资源协议：WKWebView 不认 HEIC，
  * 而队列里最多的恰恰是 HEIC（ADR-022）。
  */
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import { AudioLines, Loader2 } from "lucide-react";
 
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
@@ -139,18 +142,23 @@ function caption(data: Loaded | null, labels: Labels): string {
   if (!data.dst) return `只有${labels.before}`;
   if (!data.src.url) return "音频没有画面，看下面的规格";
   const at = data.atUs !== null ? ` · 第 ${formatDuration(data.atUs / 1e6)} 处的画面` : "";
-  return `左边${labels.before}，右边${labels.after}，拖动中间的分界线${at}`;
+  return `左边${labels.before}，右边${labels.after} · 拖动分界线，滚轮缩放看细节${at}`;
 }
+
+const SURFACE = "overflow-hidden rounded-lg bg-secondary";
+/** 画面区的高度。占位、单图、对比三处必须一致，否则加载完成时整个弹窗会跳一下。 */
+const TALL = "h-[52vh] min-h-64";
 
 /** 画面区：固定高度，两边都在这块地里 `object-contain`，所以像素能对齐。 */
 function Stage({ children, short }: { children: React.ReactNode; short?: boolean }) {
   return (
     <div
       className={cn(
-        "grid place-items-center overflow-hidden rounded-lg bg-secondary",
+        "grid place-items-center",
+        SURFACE,
         // 没画面可看的时候不要占着半屏空白：那半屏什么都不说，只是让下面的
         // 规格表被挤到屏幕外面去。
-        short ? "h-32" : "h-[52vh] min-h-64",
+        short ? "h-32" : TALL,
       )}
     >
       {children}
@@ -170,13 +178,171 @@ function Viewer({ data, labels }: { data: Loaded; labels: Labels }) {
     );
   }
   if (!data.dst?.url) {
-    return (
-      <Stage>
-        <img src={data.src.url} alt="" className="size-full object-contain" />
-      </Stage>
-    );
+    return <Single url={data.src.url} />;
   }
   return <Slider before={data.src.url} after={data.dst.url} labels={labels} />;
+}
+
+/**
+ * 缩放上限。
+ *
+ * 不是随手写的 10：预览图长边被后端压到 1600 px（`core::compare::PREVIEW_MAX_PX`），
+ * 一张 4032 px 的照片摆进这块画布本来就只有 0.35 倍上下，放到 3 倍左右才刚好
+ * 一个预览像素对一个屏幕像素——再往上，放大的是 PNG 的插值，不是原图的细节。
+ * 留到 6 倍是给「凑近一点看」一点余量；给得再多只是让人对着糊出来的东西下判断。
+ */
+const MAX_ZOOM = 6;
+
+/** 画布此刻的位置：先按屏幕像素平移，再以画面中心为原点缩放。 */
+type View = { scale: number; x: number; y: number };
+
+const FIT: View = { scale: 1, x: 0, y: 0 };
+
+const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+
+/** 只许在「放大出来的那圈余量」里挪，图怎么拖也不会被拖到画布外面去。 */
+function clampPan(v: View, rect: DOMRect): View {
+  const mx = ((v.scale - 1) * rect.width) / 2;
+  const my = ((v.scale - 1) * rect.height) / 2;
+  return { scale: v.scale, x: clamp(v.x, -mx, mx), y: clamp(v.y, -my, my) };
+}
+
+/**
+ * 以画布内的某一点为锚缩放：那一点在缩放前后停在原地。
+ *
+ * 光标底下的东西跟着手走，是「放大镜」和「换了一张图」的区别——盯着一处纹理
+ * 滚两下就滚丢了的话，这个功能等于没做。
+ */
+function zoomAt(v: View, factor: number, px: number, py: number, rect: DOMRect): View {
+  const scale = clamp(v.scale * factor, 1, MAX_ZOOM);
+  if (scale === v.scale) return v;
+  // 锚点相对画面中心的偏移；它在内容坐标里的位置 (o - t) / s 缩放前后相等，
+  // 解出新的 t 就是下面这行。
+  const ox = px - rect.width / 2;
+  const oy = py - rect.height / 2;
+  const r = scale / v.scale;
+  return clampPan({ scale, x: ox - (ox - v.x) * r, y: oy - (oy - v.y) * r }, rect);
+}
+
+/**
+ * 画布的缩放与平移。
+ *
+ * 变换加在**每一张图**上，不是加在装它们的盒子上：分界线的裁剪（`clip-path`）
+ * 和它的把手是屏幕坐标里的一条竖线，跟着一起缩放的话，手按在哪儿和线画在哪儿
+ * 就对不上了。两张图共用同一份 `view`，所以放大之后左右两边仍然是同一块像素——
+ * 这一屏的全部价值就在这个「同一块」上。
+ *
+ * 这也是没有用现成 pan/zoom 库的原因：那类库要把内容整个包进自己的变换层，
+ * 而这里需要变换层**在裁剪之下**、把手在裁剪之上。共享一份 transform 是这个
+ * 结构下最短的写法，多出来的只有下面这十几行。
+ */
+function useZoom(box: RefObject<HTMLDivElement | null>) {
+  const [view, setView] = useState<View>(FIT);
+  const from = useRef<{ x: number; y: number } | null>(null);
+  const [dragging, setDragging] = useState(false);
+
+  // 滚轮得自己挂：React 从 17 起把 wheel 统一代理到根节点上，而且注册成 passive，
+  // 在 `onWheel` 里 `preventDefault` 是一句空话——拦不下来的话，触控板捏合会被
+  // WKWebView 拿去缩放整个页面（整屏文字跟着一起变大）。
+  useEffect(() => {
+    const el = box.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = el.getBoundingClientRect();
+      // 捏合手势是 ctrlKey + 很碎的 delta，步子给大一些才跟得上手指。
+      const k = e.ctrlKey ? 0.01 : 0.0025;
+      const at = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+      setView((v) => zoomAt(v, Math.exp(-e.deltaY * k), at.x, at.y, rect));
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [box]);
+
+  return {
+    scale: view.scale,
+    dragging,
+    /** 两张图共用这一份，所以放大后左右仍然是同一块像素。 */
+    style: { transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})` },
+    /** 没放大时没有可挪的余量，这时候拖动该去干别的事（拖分界线）。 */
+    canPan: view.scale > 1,
+    reset: () => setView(FIT),
+    begin(e: React.PointerEvent) {
+      from.current = { x: e.clientX - view.x, y: e.clientY - view.y };
+      setDragging(true);
+    },
+    drag(e: React.PointerEvent) {
+      const rect = box.current?.getBoundingClientRect();
+      const f = from.current;
+      if (!f || !rect) return;
+      setView((v) => clampPan({ ...v, x: e.clientX - f.x, y: e.clientY - f.y }, rect));
+    },
+    end() {
+      from.current = null;
+      setDragging(false);
+    },
+    /** 双击在「贴合」和「2.5 倍」之间来回，省得一格一格滚过去。 */
+    toggle(e: React.MouseEvent) {
+      const rect = box.current?.getBoundingClientRect();
+      if (!rect) return;
+      const at = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+      setView((v) => (v.scale > 1 ? FIT : zoomAt(FIT, 2.5, at.x, at.y, rect)));
+    },
+  };
+}
+
+type Zoom = ReturnType<typeof useZoom>;
+
+/** 抓手光标：能挪的时候才给，免得在贴合状态下暗示一个拖不动的动作。 */
+function grabCursor(zoom: Zoom): string {
+  if (!zoom.canPan) return "";
+  return zoom.dragging ? "cursor-grabbing" : "cursor-grab";
+}
+
+/** 放大时才出现：说清楚现在是几倍，也给一条回到原样的退路。 */
+function ZoomBadge({ zoom }: { zoom: Zoom }) {
+  if (!zoom.canPan) return null;
+  return (
+    <button
+      // 这颗按钮坐在画布里，不截住的话按下去会被外面那层当成一次平移的起手。
+      onPointerDown={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => e.stopPropagation()}
+      onClick={zoom.reset}
+      className="absolute top-2 right-2 rounded bg-black/55 px-1.5 py-0.5 text-[11px] text-white tabular-nums hover:bg-black/75"
+    >
+      {Math.round(zoom.scale * 100)}% · 复位
+    </button>
+  );
+}
+
+/** 只有一边时的大图。同样能放大：查重复核点开一个成员，看的也是细节。 */
+function Single({ url }: { url: string }) {
+  const box = useRef<HTMLDivElement>(null);
+  const zoom = useZoom(box);
+
+  return (
+    <div
+      ref={box}
+      className={cn("relative touch-none select-none", SURFACE, TALL, grabCursor(zoom))}
+      onPointerDown={(e) => {
+        e.currentTarget.setPointerCapture(e.pointerId);
+        zoom.begin(e);
+      }}
+      onPointerMove={(e) => e.currentTarget.hasPointerCapture(e.pointerId) && zoom.drag(e)}
+      onPointerUp={zoom.end}
+      onPointerCancel={zoom.end}
+      onDoubleClick={zoom.toggle}
+    >
+      <img
+        src={url}
+        alt=""
+        draggable={false}
+        style={zoom.style}
+        className="pointer-events-none absolute inset-0 size-full object-contain"
+      />
+      <ZoomBadge zoom={zoom} />
+    </div>
+  );
 }
 
 /**
@@ -186,6 +352,13 @@ function Viewer({ data, labels }: { data: Loaded; labels: Labels }) {
  * 原图再用 `clip-path` 从右往左裁掉。这比「左半张图 + 右半张图」的两栏布局
  * 稳：两栏各自 `object-contain` 会按各自的宽度重新缩放，分界线两侧的图不再
  * 是同一个比例，拖到哪儿哪儿错位。
+ *
+ * 缩放（[`useZoom`]）套在这个结构里：变换加在两张 `<img>` 上，裁剪和把手留在
+ * 屏幕坐标里不动。于是放大之后分界线还是那条竖线，两边还是同一块像素。
+ *
+ * **拖动有两种意思，按有没有放大分**：贴合时整块画布都能拖分界线（这一屏最要紧
+ * 的动作，不该因为多了个缩放就得先去够那个小把手）；放大之后画布上的拖动变成
+ * 挪画布，分界线交给把手——那时候用户想动的十有八九是取景，不是分界。
  */
 function Slider({
   before,
@@ -199,6 +372,7 @@ function Slider({
   const box = useRef<HTMLDivElement>(null);
   const handle = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState(50);
+  const zoom = useZoom(box);
 
   // 开窗就把焦点放到分界线上：方向键立刻可用，不用先 Tab 一圈；顺带把焦点
   // 从关闭按钮上挪开——一进来就框着「关闭」，像是在催人走。
@@ -214,28 +388,44 @@ function Slider({
   return (
     <div
       ref={box}
-      className="relative h-[52vh] min-h-64 touch-none overflow-hidden rounded-lg bg-secondary select-none"
+      className={cn(
+        "relative touch-none select-none",
+        SURFACE,
+        TALL,
+        zoom.canPan ? grabCursor(zoom) : "cursor-ew-resize",
+      )}
       onPointerDown={(e) => {
         e.currentTarget.setPointerCapture(e.pointerId);
-        track(e);
+        if (zoom.canPan) zoom.begin(e);
+        else track(e);
       }}
-      onPointerMove={(e) => e.currentTarget.hasPointerCapture(e.pointerId) && track(e)}
+      onPointerMove={(e) => {
+        if (!e.currentTarget.hasPointerCapture(e.pointerId)) return;
+        if (zoom.dragging) zoom.drag(e);
+        else if (!zoom.canPan) track(e);
+      }}
+      onPointerUp={zoom.end}
+      onPointerCancel={zoom.end}
+      onDoubleClick={zoom.toggle}
     >
       <img
         src={after}
         alt=""
         draggable={false}
+        style={zoom.style}
         className="pointer-events-none absolute inset-0 size-full object-contain"
       />
       <div
         className="absolute inset-0"
-        // 裁掉右边的 (100 - pos)%，露出下面那张产物图。
+        // 裁掉右边的 (100 - pos)%，露出下面那张产物图。**裁剪不参与缩放**：
+        // 它是屏幕坐标里的一条竖线，跟着图一起放大就和把手对不上了。
         style={{ clipPath: `inset(0 ${100 - pos}% 0 0)` }}
       >
         <img
           src={before}
           alt=""
           draggable={false}
+          style={zoom.style}
           className="pointer-events-none absolute inset-0 size-full object-contain"
         />
       </div>
@@ -251,6 +441,15 @@ function Slider({
         aria-valuenow={Math.round(pos)}
         className="absolute top-0 bottom-0 w-px cursor-ew-resize bg-white/90 shadow-[0_0_0_1px_rgba(0,0,0,0.25)] outline-none"
         style={{ left: `${pos}%` }}
+        // 放大之后画布上的拖动是挪画布，分界线就只能从这儿抓（那颗 28px 的圆钮
+        // 是实际的抓取区）。截住事件，否则同一下按压会被外面当成平移的起手。
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          e.currentTarget.setPointerCapture(e.pointerId);
+          track(e);
+        }}
+        onPointerMove={(e) => e.currentTarget.hasPointerCapture(e.pointerId) && track(e)}
+        onDoubleClick={(e) => e.stopPropagation()}
         onKeyDown={(e) => {
           const step = e.shiftKey ? 10 : 2;
           if (e.key === "ArrowLeft") setPos((p) => Math.max(0, p - step));
@@ -266,6 +465,7 @@ function Slider({
 
       <Tag className="left-2">{labels.before}</Tag>
       <Tag className="right-2">{labels.after}</Tag>
+      <ZoomBadge zoom={zoom} />
     </div>
   );
 }

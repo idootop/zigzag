@@ -394,6 +394,8 @@ struct Book<F> {
     /// 这一轮开跑的时刻与完成条数，只用来算 ETA。
     began: Instant,
     completed: u64,
+    /// 停着的那些时间不算进 ETA 的分母。
+    pause: PauseClock,
     /// 在飞条目的路径与开始时刻。跑完即移除，所以它的大小跟着队列深度走，
     /// 不跟着任务规模走。
     paths: HashMap<i64, String>,
@@ -403,6 +405,45 @@ struct Book<F> {
 
 /// ETA 至少要这么多样本才敢报。头几条的速率完全由文件大小决定，毫无参考价值。
 const ETA_MIN_SAMPLES: u64 = 8;
+
+/// 暂停计时。
+///
+/// ETA 的分母必须是**真正在干活的那段时间**：`began.elapsed()` 在暂停期间照走，
+/// 不扣掉的话「剩余」会一直往上涨，而任务其实一件事都没干。界面要求暂停时也把
+/// 剩余时间显示出来（tasks.md #6），那这个数字就必须是停住不动的——它回答的是
+/// 「现在点继续，还要多久」。
+#[derive(Default)]
+struct PauseClock {
+    /// 这一次暂停是什么时候开始的。
+    since: Option<Instant>,
+    /// 之前几次暂停加起来有多久。
+    total: Duration,
+}
+
+impl PauseClock {
+    /// 每个心跳看一眼。**状态变了返回 `true`**：暂停和继续本身不经过消息通道，
+    /// 不借这一下把帧推出去，界面要等到下一条结果落地才知道自己停了。
+    fn observe(&mut self, paused: bool) -> bool {
+        match (paused, self.since) {
+            (true, None) => {
+                self.since = Some(Instant::now());
+                true
+            }
+            (false, Some(t)) => {
+                self.total += t.elapsed();
+                self.since = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 从 `began` 到现在，扣掉停着的那些时间。
+    fn working(&self, began: Instant) -> Duration {
+        let paused = self.total + self.since.map_or(Duration::ZERO, |t| t.elapsed());
+        began.elapsed().saturating_sub(paused)
+    }
+}
 
 async fn bookkeep<F>(
     db: Arc<Db>,
@@ -434,6 +475,7 @@ async fn bookkeep<F>(
         last_emit: Instant::now(),
         began: Instant::now(),
         completed: 0,
+        pause: PauseClock::default(),
         paths: HashMap::new(),
         started: HashMap::new(),
         dirty: true,
@@ -447,6 +489,7 @@ async fn bookkeep<F>(
                 None => break,
             },
             _ = tick.tick() => {
+                b.observe_pause();
                 if b.last_flush.elapsed() >= RESULT_INTERVAL {
                     b.flush();
                 }
@@ -559,6 +602,13 @@ impl<F: Fn(JobUpdate)> Book<F> {
         self.rows.clear();
     }
 
+    /// 心跳里看一眼是不是停着。变了就标脏，好让这一帧带着新的 `paused` 出去。
+    fn observe_pause(&mut self) {
+        if self.pause.observe(self.ctl.is_paused()) {
+            self.dirty = true;
+        }
+    }
+
     fn emit(&mut self, finished: bool) {
         if !finished && (!self.dirty || self.last_emit.elapsed() < TICK) {
             return;
@@ -580,11 +630,14 @@ impl<F: Fn(JobUpdate)> Book<F> {
     }
 
     /// 按这一轮的平均速率外推。样本不足或已经跑完时不报。
+    ///
+    /// 分母是**干活的时间**而不是墙上时间（见 [`PauseClock`]）：暂停期间这个数字
+    /// 因此是冻住的，正好是界面要的那个意思——「现在点继续，还要多久」。
     fn eta(&self) -> Option<f64> {
         if self.completed < ETA_MIN_SAMPLES || self.up.pending == 0 {
             return None;
         }
-        let per = self.began.elapsed().as_secs_f64() / self.completed as f64;
+        let per = self.pause.working(self.began).as_secs_f64() / self.completed as f64;
         Some(per * self.up.pending as f64)
     }
 }
@@ -704,6 +757,27 @@ mod tests {
         fn rows(&self) -> Vec<crate::store::repo::ItemRow> {
             self.db.list_items(self.job, None, 100, 0).unwrap()
         }
+    }
+
+    #[test]
+    fn time_spent_paused_is_not_time_spent_working() {
+        // 不扣掉暂停时长的话，ETA = 墙上时间 / 完成条数 × 待处理，会在暂停期间
+        // 每 100 ms 往上涨一次——而任务一件事都没干。界面要在暂停时显示剩余时间
+        // （tasks.md #6），它就必须是冻住的。
+        let began = Instant::now();
+        let mut c = PauseClock::default();
+
+        assert!(c.observe(true), "刚停下要推一帧，否则界面不知道自己停了");
+        assert!(!c.observe(true), "还停着，没有新消息");
+        std::thread::sleep(Duration::from_millis(40));
+        let during = c.working(began);
+        assert!(during < Duration::from_millis(20), "停着的时候干活时间不该走：{during:?}");
+
+        assert!(c.observe(false), "继续也要推一帧");
+        std::thread::sleep(Duration::from_millis(20));
+        let after = c.working(began);
+        assert!(after >= during, "继续之后要接着走");
+        assert!(after < Duration::from_millis(60), "那 40 ms 不该被算回来：{after:?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

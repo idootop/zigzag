@@ -53,7 +53,6 @@ interface JobState {
   checkResumable: () => Promise<void>;
   pause: () => Promise<void>;
   resume: () => Promise<void>;
-  cancel: () => Promise<void>;
   /** 把失败项退回队列，返回退回的条数。任务在跑时也能调。 */
   retry: () => Promise<number>;
   dismissError: () => void;
@@ -138,15 +137,6 @@ export const useJob = create<JobState>((set, get) => ({
     }
   },
 
-  cancel: async () => {
-    try {
-      // 也不切状态：正在编的那几件会跑完，最后一帧照样会来。
-      await ipc.jobCancel();
-    } catch (e) {
-      set({ error: toIpcError(e) });
-    }
-  },
-
   retry: async () => {
     const { jobId } = get();
     if (jobId === null) return 0;
@@ -154,7 +144,7 @@ export const useJob = create<JobState>((set, get) => ({
       const n = await ipc.jobRetry(jobId);
       // 跑完之后重试是个死胡同：条目确实退回了队列，但任务这一帧停在 finished，
       // 事件监听也早就退订了，界面上再没有任何按钮能把它们跑起来——用户只能等
-      // 下次启动时被 checkResumable 捞出来。退回 resumable，让「接着跑」出现。
+      // 下次启动时被 checkResumable 捞出来。退回 resumable，让「继续」出现。
       if (n > 0 && get().phase === "finished") {
         const update = await ipc.jobResumable();
         if (update) set({ phase: "resumable", jobId: update.job_id, update });

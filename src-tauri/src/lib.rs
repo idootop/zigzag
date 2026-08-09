@@ -67,6 +67,7 @@ pub fn run() {
             commands::check_tools,
             commands::job_progress,
             commands::log_path,
+            commands::prune_history,
             commands::scan::scan_start,
             commands::scan::scan_cancel,
             commands::scan::check_access,
@@ -75,7 +76,7 @@ pub fn run() {
             commands::job::job_resumable,
             commands::job::job_pause,
             commands::job::job_resume,
-            commands::job::job_cancel,
+            commands::job::job_discard,
             commands::job::job_items,
             commands::job::job_item_count,
             commands::job::job_retry,
@@ -113,6 +114,12 @@ fn build_state(
     // 上次若是崩溃或强退，卡在 running 的条目要先退回队列，否则永远不会被处理；
     // 同时清掉它们落点上的孤儿临时文件，不然重跑一次就积一份。
     core::recover::on_startup(&db)?;
+    // 再把上次留下的死数据清掉。**必须在 recover 之后**：可续任务的判据是
+    // 「running/paused 且还有 pending」，而把 running 退回 pending 正是上一步做的事。
+    // 清不掉不是启动失败的理由——顶多是没省下那点空间。
+    if let Err(e) = db.prune_history() {
+        tracing::warn!(%e, "历史数据清理失败");
+    }
 
     tracing::info!(data_dir = %dir.display(), "状态就绪");
     Ok(AppState {

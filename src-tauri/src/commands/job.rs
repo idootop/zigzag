@@ -168,14 +168,24 @@ pub fn job_resume(state: tauri::State<'_, AppState>) {
     }
 }
 
-/// 取消。已经在编的那几件会跑完（中途掐掉只会留下垃圾），没派发的留在队列里，
-/// 任务状态记 `paused`，用户再点开始就接着跑。
+/// 放弃这个任务：正在跑就先叫停，再把它连同那份队列从库里删掉。
+///
+/// 界面上只有「取消」这一个说法，它就是这条（tasks.md #3）。**只停不删是不够的**：
+/// 用户按完取消、退出、再打开，「上次还剩 N 个没处理完」原样回来，那个按钮等于没有。
+/// 已经压好的文件一个都不动——删掉的只是「还没干的那份清单」，重扫一遍就能再有。
+///
+/// 叫停时已经在编的那几件会跑完（中途掐掉只会留下垃圾）。**正在跑时删是安全的**：
+/// 任务收尾的那几条写全是 `UPDATE`（`apply_results`、`set_job_status`、
+/// `release_running`），行没了就是影响 0 行，不会把任务写回来。
+///
+/// 想「停下但留着下次跑」就按暂停然后退出应用——进度在库里，下次启动照样捞得回来。
 #[tauri::command]
-pub fn job_cancel(state: tauri::State<'_, AppState>) {
+pub fn job_discard(state: tauri::State<'_, AppState>, job_id: i64) -> Result<()> {
     if let Some(c) = &state.job.lock().expect("任务锁中毒").ctl {
         c.cancel();
-        tracing::info!("任务已取消");
+        tracing::info!(job_id, "任务已叫停");
     }
+    state.db.discard_job(job_id)
 }
 
 /// 分页读条目。`status` 为 `None` 表示不筛。

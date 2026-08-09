@@ -16,7 +16,7 @@ import { useApp } from "@/store/app";
 import { useJob } from "@/store/job";
 import { useScan } from "@/store/scan";
 import { useCompressStage } from "@/store/ui";
-import { Queue, QueueActions } from "@/views/Queue";
+import { Queue } from "@/views/Queue";
 import { Report, ReportActions } from "@/views/Report";
 
 import { Picker } from "./parts/Picker";
@@ -33,8 +33,8 @@ export function Compress() {
       <Toolbar
         back={stage === "report" ? { label: "重新选择", onClick: resetScan } : undefined}
       >
+        {/* 队列阶段工具栏是空的：暂停/继续/取消挨着进度条，见 `Queue` 的 `Header`。 */}
         {stage === "report" && report && <ReportActions report={report} />}
-        {stage === "queue" && <QueueActions />}
       </Toolbar>
 
       <Notices />

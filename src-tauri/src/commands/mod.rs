@@ -193,6 +193,19 @@ pub fn log_path(state: tauri::State<'_, AppState>) -> String {
     state.log_path.display().to_string()
 }
 
+/// 用户把队列关掉时叫一声，把再也读不到的历史清干净（[`Db::prune_history`]）。
+///
+/// 库里本来就会在启动时和开扫之前各清一遍，这个入口是为了让「关掉」当场生效：
+/// 十万文件的一份 `items` 是 25 MB，用户点完「再压一批」就去看数据目录，
+/// 不该还看见它。**失败不往前端抛**——没清成只是留下垃圾，下次开机再清，
+/// 拿它去打断用户的操作是本末倒置。
+#[tauri::command]
+pub fn prune_history(state: tauri::State<'_, AppState>) {
+    if let Err(e) = state.db.prune_history() {
+        tracing::warn!(%e, "历史数据清理失败");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

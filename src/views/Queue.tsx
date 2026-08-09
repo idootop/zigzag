@@ -32,8 +32,8 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { ipc, type ItemRow, type JobUpdate } from "@/lib/ipc";
 import { cn, formatBytes, formatCount, formatDuration, formatEta, formatSaving } from "@/lib/utils";
-import { useJob } from "@/store/job";
-import { resetCompress } from "@/store/ui";
+import { useJob, type JobPhase } from "@/store/job";
+import { discardCompress, resetCompress } from "@/store/ui";
 
 import { PathText } from "./parts/PathText";
 
@@ -84,117 +84,57 @@ export function Queue() {
 }
 
 /**
- * 队列阶段的主操作，摆进工具栏右槽。
+ * 这一屏此刻的样子。
  *
- * 「再压一批」走 `resetCompress()` 而不是裸的 `job.reset()`：只清任务的话，
- * 阶段优先级会掉到 `scan.phase === "done"`，那份已经被消费掉的报告会原路返回
- * （store/ui.ts）。
+ * **不能只看 `phase`。** 取消一个任务之后，最后那一帧照样带 `finished=true`
+ * （它由记账线程发，而记账线程分不清「跑完了」和「被叫停了」），只看 phase 就会
+ * 把「还剩九万条没跑」画成「已完成」。加上「还剩没剩」这一条，取消过的任务和
+ * 上次没跑完的任务就落到同一个状态上——它们本来就是同一件事：**停着，还没干完**，
+ * 能做的也一模一样（继续 / 取消）。
  */
-export function QueueActions() {
-  const phase = useJob((s) => s.phase);
-  const jobId = useJob((s) => s.jobId);
-  const paused = useJob((s) => s.update?.paused ?? false);
-  const failed = useJob((s) => s.update?.failed ?? 0);
-  const start = useJob((s) => s.start);
-  const pause = useJob((s) => s.pause);
-  const resume = useJob((s) => s.resume);
-  const cancel = useJob((s) => s.cancel);
-  const retry = useJob((s) => s.retry);
-  const [retried, setRetried] = useState<number | null>(null);
+type QueueState = "running" | "paused" | "stopped" | "done" | "failed";
 
-  if (phase === "running") {
-    return (
-      <>
-        {paused ? (
-          <Button size="sm" onClick={() => void resume()} className="gap-1.5">
-            <Play className="size-3.5" />
-            继续
-          </Button>
-        ) : (
-          <Button size="sm" variant="outline" onClick={() => void pause()} className="gap-1.5">
-            <Pause className="size-3.5" />
-            暂停
-          </Button>
-        )}
-        <Button size="sm" variant="ghost" onClick={() => void cancel()} className="gap-1.5">
-          <X className="size-3.5" />
-          停止
-        </Button>
-      </>
-    );
-  }
-
-  if (phase === "resumable") {
-    return (
-      <>
-        {/* 输出目录传 null：后端会用库里记着的那个，用户不必再选一遍。 */}
-        <Button
-          size="sm"
-          onClick={() => void (jobId !== null && start(jobId, null))}
-          className="gap-1.5"
-        >
-          <Play className="size-3.5" />
-          接着跑
-        </Button>
-        <Button size="sm" variant="ghost" onClick={resetCompress}>
-          关闭
-        </Button>
-      </>
-    );
-  }
-
-  // 中断的任务只给一条退路。**不给「再试一次」**：能让它死在启动上的多半是
-  // 配置问题（镜像模式没输出目录之类），原样再点一次只会再死一次；库里的进度
-  // 一条不少，下次打开由续跑接住。
-  if (phase === "failed") {
-    return (
-      <Button size="sm" onClick={resetCompress}>
-        关闭
-      </Button>
-    );
-  }
-
-  return (
-    <>
-      {retried !== null && (
-        <span className="text-xs text-muted-foreground">
-          {retried > 0 ? `已退回 ${formatCount(retried)} 项` : "没有可重试的项目"}
-        </span>
-      )}
-      {failed > 0 && (
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={() => void retry().then(setRetried)}
-          className="gap-1.5"
-        >
-          <RotateCcw className="size-3.5" />
-          重试失败项 {formatCount(failed)}
-        </Button>
-      )}
-      <Button size="sm" onClick={resetCompress}>
-        再压一批
-      </Button>
-    </>
-  );
+function queueState(phase: JobPhase, u: JobUpdate): QueueState {
+  if (phase === "failed") return "failed";
+  if (phase === "running") return u.paused ? "paused" : "running";
+  return u.pending > 0 ? "stopped" : "done";
 }
 
 /**
- * 顶部：进度与数字。控制按钮已经上了工具栏，这里只剩「现在怎么样了」。
+ * 头部：这一趟干到哪儿了，以及**能对它做什么**。
+ *
+ * 三行，从上到下回答三个问题：
+ *
+ * ```text
+ * 12,430 / 128,900   已省 4.2 GB · 38%              剩余 2 小时 14 分   ← 到哪儿了
+ * ▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+ * ⟳ …/IMG_0042.HEIC 62%                      [ ⏸ 暂停 ]  [ ✕ 取消 ]   ← 在干什么／怎么办
+ * ```
+ *
+ * **控制按钮从工具栏搬到了这里（tasks.md #4）。** 摆在工具栏上是错的：它们只在
+ * 这一屏存在、只作用于底下那根进度条，却被放在离它 200 px 远的窗口顶栏里，中间
+ * 还隔着一个和它们毫无关系的分段控件。手要去的地方和眼睛在看的地方分成两处，
+ * 每次暂停都得重新找一遍。
+ *
+ * 「上次还剩 N 个没处理完」也从一条独立的提示条并进了第三行：它说的是**当前状态**，
+ * 而状态那一行本来就在那儿空着——多一个带边框的盒子只是把同一句话说得更响。
  */
 function Header({ update }: { update: JobUpdate | null }) {
   const phase = useJob((s) => s.phase);
 
   // 还没收到第一帧。不画 0%，那会让人以为任务卡在开头。
   // 一帧都没收到就断了（配置不对是最常见的一种），这时更不能画「正在启动…」——
-  // 那个圈会一直转下去。原因由提示条说，这里只交代它没在跑。
+  // 那个圈会一直转下去。原因由提示条说，这里只交代它没在跑，外加一条退路。
   if (!update) {
     return (
-      <div className="flex shrink-0 items-center gap-2 border-b border-border px-6 py-4 text-sm text-muted-foreground">
+      <header className="flex h-16 shrink-0 items-center gap-2 border-b border-border px-6 text-sm text-muted-foreground">
         {phase === "failed" ? (
           <>
             <AlertTriangle className="size-4 text-destructive" />
             任务没能开始
+            <div className="ml-auto flex shrink-0 items-center gap-2">
+              <Controls state="failed" update={null} />
+            </div>
           </>
         ) : (
           <>
@@ -202,22 +142,17 @@ function Header({ update }: { update: JobUpdate | null }) {
             正在启动…
           </>
         )}
-      </div>
+      </header>
     );
   }
 
+  const state = queueState(phase, update);
   const settled = update.done + update.failed + update.skipped;
   const pct = update.total > 0 ? (settled / update.total) * 100 : 0;
   const saved = update.src_bytes - update.dst_bytes;
-  const running = phase === "running";
 
   return (
     <header className="flex shrink-0 flex-col gap-3 border-b border-border px-6 py-4">
-      {/* 上次没跑完。说清还剩多少，别让用户自己拿总数减一减。 */}
-      {phase === "resumable" && (
-        <Notice>上次还剩 {formatCount(update.pending)} 个没处理完，进度都在。</Notice>
-      )}
-
       {update.volume_lost && (
         <Notice tone="warn">
           找不到 <span className="font-mono">{update.volume_lost}</span> 了，任务已自动暂停。
@@ -225,77 +160,63 @@ function Header({ update }: { update: JobUpdate | null }) {
         </Notice>
       )}
 
-      {phase === "failed" ? (
-        /* 中途死了。**不报「已完成」**——数字停在断掉那一刻，已经压好的都在库里，
-           下次打开会被续跑捞出来。出了什么事由上面的提示条说。 */
-        <div className="flex items-baseline gap-2 text-sm">
-          <AlertTriangle className="size-4 shrink-0 self-center text-destructive" />
-          <span className="font-medium">任务中断</span>
-          <span className="tabular-nums text-muted-foreground">
-            已压缩 {formatCount(update.done)} · 还剩 {formatCount(update.pending)}，
-            进度都在，下次打开可以接着跑
+      <div className="flex items-baseline gap-3">
+        <span className="text-2xl font-semibold tabular-nums">
+          {formatCount(settled)}
+          <span className="text-base font-normal text-muted-foreground">
+            {" / "}
+            {formatCount(update.total)}
           </span>
-        </div>
-      ) : phase === "finished" ? (
-        /* 跑完了就换成一句小结，取代那个 12px 的「已结束」。**列表留着**——
-           跑完第一件事是点「失败 N」，拿一屏成功公告挡在用户和他唯一想看的
-           东西之间是没道理的。 */
-        <div className="flex items-baseline gap-2 text-sm">
-          <Check className="size-4 shrink-0 self-center text-good" />
-          <span className="font-medium">已完成</span>
-          <span className="tabular-nums text-muted-foreground">
-            压缩 {formatCount(update.done)} · 跳过 {formatCount(update.skipped)}
-          </span>
-          {update.failed > 0 && (
-            <span className="tabular-nums text-destructive">
-              失败 {formatCount(update.failed)}
-            </span>
-          )}
-          <div className="flex-1" />
-          {saved > 0 && (
-            <span className="text-good">
-              省下 {formatBytes(saved)}
-              <span className="text-muted-foreground">
-                {" · "}
-                {formatSaving(update.src_bytes, update.dst_bytes)}
-              </span>
-            </span>
-          )}
-        </div>
-      ) : (
-        <div className="flex items-baseline gap-3">
-          <span className="text-2xl font-semibold tabular-nums">
-            {formatCount(settled)}
-            <span className="text-base font-normal text-muted-foreground">
-              {" / "}
-              {formatCount(update.total)}
+        </span>
+        {saved > 0 && (
+          <span className="text-sm text-good">
+            已省 {formatBytes(saved)}
+            <span className="text-muted-foreground">
+              {" · "}
+              {formatSaving(update.src_bytes, update.dst_bytes)}
             </span>
           </span>
-          {saved > 0 && (
-            <span className="text-sm text-good">
-              已省 {formatBytes(saved)}
-              <span className="text-muted-foreground">
-                {" · "}
-                {formatSaving(update.src_bytes, update.dst_bytes)}
-              </span>
-            </span>
-          )}
-          <div className="flex-1" />
-          {/* 样本不足时后端给 null。宁可不显示，也不显示一个乱跳的数字。 */}
-          {running && !update.paused && update.eta_secs !== null && (
-            <span className="text-xs tabular-nums text-muted-foreground">
-              剩余 {formatEta(update.eta_secs)}
-            </span>
-          )}
-        </div>
-      )}
+        )}
+        <div className="flex-1" />
+        {/* 样本不足时后端给 null，那就不显示——宁可没有，也不显示一个乱跳的数字。
+            **暂停时照常显示**（tasks.md #6）：它回答的是「现在点继续还要多久」，
+            而暂停期间这个数字是冻住的——后端算它时扣掉了停着的那段时间
+            （`core::job::PauseClock`），不扣的话它会在暂停期间一路往上涨。 */}
+        {update.eta_secs !== null && (
+          <span className="text-xs tabular-nums text-muted-foreground">
+            剩余 {formatEta(update.eta_secs)}
+          </span>
+        )}
+      </div>
 
       <Progress value={pct} />
 
-      {/* 只在跑动时占这一行：`resumable` 下 current / eta 都是 null（D-158），
-          那 20px 是纯空白。定高是为了免得它出现/消失时整块版面上下抖。 */}
-      {running && (
-        <div className="flex h-5 items-center gap-2 text-xs text-muted-foreground">
+      {/* 状态 + 控制。定高，免得按钮随状态出现/消失时整块版面上下抖。 */}
+      <div className="flex h-8 items-center gap-3">
+        <StatusLine state={state} phase={phase} update={update} />
+        <div className="flex shrink-0 items-center gap-2">
+          <Controls state={state} update={update} />
+        </div>
+      </div>
+    </header>
+  );
+}
+
+/** 左边那一行：现在到底什么情况。数字不重复——它们就在下面那排筛选上。 */
+function StatusLine({
+  state,
+  phase,
+  update,
+}: {
+  state: QueueState;
+  phase: JobPhase;
+  update: JobUpdate;
+}) {
+  const box = "flex min-w-0 flex-1 items-center gap-2 text-xs text-muted-foreground";
+  switch (state) {
+    case "running":
+      return (
+        <div className={box}>
           {!update.finished && update.current && (
             <>
               <Loader2 className="size-3 shrink-0 animate-spin" />
@@ -308,8 +229,115 @@ function Header({ update }: { update: JobUpdate | null }) {
             </>
           )}
         </div>
+      );
+    case "paused":
+      return (
+        <div className={box}>
+          <Pause className="size-3 shrink-0" />
+          已暂停，随时可以继续
+        </div>
+      );
+    case "stopped":
+      return (
+        <div className={box}>
+          {/* `resumable` 是启动时从库里捞出来的，得先交代它是打哪儿来的；
+              刚被取消的那一份用户自己按的，不必再解释一遍。 */}
+          {phase === "resumable" ? "上次" : "已停止，"}还剩 {formatCount(update.pending)}{" "}
+          个没处理完，进度都在
+        </div>
+      );
+    case "done":
+      return (
+        <div className={box}>
+          <Check className="size-3 shrink-0 text-good" />
+          已完成
+        </div>
+      );
+    case "failed":
+      return (
+        <div className={box}>
+          <AlertTriangle className="size-3 shrink-0 text-destructive" />
+          任务中断，已经压好的都保留着
+        </div>
+      );
+  }
+}
+
+/**
+ * 这个任务能做的事。
+ *
+ * 只有三个词：**暂停 / 继续 / 取消**（tasks.md #3）。「关闭」「接着跑」既不像一个
+ * 专业工具会说的话，也没说清按下去会发生什么——「关闭」关的是窗口还是任务？
+ *
+ * 「取消」是真的取消：任务连同那份没干完的队列一起从库里删掉，不会下次启动又被
+ * 「上次还剩 N 个」捞回来（`discardCompress`）。已经压好的文件一个都不动。
+ */
+function Controls({ state, update }: { state: QueueState; update: JobUpdate | null }) {
+  const jobId = useJob((s) => s.jobId);
+  const start = useJob((s) => s.start);
+  const pause = useJob((s) => s.pause);
+  const resume = useJob((s) => s.resume);
+  const retry = useJob((s) => s.retry);
+  const [retried, setRetried] = useState<number | null>(null);
+  const failed = update?.failed ?? 0;
+
+  // 全干完了。剩下的事只有「要不要再理一下失败项」和收摊，没什么可取消的。
+  if (state === "done") {
+    return (
+      <>
+        {retried !== null && retried === 0 && (
+          <span className="text-xs text-muted-foreground">没有可重试的项目</span>
+        )}
+        {failed > 0 && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void retry().then(setRetried)}
+            className="gap-1.5"
+          >
+            <RotateCcw className="size-3.5" />
+            重试失败项 {formatCount(failed)}
+          </Button>
+        )}
+        <Button size="sm" onClick={resetCompress}>
+          完成
+        </Button>
+      </>
+    );
+  }
+
+  // 「继续」有两种：暂停的任务还活着，叫醒就行；停下的（上次没跑完、被取消过、
+  // 或者启动时死了）得重新开跑，输出目录传 null——后端会用库里记着的那个，
+  // 用户不必再选一遍（tasks.md #1）。
+  const goOn = () => {
+    if (state === "paused") void resume();
+    else if (jobId !== null) void start(jobId, null);
+  };
+
+  return (
+    <>
+      {state === "running" ? (
+        <Button size="sm" variant="outline" onClick={() => void pause()} className="gap-1.5">
+          <Pause className="size-3.5" />
+          暂停
+        </Button>
+      ) : (
+        <Button size="sm" onClick={goOn} className="gap-1.5">
+          <Play className="size-3.5" />
+          继续
+        </Button>
       )}
-    </header>
+      <Button
+        size="sm"
+        variant="ghost"
+        onClick={discardCompress}
+        title="放弃这个任务。已经压好的文件都保留，没处理的那些下次要重新扫描。"
+        className="gap-1.5 text-muted-foreground"
+      >
+        <X className="size-3.5" />
+        取消
+      </Button>
+    </>
   );
 }
 

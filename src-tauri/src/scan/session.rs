@@ -159,8 +159,9 @@ pub async fn run(
         // 写不进去只是让预检失去依据（那时会放行），不值得让扫描白跑。
         tracing::warn!(%e, "产物体积预估回写失败，空间预检将被跳过");
     }
-    // 扫完就把任务从「扫描中」放回「待处理」。中途崩了则留在 scanning，
-    // 启动恢复会把它标成 paused——那份计划是残的，状态上要看得出来。
+    // 扫完就把任务从「扫描中」放回「待处理」。中途崩了则**一直留在 scanning**：
+    // 那份计划是残的，既不该被当成可续任务捞回队列页（它连输出目录都还没选），
+    // 也该在下次扫描时被剪掉。启动恢复不碰这个状态，见 `Db::recover_interrupted`。
     if let Err(e) = db.set_job_status(job, "pending") {
         tracing::warn!(%e, "任务状态回写失败");
     }
@@ -182,19 +183,18 @@ pub async fn run(
     report
 }
 
-/// 建一条任务行，顺手清掉之前扫了但从没跑过的计划。
+/// 建一条任务行，顺手清掉读不到的历史。
 ///
 /// 每次扫描都落一个新任务：同一个 `job_id` 里混两次扫描的结果会让
 /// 「这次扫到多少」变成一笔糊涂账，而 `items` 的 `UNIQUE(job_id, src_path)`
 /// 也会让重扫时的变更（文件被删、被换）无从体现。
 ///
-/// 代价是反复扫同一块盘会攒下一堆没人跑的计划，十万条一份。所以先剪枝：
-/// **一条都没动过的任务**（没有任何非 pending 条目）可以安全删掉，
-/// 用户没有任何进度会因此丢失。
+/// 代价是每扫一遍就攒下十万条，所以**开扫之前先清一遍**（[`Db::prune_history`]）。
+/// 放在建行之前是有意的：那时新任务还不存在，清理不必为它留例外。
 fn open_job(db: &Db, cfg: &Profile, roots: &[PathBuf]) -> crate::error::Result<i64> {
-    if let Err(e) = db.prune_unstarted_jobs() {
-        // 剪枝失败只是留下垃圾，不该挡住这次扫描。
-        tracing::warn!(%e, "旧计划清理失败");
+    if let Err(e) = db.prune_history() {
+        // 清理失败只是留下垃圾，不该挡住这次扫描。
+        tracing::warn!(%e, "历史数据清理失败");
     }
     let name = roots
         .iter()
@@ -488,10 +488,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plan_that_was_started_survives_a_rescan() {
-        // 剪枝的判据是「一条都没动过」。跑过一条就有历史了，删掉等于抹掉用户的进度。
+    async fn a_plan_that_can_still_be_resumed_survives_a_rescan() {
+        // 清理的判据是「界面还读不读得到」（`Db::prune_history`）。跑了一半停下的
+        // 那一个正是队列页会捞出来的那一个，删掉等于抹掉用户的进度。
         let t = tree("keep");
         png(&t.0, "a.png", 1920, 1080, 200_000);
+        png(&t.0, "b.png", 1920, 1080, 200_000);
         let db = db();
         let cfg = Profile::default();
 
@@ -499,9 +501,11 @@ mod tests {
             run(db.clone(), cfg.clone(), vec![t.0.clone()], Arc::new(AtomicBool::new(false)), |_| {}).await;
         let id = db.claim_pending(first.job_id, 1).unwrap()[0].id;
         db.finish_item(id, "/out/a.avif", 1, 1).unwrap();
+        // 用户按了暂停——`job::run` 收尾时留的就是这个状态。
+        db.set_job_status(first.job_id, "paused").unwrap();
 
         run(db.clone(), cfg, vec![t.0.clone()], Arc::new(AtomicBool::new(false)), |_| {}).await;
-        assert!(db.get_job(first.job_id).is_ok(), "跑过的计划不能被下一次扫描抹掉");
+        assert!(db.get_job(first.job_id).is_ok(), "跑了一半的计划不能被下一次扫描抹掉");
     }
 
     #[test]
