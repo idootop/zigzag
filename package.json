@@ -10,7 +10,13 @@
     "tauri": "tauri",
     "typecheck": "tsc --noEmit",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
-    "sidecars": "./scripts/fetch-sidecars.sh"
+    "sidecars": "./scripts/fetch-sidecars.sh",
+    "bench:verify": "./bench/verify-corpus.sh",
+    "bench:size": "./bench/size.sh",
+    "bench:image": "./bench/quality-image.sh",
+    "bench:video": "./bench/quality-video.sh",
+    "bench:sample": "./bench/sample.sh",
+    "bench:100k": "./bench/make-100k.sh"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",

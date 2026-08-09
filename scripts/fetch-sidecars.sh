@@ -51,7 +51,7 @@ fetch() {
   local got
   got="$(shasum -a 256 "$tmp/$name" | cut -d' ' -f1)"
   if [[ "$got" != "$want" ]]; then
-    echo "✗ $name 校验失败：期望 $want，实际 $got" >&2
+    echo "✗ $name 校验失败：期望 ${want}，实际 $got" >&2
     exit 1
   fi
 
