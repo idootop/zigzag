@@ -14,10 +14,8 @@
 //! 都要自己记一遍上次发送时间。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager as _};
 
 use crate::error::{Result, ZzError};
 use crate::platform::{tcc, RootAccess};
@@ -28,42 +26,30 @@ use super::AppState;
 pub const EVENT_PROGRESS: &str = "scan://progress";
 pub const EVENT_REPORT: &str = "scan://report";
 
-/// 正在跑的扫描。同一时刻只允许一个——两次扫描同时写 `probe_cache`
-/// 只会互相拖慢，而用户也不可能同时看两份报告。
-#[derive(Default)]
-pub struct ScanHandle {
-    cancel: Option<Arc<AtomicBool>>,
-}
-
-impl ScanHandle {
-    fn is_running(&self) -> bool {
-        self.cancel.as_ref().is_some_and(|c| !c.load(Ordering::Relaxed))
-    }
-}
-
 /// 开始扫描。立刻返回，进度走事件。
+///
+/// 同一时刻只允许一个（[`super::CancelSlot`]）——两次扫描同时写 `probe_cache`
+/// 只会互相拖慢，而用户也不可能同时看两份报告。
 #[tauri::command]
 pub fn scan_start(app: AppHandle, state: tauri::State<'_, AppState>, roots: Vec<PathBuf>) -> Result<()> {
     if roots.is_empty() {
         return Err(ZzError::BadConfig("没有选择要扫描的目录".into()));
     }
-    let mut handle = state.scan.lock().expect("扫描锁中毒");
-    if handle.is_running() {
+    let Some(cancel) = state.scan.lock().expect("扫描锁中毒").claim() else {
         return Err(ZzError::Other("已有扫描在进行中".into()));
-    }
-
-    let cancel = Arc::new(AtomicBool::new(false));
-    handle.cancel = Some(cancel.clone());
-    drop(handle);
+    };
 
     let db = state.db.clone();
     let cfg = state.profile.lock().expect("配置锁中毒").clone();
     tauri::async_runtime::spawn(async move {
-        let report = crate::scan::run(db, cfg, roots, cancel, |p: ScanProgress| {
+        let report = crate::scan::run(db, cfg, roots, cancel.clone(), |p: ScanProgress| {
             // 发送失败只意味着窗口没了，不值得中断扫描——扫完的结果还在库里。
             let _ = app.emit(EVENT_PROGRESS, p);
         })
         .await;
+        // 先腾位再发报告：用户看到报告就可能马上「重新选择 → 扫描」，
+        // 位子这时候必须已经是空的。
+        app.state::<AppState>().scan.lock().expect("扫描锁中毒").release(&cancel);
         let _ = app.emit(EVENT_REPORT, report);
     });
     Ok(())
@@ -72,8 +58,7 @@ pub fn scan_start(app: AppHandle, state: tauri::State<'_, AppState>, roots: Vec<
 /// 取消扫描。已经分析过的部分仍会汇总成报告发出来。
 #[tauri::command]
 pub fn scan_cancel(state: tauri::State<'_, AppState>) {
-    if let Some(c) = state.scan.lock().expect("扫描锁中毒").cancel.take() {
-        c.store(true, Ordering::Relaxed);
+    if state.scan.lock().expect("扫描锁中毒").cancel() {
         tracing::info!("扫描已取消");
     }
 }
@@ -96,26 +81,6 @@ pub fn open_privacy_settings() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_fresh_handle_is_not_running() {
-        assert!(!ScanHandle::default().is_running());
-    }
-
-    #[test]
-    fn a_cancelled_scan_frees_the_slot() {
-        // 取消之后必须能立刻再开一次。如果这里判错，用户点了取消就再也
-        // 扫不了，只能重启应用。
-        let cancel = Arc::new(AtomicBool::new(false));
-        let mut h = ScanHandle { cancel: Some(cancel.clone()) };
-        assert!(h.is_running());
-
-        cancel.store(true, Ordering::Relaxed);
-        assert!(!h.is_running());
-
-        h.cancel = None;
-        assert!(!h.is_running());
-    }
 
     #[test]
     fn event_names_are_namespaced() {

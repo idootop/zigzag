@@ -29,3 +29,6 @@ src-tauri/binaries/
 
 # 测试素材（约 200 MB，见 PROGRESS.md「素材集」）
 /fixtures/
+
+# 基准 8 素材集（不进 git，清单见 bench/manifest-8.tsv）
+/bench/b8/

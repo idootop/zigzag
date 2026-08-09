@@ -131,6 +131,106 @@ pub fn decode(path: &Path) -> Result<Raw> {
     }
 }
 
+/// 缩略解码，专给感知去重用（D-108）。返回 `(宽, 高, RGBA8)`。
+///
+/// 感知哈希只需要 8×8 的灰度，为此把一张 48 MP 的图完整解成上百 MB 的 RGBA
+/// 纯属浪费——归档盘上有十万张这样的图，而哈希是多线程跑的。
+///
+/// **它省的主要是内存，不是时间**（基准 16 §2，这一条和最初的设想相反）：
+/// 缓冲区从几十 MB 掉到 40 KB 左右，稳定三位数倍率；但耗时只在 JPEG 上稳赢
+/// （3~4×，DCT 系数截断真的生效），HEIC 与 PNG 反而慢 1.7× ——ImageIO 在这
+/// 两种格式上是**先整张解完再高质量缩**，缩的那一步是净增的开销。
+/// 仍然选它：为一个 8×8 的哈希，在 8 条线程上同时各留一块几十 MB 的缓冲区，
+/// 是这个应用最不该花的内存。
+///
+/// 三个选项都不是可选的：
+///
+/// - `FromImageAlways`：强制从主图生成，**不用**文件里嵌的那张缩略图。
+///   实测（基准 16 §2）改成 `IfAbsent` 在 JPEG 上快 4~20×，但指纹和主图差
+///   19、34 位——64 位哈希的随机基线就是 32 位，等于换了张图。省的时间再多
+///   也不能要。
+/// - `WithTransform`：顺手把 EXIF 朝向应用掉。少了它，同一张照片「已转正」
+///   与「靠标签转正」的两个版本会算出完全不同的指纹。
+/// - `MaxPixelSize`：长边上限。
+///
+/// 画布**一律用 sRGB**，与 [`decode`] 的「保源色彩空间」相反：那边要的是不做
+/// 转换以免损失，这边要的正是**归一化**——同一张照片导出的 P3 版与 sRGB 版
+/// 应该算出同一个指纹。
+pub fn thumbnail(path: &Path, max_px: u32) -> Result<(u32, u32, Vec<u8>)> {
+    thumbnail_opt(path, max_px, true)
+}
+
+/// [`thumbnail`] 的可调版本，只给基准 16 §2 用来对比「用不用文件里嵌的缩略图」。
+/// 生产固定走 `always = true`，理由见上。
+pub(crate) fn thumbnail_opt(path: &Path, max_px: u32, always: bool) -> Result<(u32, u32, Vec<u8>)> {
+    use objc2_core_foundation::{CFDictionary, CFNumber, CFRetained, CFString, CFType};
+
+    let bytes = std::fs::read(path)?;
+    let data = CFData::from_bytes(&bytes);
+    // SAFETY: 与 `decode` 同样是 ImageIO/CoreGraphics 的常规调用序列，所有对象
+    // 由 CFRetained 持有；bitmap 缓冲区在 context 存活期间有效。
+    unsafe {
+        let src = CGImageSource::with_data(&data, None)
+            .ok_or_else(|| ZzError::Other("ImageIO 不认识这个文件".into()))?;
+        if src.count() == 0 {
+            return Err(ZzError::Other("ImageIO 没有从文件里读出任何图像".into()));
+        }
+        let idx = src.primary_image_index();
+
+        let size = CFNumber::new_i32(max_px as i32);
+        let yes = objc2_core_foundation::kCFBooleanTrue
+            .ok_or_else(|| ZzError::Other("取不到 kCFBooleanTrue".into()))?;
+        let keys: [&CFString; 3] = [
+            if always {
+                objc2_image_io::kCGImageSourceCreateThumbnailFromImageAlways
+            } else {
+                objc2_image_io::kCGImageSourceCreateThumbnailFromImageIfAbsent
+            },
+            objc2_image_io::kCGImageSourceCreateThumbnailWithTransform,
+            objc2_image_io::kCGImageSourceThumbnailMaxPixelSize,
+        ];
+        let values: [&CFType; 3] = [&**yes, &**yes, &*size];
+        let opts = CFDictionary::<CFString, CFType>::from_slices(&keys, &values);
+        // 泛型只是 Rust 侧的标注，ImageIO 收的是无类型的 CFDictionaryRef。
+        let opts: CFRetained<CFDictionary> = CFRetained::cast_unchecked(opts);
+
+        let img = src
+            .thumbnail_at_index(idx, Some(&opts))
+            .ok_or_else(|| ZzError::Other("ImageIO 生成缩略图失败".into()))?;
+
+        let w = CGImage::width(Some(&img));
+        let h = CGImage::height(Some(&img));
+        if w == 0 || h == 0 {
+            return Err(ZzError::Other("ImageIO 给出的缩略图尺寸为 0".into()));
+        }
+
+        let space = CGColorSpace::new_device_rgb().expect("设备 RGB 色彩空间必然存在");
+        let row_bytes = w * 4;
+        let mut rgba = vec![0u8; row_bytes * h];
+        let ctx = CGBitmapContextCreate(
+            rgba.as_mut_ptr().cast(),
+            w,
+            h,
+            8,
+            row_bytes,
+            Some(&space),
+            // 透明区域落在归零的画布上，也就是黑。指纹只要求确定，不要求好看。
+            CGImageAlphaInfo::NoneSkipLast.0,
+        )
+        .ok_or_else(|| ZzError::Other("创建位图画布失败".into()))?;
+
+        let rect = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(w as f64, h as f64));
+        CGContext::draw_image(Some(&ctx), rect, Some(&img));
+        CGContext::flush(Some(&ctx));
+        drop(ctx);
+
+        for px in rgba.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+        Ok((w as u32, h as u32, rgba))
+    }
+}
+
 /// 选画布的色彩空间，并顺带把对应的 ICC 取出来。
 ///
 /// 返回的 ICC 就是产物要嵌的那一份（D-49）——因为画布用的就是这个空间，
@@ -174,7 +274,7 @@ unsafe fn is_plain_srgb(space: &CGColorSpace) -> bool {
 /// 反预乘。CoreGraphics 只能画出预乘的 RGBA，而 AVIF 要的是非预乘。
 ///
 /// `a == 0` 时颜色分量没有任何信息可恢复，置 0 是唯一不引入假数据的选择。
-fn unpremultiply(rgba: &mut [u8]) {
+pub(super) fn unpremultiply(rgba: &mut [u8]) {
     for px in rgba.chunks_exact_mut(4) {
         let a = px[3];
         match a {
@@ -195,23 +295,78 @@ unsafe fn read_orientation(src: &CGImageSource, idx: usize) -> u16 {
     let Some(props) = src.properties_at_index(idx, None) else {
         return 1;
     };
-    let key: *const std::ffi::c_void =
-        (objc2_image_io::kCGImagePropertyOrientation as *const objc2_core_foundation::CFString)
-            .cast();
+    match dict_i64(&props, objc2_image_io::kCGImagePropertyOrientation) {
+        Some(o) if (1..=8).contains(&o) => o as u16,
+        _ => 1,
+    }
+}
+
+/// 从 ImageIO 的属性字典里取一个整数。
+///
+/// 泛型的 `CFDictionary` 在 objc2 里是「有类型」的，而 ImageIO 交回来的是无类型
+/// 字典，取值只能落回 C API。
+unsafe fn dict_i64(
+    props: &objc2_core_foundation::CFDictionary,
+    key: &'static objc2_core_foundation::CFString,
+) -> Option<i64> {
     extern "C-unwind" {
         fn CFDictionaryGetValue(
             d: *const objc2_core_foundation::CFDictionary,
             key: *const std::ffi::c_void,
         ) -> *const std::ffi::c_void;
     }
-    let v = CFDictionaryGetValue((&*props) as *const _, key);
+    let key: *const std::ffi::c_void = (key as *const objc2_core_foundation::CFString).cast();
+    let v = CFDictionaryGetValue(props as *const _, key);
     if v.is_null() {
-        return 1;
+        return None;
     }
-    let n = &*(v as *const objc2_core_foundation::CFNumber);
-    match n.as_i64() {
-        Some(o) if (1..=8).contains(&o) => o as u16,
-        _ => 1,
+    (*(v as *const objc2_core_foundation::CFNumber)).as_i64()
+}
+
+/// 一张图的「说明书」：**看到的**尺寸和格式，不解码像素。
+pub struct ImageInfo {
+    /// 已按 EXIF 朝向换算过——竖拍照片给的就是「高大于宽」。
+    pub width: u32,
+    pub height: u32,
+    /// UTI，如 `public.heic` / `public.jpeg` / `public.png`。
+    ///
+    /// 比扩展名可信：归档盘上 `.jpg` 里装着 PNG 是常有的事。
+    pub uti: Option<String>,
+}
+
+/// 只读文件头，拿显示尺寸与格式。
+///
+/// ## 为什么不用 ffprobe
+///
+/// 因为它在 HEIC 上给的是错的。本机 ffprobe 9.0 对 `fixtures/image/photo.heic`
+/// （实际 4032×3024）报的是 **512×512** ——HEIF 容器里主图之外还躺着一张缩略图
+/// item，它挑中的是那一张。iPhone 拍的照片默认就是 HEIC，这个错误会直接印在
+/// 对比界面上。ImageIO 走 `primary_image_index()`，不存在这个问题。
+///
+/// ## 为什么不用 `imagesize`
+///
+/// 扫描阶段用它是对的（读头，136 us，见 [`crate::scan::probe`]），但它不解析
+/// EXIF 朝向，也不给格式。对比界面上「源 4032×3024 → 产物 3024×4032」会被当成
+/// 应用把图转错了，而实际上只是源的朝向没算进去——产物是把朝向烘焙进像素的。
+pub fn info(path: &Path) -> Result<ImageInfo> {
+    let bytes = std::fs::read(path)?;
+    let data = CFData::from_bytes(&bytes);
+    // SAFETY: 同 `decode`，常规的 ImageIO 调用序列，对象都由 CFRetained 持有。
+    unsafe {
+        let src = CGImageSource::with_data(&data, None)
+            .ok_or_else(|| ZzError::Other("ImageIO 不认识这个文件".into()))?;
+        if src.count() == 0 {
+            return Err(ZzError::Other("ImageIO 没有从文件里读出任何图像".into()));
+        }
+        let idx = src.primary_image_index();
+        let props = src
+            .properties_at_index(idx, None)
+            .ok_or_else(|| ZzError::Other("ImageIO 读不出这张图的属性".into()))?;
+        let w = dict_i64(&props, objc2_image_io::kCGImagePropertyPixelWidth).unwrap_or(0) as u32;
+        let h = dict_i64(&props, objc2_image_io::kCGImagePropertyPixelHeight).unwrap_or(0) as u32;
+        // 5~8 这四种朝向要转 90°，宽高互换。
+        let (w, h) = if (5..=8).contains(&read_orientation(&src, idx)) { (h, w) } else { (w, h) };
+        Ok(ImageInfo { width: w, height: h, uti: src.r#type().map(|s| s.to_string()) })
     }
 }
 
@@ -245,6 +400,33 @@ mod tests {
         assert_eq!(raw.rgba.len(), raw.width as usize * raw.height as usize * 4);
         assert!(raw.opaque, "相机拍的 HEIC 没有 alpha 通道");
         assert!(raw.rgba.chunks_exact(4).all(|px| px[3] == 255), "不透明图的 alpha 必须补满");
+    }
+
+    #[test]
+    #[ignore = "需要真实素材"]
+    fn reads_the_real_size_of_a_heic() {
+        // 这条断言存在的唯一理由：本机 ffprobe 9.0 对同一个文件报的是 512×512
+        // （它挑中了 HEIF 容器里那张缩略图 item）。见 `info` 的文档。
+        let i = info(&fixture("photo.heic")).unwrap();
+        assert_eq!((i.width, i.height), (4032, 3024));
+        assert_eq!(i.uti.as_deref(), Some("public.heic"));
+    }
+
+    #[test]
+    #[ignore = "需要真实素材"]
+    fn size_is_what_you_see_not_what_is_stored() {
+        // 竖拍照片存的是 4032×3024 + 朝向标签，界面上要显示的是转正之后的尺寸，
+        // 否则「源 4032×3024 → 产物 3024×4032」看起来就像应用把图转错了。
+        let i = info(&fixture("exif.heic")).unwrap();
+        assert!(i.height > i.width, "竖图必须是高大于宽，实得 {}×{}", i.width, i.height);
+    }
+
+    #[test]
+    #[ignore = "需要真实素材"]
+    fn format_comes_from_the_content_not_the_extension() {
+        // 归档盘上 `.jpg` 里装着别的格式是常有的事。
+        assert_eq!(info(&fixture("shot.png")).unwrap().uti.as_deref(), Some("public.png"));
+        assert_eq!(info(&fixture("photo.jpg")).unwrap().uti.as_deref(), Some("public.jpeg"));
     }
 
     #[test]

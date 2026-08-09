@@ -91,6 +91,8 @@ pub struct ScanProgress {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, TS)]
 #[ts(export, export_to = "../../src/lib/bindings/")]
 pub struct ScanReport {
+    /// 这次扫描落下的任务 id。处理计划已经写进库了，按「开始」就是跑它。
+    #[ts(type = "number")] pub job_id: i64,
     pub roots: Vec<String>,
     /// 遍历到的普通文件总数（含非媒体）。
     #[ts(type = "number")] pub files_seen: u64,
@@ -100,6 +102,18 @@ pub struct ScanReport {
     #[ts(type = "number")] pub errors: u64,
     #[ts(type = "number")] pub hardlinks_skipped: u64,
     pub cancelled: bool,
+
+    /// 下面三个数只在**镜像模式**下有意义：它们是源目录里有、而输出目录里
+    /// 不会有的东西（ADR-021 §13）。界面据此告诉用户「输出目录不是源目录的
+    /// 完整副本」——不说清楚，用户对着输出目录点头再删源盘，丢的就是这些。
+    ///
+    /// 扩展名不认识的普通文件：文档、压缩包、工程文件。
+    #[ts(type = "number")] pub non_media_files: u64,
+    /// 边车文件：`.xmp` / `.aae` 这类紧挨着照片的编辑记录。最要紧的一类——
+    /// 它们依附于被压缩的那些照片，丢了就是丢了人家的调色参数。
+    #[ts(type = "number")] pub sidecar_files: u64,
+    /// 整个跳过的包目录：`.photoslibrary` / `.fcpbundle` / `.app`。
+    #[ts(type = "number")] pub bundles_skipped: u64,
 
     /// 将要处理的文件数与源字节。**不含跳过项**。
     #[ts(type = "number")] pub planned_files: u64,
@@ -135,6 +149,9 @@ pub struct Aggregator {
     media_found: u64,
     errors: u64,
     hardlinks_skipped: u64,
+    non_media: u64,
+    sidecars: u64,
+    bundles: u64,
     cancelled: bool,
 }
 
@@ -151,12 +168,18 @@ impl Aggregator {
             media_found: 0,
             errors: 0,
             hardlinks_skipped: 0,
+            non_media: 0,
+            sidecars: 0,
+            bundles: 0,
             cancelled: false,
         }
     }
 
-    /// 记一个已探测的文件。跳过判定在这里做，调用方不用重复一遍。
-    pub fn add(&mut self, path: &Path, p: &Probed) {
+    /// 记一个已探测的文件，返回它被跳过的原因（`None` = 进处理计划）。
+    ///
+    /// 跳过判定在这里做，调用方不用重复一遍——但结果要还给调用方：扫描会把
+    /// 「进计划」的那些写进 `items`，判两遍等于给了两个可能不一致的答案。
+    pub fn add(&mut self, path: &Path, p: &Probed) -> Option<SkipReason> {
         self.media_found += 1;
         self.note_dir(path, p.size_bytes);
 
@@ -164,12 +187,13 @@ impl Aggregator {
             let slot = self.by_reason.entry(reason).or_insert((0, 0));
             slot.0 += 1;
             slot.1 += p.size_bytes;
-            return;
+            return Some(reason);
         }
 
         let item = estimate::item(p, &self.cfg);
         self.total.push(p.size_bytes, item);
         self.by_kind.entry(p.class.media_kind()).or_default().push(p.size_bytes, item);
+        None
     }
 
     /// 把 walker 的统计并进来。遍历与探测是两个阶段，计数分开攒。
@@ -177,6 +201,9 @@ impl Aggregator {
         self.files_seen += stats.files_seen;
         self.errors += stats.errors;
         self.hardlinks_skipped += stats.hardlinks_skipped;
+        self.non_media += stats.non_media;
+        self.sidecars += stats.sidecars;
+        self.bundles += stats.bundles_skipped;
         self.cancelled |= stats.cancelled;
     }
 
@@ -221,12 +248,17 @@ impl Aggregator {
         skipped.sort_by(|a, b| b.files.cmp(&a.files).then_with(|| a.reason.as_str().cmp(b.reason.as_str())));
 
         ScanReport {
+            // 聚合器不认识数据库，任务 id 由 `scan::session` 扫完回填。
+            job_id: 0,
             roots: self.roots.iter().map(|p| p.display().to_string()).collect(),
             files_seen: self.files_seen,
             media_found: self.media_found,
             errors: self.errors,
             hardlinks_skipped: self.hardlinks_skipped,
             cancelled: self.cancelled,
+            non_media_files: self.non_media,
+            sidecar_files: self.sidecars,
+            bundles_skipped: self.bundles,
             planned_files: self.total.files,
             planned_bytes: self.total.src_bytes,
             out_bytes: self.total.out_bytes,
@@ -465,6 +497,9 @@ mod tests {
             bytes: 999,
             hardlinks_skipped: 2,
             errors: 7,
+            non_media: 11,
+            sidecars: 5,
+            bundles_skipped: 1,
             cancelled: true,
         });
         let r = a.finish();

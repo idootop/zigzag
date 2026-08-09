@@ -18,6 +18,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# protocol-asset：去重复核那一屏要在界面里直接显示原图，否则「相似图片」
+# 只剩一串路径，人根本没法确认（D-113 要求的人工确认就落不了地）。
+# 协议的可读范围默认是空的，只在查重开始时按本次的根目录临时放行。
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
@@ -47,11 +50,42 @@ image = { version = "0.25.10", default-features = false, features = [
 ] }
 fast_image_resize = "6.1.0"
 kamadak-exif = "0.6.1"
+# 回收站。原地模式替换原文件前先把它放进回收站（§8），macOS 下走 NSFileManager
+trash = { version = "5.2.6", default-features = false }
+# 去重用。选它不是因为「密码学安全」——这里只需要「不会撞」——而是因为它
+# 在 aarch64 上跑得比 SHA-256 快一个数量级，而去重的瓶颈就是把盘上的字节读完并算完。
+blake3 = "1.8"
+# 哈希是 CPU + IO 混合负载，`jwalk` 已经拖了 rayon 进来，直接用同一个线程池。
+rayon = "1.12"
+# 感知哈希（pHash/dHash）。实测**没有**把 `image` 的默认 features 拖回来，
+# D-52/D-60 收窄的格式清单不受影响（`cargo tree -e features -p image` 里 tiff/bmp 等仍不在）。
+image_hasher = "3.1"
+# 缩略图按 data URL 下发（见 `commands/thumb.rs`）。base64 的 33% 膨胀换掉了
+# 一整套 blob URL 的生命周期管理，而一张 96 px 缩略图本来就只有几 KB。
+base64 = "0.22"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
 objc2-core-foundation = "0.3.2"
 objc2-core-graphics = "0.3.2"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSProcessInfo", "NSString"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSProcessInfo", "NSString", "NSURL"] }
 objc2-image-io = "0.3.2"
+# 缩略图。QuickLook 是系统级缩略图服务：有自己的磁盘缓存（和访达共用一份），
+# 而且**认视频与音频**——这两类 ImageIO 根本生成不了，而队列里它们是大头。
+objc2-quick-look-thumbnailing = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "QLThumbnailGenerator",
+    "QLThumbnailGenerationRequest",
+    "QLThumbnailRepresentation",
+    "block2",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+] }
+# QuickLook 的生成接口只有异步一种，回调是 Objective-C block。
+block2 = "0.6.2"
 
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "debuginfo"

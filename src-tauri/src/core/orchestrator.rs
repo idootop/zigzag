@@ -37,7 +37,14 @@
 //! > **凡是拿墙钟在 Rust 管线之间做比较的基准，都必须 `--release`。**
 //!
 //! 这两个数字**不开放给用户调**。它们是这台机器的物理，不是口味——用户没有
-//! 办法判断该填几，填错了只会更慢。热状态与低电量下的动态收窄属于 M4。
+//! 办法判断该填几，填错了只会更慢。
+//!
+//! ## 唯一的动态收窄入口：热状态与低电量
+//!
+//! 上面两个宽度是**上限**，跑动中只会往回收，不会往上加。收的依据只有机器
+//! 状态（`NSProcessInfo` 的 `thermalState` 与低电量模式），跟队列里装的是什么
+//! 无关——D-78 删掉的正是「按任务混合比例联动」那一套。规则见
+//! [`Gates::scaled`]，机制见 [`Lane`] 与 [`watch_power`]。
 //!
 //! ## 为什么派发前就要拿许可
 //!
@@ -49,13 +56,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{mpsc, Notify, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::config::Profile;
 use crate::core::{audio, image, video};
 use crate::error::Result;
 use crate::fsops::atomic::Outcome;
+use crate::platform::power::{PowerState, Thermal};
 use crate::store::MediaKind;
 
 /// 一件待处理的文件。`dst` 的扩展名可能被管线改写（视频按字幕定容器、
@@ -77,13 +85,16 @@ pub struct Done {
     pub dst: PathBuf,
 }
 
-/// 处理过程中回流给调用方的事件。M4 的落库与 UI 事件都接在这里。
+/// 处理过程中回流给调用方的事件。落库与 UI 事件都接在这里。
 #[derive(Debug)]
 pub enum Event {
     Started { id: i64 },
     /// 0.0~1.0。图片管线不报进度（一张图零点几秒，报了也没人看得见）。
     Progress { id: i64, fraction: f64 },
     Finished { id: i64, result: Result<Done> },
+    /// 取消时已经进了通道却没派发出去的。**它必须回到队列**——认领时已经被
+    /// 标成 running，不退回就会一直卡在那儿，下次启动才被崩溃恢复捡起来。
+    Requeued { id: i64 },
 }
 
 /// 并发闸门宽度。
@@ -103,6 +114,36 @@ impl Gates {
     pub fn detect() -> Self {
         Self { video: VIDEO_GATE, light: light_gate(available_cores()) }
     }
+
+    /// 按当下的电源状况收窄。**只会变窄，不会变宽**——[`Gates::detect`] 已经是
+    /// 这台机器的上限，这里只往回收。
+    ///
+    /// | 状态 | 视频 | 轻活 | 为什么 |
+    /// |---|---|---|---|
+    /// | Nominal / Fair | 满 | 满 | Fair 只是风扇转起来了，系统还没限速。一有点热就减速，等于让任何一台笔记本上的任务全程半速 |
+    /// | Serious | 1 | 半 | 系统已经在降频，这时候继续满载只是把热量堆得更高，并不换来吞吐 |
+    /// | Critical | 1 | 1 | 只保底推进，不追吞吐 |
+    /// | 低电量模式 | 1 | 半 | 用户明说了「省着点用」。注意这**不省总电量**（基准 11：CPU 秒数几乎与并发无关），省的是峰值功率和被占满的核 |
+    pub fn scaled(self, p: PowerState) -> Self {
+        let half = |n: usize| (n / 2).max(1);
+        let mut g = self;
+        match p.thermal {
+            Thermal::Nominal | Thermal::Fair => {}
+            Thermal::Serious => {
+                g.video = 1;
+                g.light = half(self.light);
+            }
+            Thermal::Critical => {
+                g.video = 1;
+                g.light = 1;
+            }
+        }
+        if p.low_power_mode {
+            g.video = g.video.min(1);
+            g.light = g.light.min(half(self.light));
+        }
+        g
+    }
 }
 
 fn available_cores() -> usize {
@@ -112,6 +153,81 @@ fn available_cores() -> usize {
 /// 轻活闸门：留两个核给视频那条队列的解复用与进度读取，其余全开。
 fn light_gate(ncpu: usize) -> usize {
     ncpu.saturating_sub(2).max(1)
+}
+
+/// 看门狗多久看一眼电源状况。
+///
+/// 5 秒。热状态是分钟级才会动的东西（基准 14），读一次只是两条 objc 消息，
+/// 再密没有意义；再稀又会让 Critical 拖上小半分钟才生效。
+const POWER_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 一条队列的闸门，宽度可以在跑动中改。
+///
+/// tokio 的 `Semaphore` 只能加许可（`add_permits`），减是靠**拿到再 forget**。
+/// 于是收窄有个天然性质：**它等正在跑的那些自己跑完，绝不打断谁**——这正是
+/// 我们要的语义，热了就少派新的，不是把手上的活砍掉。
+struct Lane {
+    sem: Arc<Semaphore>,
+    /// 满速宽度，收窄的上界。
+    full: usize,
+    /// 已经扣掉多少许可。加回来时照这个数还。
+    removed: usize,
+}
+
+impl Lane {
+    fn new(full: usize) -> Self {
+        let full = full.max(1);
+        Self { sem: Arc::new(Semaphore::new(full)), full, removed: 0 }
+    }
+
+    /// 把宽度挪向 `target`。
+    ///
+    /// **扣不动就算了，下次再扣**：许可这会儿全在跑任务的手上是常态，
+    /// 而看门狗不能卡在这儿等——等到手时热状态可能早回落了，那一扣就成了
+    /// 对着已经消失的状况做出的反应。分几次扣完，对一个跑几小时的任务无所谓。
+    fn aim(&mut self, target: usize) {
+        let want = self.full - target.clamp(1, self.full);
+        if want > self.removed {
+            // 一个一个扣：`try_acquire_many` 是全有或全无，凑不齐整数就一个也扣不到。
+            for _ in 0..(want - self.removed) {
+                match self.sem.try_acquire() {
+                    Ok(p) => {
+                        p.forget();
+                        self.removed += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+        } else if want < self.removed {
+            self.sem.add_permits(self.removed - want);
+            self.removed = want;
+        }
+    }
+
+    /// 当前实际宽度（已扣掉的不算）。
+    fn width(&self) -> usize {
+        self.full - self.removed
+    }
+}
+
+/// 跟着电源状况调闸门的看门狗。
+///
+/// **这是全项目唯一会动态改变闸门宽度的地方。** D-78 删掉的是「视频在跑就把
+/// 图片池掐窄」那一套（实测无收益），不是这个——热与低电量是机器状态，不是
+/// 任务的混合比例。
+async fn watch_power(mut video: Lane, mut light: Lane, full: Gates) {
+    let mut last = Gates { video: video.width(), light: light.width() };
+    loop {
+        tokio::time::sleep(POWER_POLL).await;
+        let want = full.scaled(PowerState::read());
+        video.aim(want.video);
+        light.aim(want.light);
+        let now = Gates { video: video.width(), light: light.width() };
+        if now != last {
+            tracing::info!(?now, ?want, "闸门宽度已随电源状况调整");
+            last = now;
+        }
+    }
 }
 
 /// 暂停与取消。§6.3 的「停止派发」语义：**不挂起已经在跑的 ffmpeg**，
@@ -148,7 +264,11 @@ impl Control {
     }
 
     /// 暂停期间在这里等。取消同样会把它放行——之后由调用方判断该退出。
-    async fn wait_if_paused(&self) {
+    ///
+    /// 公开是因为**供给端也要跟着停**（`core::job` 的认领循环）：只让派发循环
+    /// 停下的话，认领循环会继续把条目标成 running 塞进通道，暂停期间库里就攒出
+    /// 一堆「在跑」却没人跑的条目；此时退出应用，它们要等下次崩溃恢复才回得来。
+    pub async fn wait_if_paused(&self) {
         while self.is_paused() && !self.is_cancelled() {
             // 先登记再复查：notify 发生在检查与 await 之间时不会丢唤醒。
             let waiter = self.wake.notified();
@@ -196,25 +316,63 @@ impl Summary {
     }
 }
 
-/// 跑完一批任务。
+/// 跑完一批任务。**测试与基准用**：真实任务的条目是从库里一批批认领出来的，
+/// 十万条不会同时存在于内存，走 [`run_streamed`]。
 ///
-/// `on_event` 会被多个任务并发调用，实现里别做重活——M4 会在这里批量攒进
-/// 数据库，攒的动作要自己带缓冲。
+/// `on_event` 会被多个任务并发调用，实现里别做重活——落库的那一路要自己带缓冲。
 pub async fn run<F>(tasks: Vec<Task>, cfg: &Profile, gates: Gates, ctl: Arc<Control>, on_event: F) -> Summary
+where
+    F: Fn(Event) + Send + Sync + 'static,
+{
+    // 重活轻活分两条队列，各自独立派发：混在一条里，队头连着几段视频就会把
+    // 后面的图片一起堵死（见模块文档）。
+    let (heavy, light): (Vec<_>, Vec<_>) =
+        tasks.into_iter().partition(|t| t.kind == MediaKind::Video);
+
+    // 通道要装得下整批，否则这里的 send 会在没人收的时候堵住自己。
+    let (htx, hrx) = mpsc::channel(heavy.len().max(1));
+    let (ltx, lrx) = mpsc::channel(light.len().max(1));
+    for t in heavy {
+        let _ = htx.send(t).await;
+    }
+    for t in light {
+        let _ = ltx.send(t).await;
+    }
+    drop((htx, ltx));
+    run_streamed(hrx, lrx, cfg, gates, ctl, on_event).await
+}
+
+/// 跑两条流式队列。
+///
+/// 两个 `Receiver` 而不是一个：视频与轻活的**供给端也要能各自阻塞**。合成一条
+/// 通道的话，视频那头满了会把排在后面的图片一起堵住，等于把两条闸门的隔离
+/// 又还回去了。上游（`core::job`）为此开两个认领循环，各喂各的。
+///
+/// 发送端 drop 掉即表示「没有更多任务了」，两条都收完才返回。
+pub async fn run_streamed<F>(
+    heavy: mpsc::Receiver<Task>,
+    light: mpsc::Receiver<Task>,
+    cfg: &Profile,
+    gates: Gates,
+    ctl: Arc<Control>,
+    on_event: F,
+) -> Summary
 where
     F: Fn(Event) + Send + Sync + 'static,
 {
     let on_event = Arc::new(on_event);
     let cfg = Arc::new(cfg.clone());
 
-    // 重活轻活分两条队列，各自独立派发：混在一条里，队头连着几段视频就会把
-    // 后面的图片一起堵死（见模块文档）。
-    let (heavy, light): (Vec<_>, Vec<_>) =
-        tasks.into_iter().partition(|t| t.kind == MediaKind::Video);
+    // 闸门在这儿造，两份句柄：一份给派发循环取许可，一份给看门狗调宽度。
+    let (hlane, llane) = (Lane::new(gates.video), Lane::new(gates.light));
+    let (hsem, lsem) = (hlane.sem.clone(), llane.sem.clone());
+    let watchdog = tokio::spawn(watch_power(hlane, llane, gates));
 
-    let a = queue(heavy, gates.video, cfg.clone(), ctl.clone(), on_event.clone());
-    let b = queue(light, gates.light, cfg, ctl, on_event);
+    let a = queue(heavy, hsem, cfg.clone(), ctl.clone(), on_event.clone());
+    let b = queue(light, lsem, cfg, ctl, on_event);
     let (mut sa, sb) = tokio::join!(a, b);
+    // 两条队列都收完了，看门狗没有别的退出条件——它是个无限循环。
+    watchdog.abort();
 
     sa.written += sb.written;
     sa.skipped += sb.skipped;
@@ -225,10 +383,12 @@ where
     sa
 }
 
-/// 一条队列：最多 `width` 件同时在跑，派完为止。
+/// 一条队列：同时在跑的件数受 `sem` 限制，收完为止。
+///
+/// 闸门是外面传进来的，因为看门狗（[`watch_power`]）会在跑动中改它的宽度。
 async fn queue<F>(
-    tasks: Vec<Task>,
-    width: usize,
+    mut pending: mpsc::Receiver<Task>,
+    sem: Arc<Semaphore>,
     cfg: Arc<Profile>,
     ctl: Arc<Control>,
     on_event: Arc<F>,
@@ -237,21 +397,15 @@ where
     F: Fn(Event) + Send + Sync + 'static,
 {
     let mut summary = Summary::default();
-    if tasks.is_empty() {
-        return summary;
-    }
-
-    let sem = Arc::new(Semaphore::new(width.max(1)));
     let mut running = JoinSet::new();
-    let mut pending = tasks.into_iter();
 
     loop {
         ctl.wait_if_paused().await;
         if ctl.is_cancelled() {
-            summary.cancelled += pending.count() as u64;
+            summary.cancelled += drain(&mut pending, &on_event);
             break;
         }
-        let Some(task) = pending.next() else { break };
+        let Some(task) = pending.recv().await else { break };
 
         // 先拿许可再 spawn：在飞的任务数就恒等于闸门宽度（见模块文档）。
         // 信号量只在整个调度结束时才可能被关闭，这里不会拿不到。
@@ -278,8 +432,62 @@ where
     summary
 }
 
-/// 把一件文件交给对应的管线。
+/// 取消时把通道里剩下的倒干净，逐条报 `Requeued`。
+///
+/// 先 `close()` 再 `try_recv()`：不关的话上游还在往里塞，这个循环可能永远
+/// 追不上；关了之后已经在通道里的仍然收得到，语义正是「不再接新的，但手上
+/// 这些要交代清楚」。
+fn drain<F>(rx: &mut mpsc::Receiver<Task>, on_event: &Arc<F>) -> u64
+where
+    F: Fn(Event) + Send + Sync + 'static,
+{
+    rx.close();
+    let mut n = 0;
+    while let Ok(task) = rx.try_recv() {
+        on_event(Event::Requeued { id: task.id });
+        n += 1;
+    }
+    n
+}
+
+/// 把一件文件交给对应的管线，产物没被采纳时补齐镜像树。
 async fn process<F>(task: &Task, cfg: &Profile, on_event: &Arc<F>) -> Result<Done>
+where
+    F: Fn(Event) + Send + Sync + 'static,
+{
+    let done = encode(task, cfg, on_event).await?;
+    keep_the_mirror_whole(task, &done, cfg)?;
+    Ok(done)
+}
+
+/// 压完没要产物时，镜像模式下要把原文件放进输出目录（§5.5 / D-16）。
+///
+/// 不做的话输出树会缺文件，而缺的正是「压不动的那些」——往往是已经压过的
+/// 成品。用户对着输出目录点头、回头删掉源盘，丢的就是这批。
+///
+/// 落点是产物路径换回源扩展名：`a.jpg` 没压动就放 `a.jpg`，而不是叫 `a.avif`
+/// 的一个 JPEG。产物路径此刻必定是空的（`NoGain`/`LowQuality` 都已经把临时
+/// 文件删了，目标位置从没被碰过），所以不会顶掉任何东西。
+///
+/// 原地模式什么都不用做：原文件本来就在原地。
+fn keep_the_mirror_whole(task: &Task, done: &Done, cfg: &Profile) -> Result<()> {
+    use crate::config::OutputMode;
+    if cfg.output.mode != OutputMode::Mirror {
+        return Ok(());
+    }
+    if matches!(done.outcome, Outcome::Written { .. }) {
+        return Ok(());
+    }
+    let dst = match task.src.extension() {
+        Some(ext) => done.dst.with_extension(ext),
+        None => done.dst.with_extension(""),
+    };
+    crate::fsops::preserve(&task.src, &dst)?;
+    Ok(())
+}
+
+/// 把一件文件交给对应的管线。
+async fn encode<F>(task: &Task, cfg: &Profile, on_event: &Arc<F>) -> Result<Done>
 where
     F: Fn(Event) + Send + Sync + 'static,
 {
@@ -323,17 +531,21 @@ fn flatten(r: std::result::Result<Result<Done>, tokio::task::JoinError>) -> Resu
 }
 
 /// `ZzError` 不是 `Clone`（内含 `io::Error`），而事件和汇总都要用一份结果。
-/// 事件那份只要文案，退化成字符串即可。
+///
+/// 退化成字符串可以，**但 code 必须跟着走**（[`crate::error::ZzError::cloned`]）：
+/// 落库的那一份走的正是事件这条路，code 丢了的话异常列表里所有失败都显示成
+/// `other`，用户分不清是缺工具还是盘满了。
 fn clone_result(r: &Result<Done>) -> Result<Done> {
     match r {
         Ok(d) => Ok(d.clone()),
-        Err(e) => Err(crate::error::ZzError::Other(e.to_string())),
+        Err(e) => Err(e.cloned()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
 
@@ -360,6 +572,166 @@ mod tests {
     fn the_light_gate_opens_up_on_a_bigger_machine() {
         // 基准 13：图片池 1→8 路实测加速 6.58×，核多就该开得更宽。
         assert!(light_gate(16) > light_gate(4));
+    }
+
+    fn state(thermal: Thermal, low_power_mode: bool) -> PowerState {
+        PowerState { thermal, low_power_mode }
+    }
+
+    #[test]
+    fn a_warm_machine_is_not_a_throttled_one() {
+        // Fair 只表示风扇转起来了，系统还没限速。在这一档就减速，等于让任何
+        // 一台笔记本上的任务全程半速——而热状态在插电的 M1 Max 上满载五分钟
+        // 都停在 Nominal（基准 14），能到 Fair 的机器本来就散热吃紧。
+        let full = Gates { video: 2, light: 8 };
+        assert_eq!(full.scaled(state(Thermal::Nominal, false)), full);
+        assert_eq!(full.scaled(state(Thermal::Fair, false)), full);
+    }
+
+    #[test]
+    fn heat_and_low_power_only_ever_narrow_the_gates() {
+        let full = Gates { video: 2, light: 8 };
+        for thermal in [Thermal::Nominal, Thermal::Fair, Thermal::Serious, Thermal::Critical] {
+            for low in [false, true] {
+                let g = full.scaled(state(thermal, low));
+                assert!(g.video <= full.video && g.light <= full.light, "{thermal:?}/{low} 把闸门开宽了");
+                assert!(g.video >= 1 && g.light >= 1, "{thermal:?}/{low} 算出了宽度 0，队列会静默挂死");
+            }
+        }
+    }
+
+    #[test]
+    fn the_hotter_it_gets_the_narrower_it_goes() {
+        let full = Gates { video: 2, light: 8 };
+        let serious = full.scaled(state(Thermal::Serious, false));
+        let critical = full.scaled(state(Thermal::Critical, false));
+        assert_eq!(serious, Gates { video: 1, light: 4 });
+        assert_eq!(critical, Gates { video: 1, light: 1 });
+    }
+
+    #[test]
+    fn low_power_mode_narrows_without_touching_the_encoder() {
+        // 任务清单原文是「低电量自动切硬编」。基准 9 否掉了它：硬编等画质体积是
+        // 软编的 1.84~3.43×，两组 720p 素材反而膨胀到 122.9% / 127.2%，过不了
+        // D-75 的 80% 闸门——那些视频会**整件被丢掉，一点没压**。电池状态是一时的，
+        // 归档是永久的，不能拿后者换前者。改成走同一套收窄（D-100）。
+        let full = Gates { video: 2, light: 8 };
+        assert_eq!(full.scaled(state(Thermal::Nominal, true)), Gates { video: 1, light: 4 });
+    }
+
+    #[test]
+    fn a_two_core_machine_still_makes_progress_when_it_is_hot() {
+        // light 已经是 1 时再取一半仍是 1。这里取 0 就是静默挂死。
+        let tiny = Gates { video: 1, light: 1 };
+        for thermal in [Thermal::Serious, Thermal::Critical] {
+            assert_eq!(tiny.scaled(state(thermal, true)), tiny);
+        }
+    }
+
+    #[tokio::test]
+    async fn narrowing_a_lane_waits_for_the_running_work_instead_of_interrupting_it() {
+        // 收窄是「拿到许可再 forget」，所以正在跑的那些不受影响——热了就少派新的，
+        // 不是把手上的活砍掉。这条测的正是这个：许可被占着时扣不动。
+        let mut lane = Lane::new(4);
+        let held: Vec<_> = (0..3).map(|_| lane.sem.clone().try_acquire_owned().unwrap()).collect();
+
+        lane.aim(1); // 想扣 3 个，但只有 1 个是空的
+        assert_eq!(lane.width(), 3, "不该抢走正在跑的任务的许可");
+
+        drop(held); // 任务陆续跑完
+        lane.aim(1);
+        assert_eq!(lane.width(), 1, "空出来之后要补扣上");
+    }
+
+    #[tokio::test]
+    async fn a_lane_goes_back_to_full_width_when_the_machine_cools_off() {
+        let mut lane = Lane::new(8);
+        lane.aim(2);
+        assert_eq!(lane.width(), 2);
+        assert_eq!(lane.sem.available_permits(), 2);
+
+        lane.aim(8);
+        assert_eq!(lane.width(), 8);
+        assert_eq!(lane.sem.available_permits(), 8, "还回来的许可数必须和扣掉的一致");
+    }
+
+    #[tokio::test]
+    async fn a_lane_never_hands_back_more_than_it_took() {
+        // aim 被反复调用是常态（看门狗每 5 秒一次）。多还一次就等于凭空放宽闸门。
+        let mut lane = Lane::new(4);
+        for target in [1, 1, 1, 4, 4, 9, 0, 4] {
+            lane.aim(target);
+        }
+        assert_eq!(lane.width(), 4);
+        assert_eq!(lane.sem.available_permits(), 4);
+    }
+
+    /// 造一份「压了但没要」的结果，落点在 `dir` 里。
+    fn no_gain(dir: &Path, src: &Path, dst_name: &str) -> (Task, Done) {
+        let dst = dir.join(dst_name);
+        let t = Task { id: 1, src: src.to_path_buf(), dst: dst.clone(), kind: MediaKind::Image };
+        (t, Done { src_size: 3, outcome: Outcome::NoGain { dst_size: 9 }, dst })
+    }
+
+    fn mirror() -> Profile {
+        Profile::default()
+    }
+
+    fn in_place() -> Profile {
+        let mut p = Profile::default();
+        p.output.mode = crate::config::OutputMode::InPlace;
+        p
+    }
+
+    #[test]
+    fn a_file_that_would_not_compress_still_shows_up_in_the_mirror() {
+        // §5.5 / D-16：输出树缺文件是数据安全问题，不是显示问题——用户照着
+        // 输出目录点头、回头删源盘，丢的正是「压不动的那些」。
+        let dir = std::env::temp_dir().join("zigzag-orch-mirror");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("原图.jpg");
+        std::fs::write(&src, "abc").unwrap();
+
+        let (t, d) = no_gain(&dir, &src, "out.avif");
+        keep_the_mirror_whole(&t, &d, &mirror()).unwrap();
+
+        let kept = dir.join("out.jpg");
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "abc", "原文件要原样出现在输出树里");
+        assert!(!d.dst.exists(), "产物已经被丢弃，不该凭空出现一个 .avif");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_written_product_needs_no_backup_copy() {
+        let dir = std::env::temp_dir().join("zigzag-orch-mirror-written");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("原图.jpg");
+        std::fs::write(&src, "abc").unwrap();
+
+        let (t, mut d) = no_gain(&dir, &src, "out.avif");
+        d.outcome = Outcome::Written { size: 1 };
+        keep_the_mirror_whole(&t, &d, &mirror()).unwrap();
+
+        assert!(!dir.join("out.jpg").exists(), "压成功了还留一份原文件，等于白压");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn in_place_mode_has_nothing_to_mirror() {
+        // 原文件本来就在原地，再放一份就是凭空多出来的垃圾。
+        let dir = std::env::temp_dir().join("zigzag-orch-mirror-inplace");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("原图.jpg");
+        std::fs::write(&src, "abc").unwrap();
+
+        let (t, d) = no_gain(&dir, &src, "out.avif");
+        keep_the_mirror_whole(&t, &d, &in_place()).unwrap();
+
+        assert!(!dir.join("out.jpg").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -403,6 +775,58 @@ mod tests {
 
         assert!(summary.cancelled > 0, "取消之后没有任何任务被拦下");
         assert_eq!(summary.failed + summary.cancelled, 200, "有任务既没跑也没被记为取消");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_cancelled_task_is_named_not_just_counted() {
+        // 被取消的那些在库里还挂着 running。只给一个总数，上游没法把它们退回
+        // 队列，只能等下次启动的崩溃恢复来捡——用户点一下取消就白跑一批。
+        let tasks: Vec<_> =
+            (1..=200).map(|i| task(i, MediaKind::Image, "/nonexistent/x.jpg")).collect();
+        let ctl = Arc::new(Control::default());
+        let c = ctl.clone();
+        let requeued = Arc::new(Mutex::new(Vec::new()));
+        let r = requeued.clone();
+
+        let summary = run(tasks, &Profile::default(), Gates { video: 1, light: 1 }, ctl, move |e| match e {
+            Event::Finished { .. } => c.cancel(),
+            Event::Requeued { id } => r.lock().unwrap().push(id),
+            _ => {}
+        })
+        .await;
+
+        assert_eq!(requeued.lock().unwrap().len() as u64, summary.cancelled);
+        assert!(summary.cancelled > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_streamed_queue_starts_before_the_source_is_done() {
+        // 流式供给的意义：十万条不必先攒进内存。这里钉的是「边送边跑」——
+        // 发送端还没 drop，队列就已经在处理了。
+        let (htx, hrx) = mpsc::channel(4);
+        let (ltx, lrx) = mpsc::channel(4);
+        drop(htx);
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let s = started.clone();
+        let job = tokio::spawn(async move {
+            run_streamed(hrx, lrx, &Profile::default(), Gates { video: 1, light: 2 }, Arc::default(), move |e| {
+                if let Event::Finished { .. } = e {
+                    s.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .await
+        });
+
+        for i in 1..=10 {
+            ltx.send(task(i, MediaKind::Image, "/nonexistent/x.jpg")).await.unwrap();
+        }
+        // 还没 drop 发送端，但前面几件必然已经跑完了（都是必失败的路径，很快）。
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(started.load(Ordering::SeqCst) > 0, "供给端还开着就该已经在干活了");
+
+        drop(ltx);
+        assert_eq!(job.await.unwrap().failed, 10);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

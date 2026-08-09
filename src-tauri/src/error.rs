@@ -28,6 +28,23 @@ pub enum ZzError {
     #[error("配置无效: {0}")]
     BadConfig(String),
 
+    /// 开跑前的空间预检没过（§8）。
+    ///
+    /// 单独一个变体而不是塞进 `Other`：这是唯一一个「用户改一下就能继续」的
+    /// 启动失败，前端要能认出来并给出下一步（换个输出盘 / 腾空间），
+    /// 而不是弹一句红字了事。
+    #[error("{target} 空间不足：预计需要 {required}，当前可用 {available}")]
+    NotEnoughSpace { target: String, required: String, available: String },
+
+    /// 跨线程复制过的错误。
+    ///
+    /// `ZzError` 内含 `io::Error`，不是 `Clone`；而一个结果常常要分两份用
+    /// （一份进事件回调、一份进汇总）。退化成字符串是可以的，**但 code 必须
+    /// 跟着走**——否则异常列表里所有失败都会显示成 `other`，用户看不出是缺工具
+    /// 还是盘满了。见 [`crate::core::orchestrator`] 里的 `clone_result`。
+    #[error("{message}")]
+    Cloned { code: &'static str, message: String },
+
     #[error("{0}")]
     Other(String),
 }
@@ -42,8 +59,15 @@ impl ZzError {
             ZzError::ToolNotFound(_) => "tool_not_found",
             ZzError::ToolFailed { .. } => "tool_failed",
             ZzError::BadConfig(_) => "bad_config",
+            ZzError::NotEnoughSpace { .. } => "no_space",
+            ZzError::Cloned { code, .. } => code,
             ZzError::Other(_) => "other",
         }
+    }
+
+    /// 复制一份，保住 code。见 [`ZzError::Cloned`]。
+    pub fn cloned(&self) -> Self {
+        ZzError::Cloned { code: self.code(), message: self.to_string() }
     }
 }
 
@@ -92,6 +116,16 @@ mod tests {
         for (e, expected) in samples {
             assert_eq!(e.code(), expected);
         }
+    }
+
+    #[test]
+    fn a_cloned_error_keeps_its_original_code() {
+        // 复制丢掉 code 的话，异常列表里所有失败都会挤成同一类。
+        let e = ZzError::ToolFailed { tool: "ffmpeg", code: 1, stderr: "盘满".into() };
+        let c = e.cloned();
+        assert_eq!(c.code(), "tool_failed");
+        assert_eq!(c.to_string(), e.to_string());
+        assert_eq!(c.cloned().code(), "tool_failed", "复制两次也不能退化");
     }
 
     #[test]

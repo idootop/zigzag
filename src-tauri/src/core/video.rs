@@ -77,7 +77,8 @@ where
     let encoder = Encoder::for_lane(cfg.video.lane);
     let (width, height) = enc::target_size(&source, cfg);
 
-    let staged = Staged::new(&dst)?.inherit_times_from(src);
+    // 原地模式下原文件在提交那一刻进回收站（§8）；镜像模式下这一行是空操作。
+    let staged = Staged::new(&dst)?.inherit_times_from(src).replaces(src, cfg);
     let args = enc::args(src, staged.path(), &source, cfg, encoder, container);
     let total = source.duration_us;
     ffmpeg::run_with_progress(&args, |p: &Progress| {

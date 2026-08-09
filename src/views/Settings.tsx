@@ -14,7 +14,7 @@ import { Button } from "@/components/ui/button";
 import { ipc, type Profile } from "@/lib/ipc";
 import { useApp } from "@/store/app";
 
-import { NumberRow, Section, SelectRow, SwitchRow } from "./parts/Field";
+import { NumberRow, Section, SelectRow, SwitchRow, TextRow } from "./parts/Field";
 
 /** 短边上限的档位。0 放在最前面表示「不缩放」。 */
 const EDGE_STEPS = [0, 720, 1080, 1440, 2160, 4320];
@@ -231,6 +231,10 @@ export function Settings() {
             ]}
             onChange={(mode) => set("output", { mode })}
           />
+          <NameTemplateRow
+            value={profile.output.name_template}
+            onChange={(name_template) => set("output", { name_template })}
+          />
           <SwitchRow
             label="无收益时保留原文件"
             hint="压完反而变大或几乎没省的，直接保留原件"
@@ -273,6 +277,77 @@ export function Settings() {
         </Section>
       </div>
     </div>
+  );
+}
+
+/**
+ * 命名模板：输入框 + 后端试渲染出的样例。
+ *
+ * 这一格与别处不同——**只在模板合法时才保存**。这里的保存同样是即时的，
+ * 而后端拿到非法模板会把它打回默认值；敲到一半的 `{name}_` 一旦落库，
+ * 用户手还在键盘上，输入框里的字已经被换成 `{name}.{ext}` 了。
+ */
+function NameTemplateRow({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  const [text, setText] = useState(value);
+  const [sample, setSample] = useState("");
+  const [error, setError] = useState("");
+
+  // 预设切换、「恢复默认」这些外部改动要能盖回输入框。
+  useEffect(() => setText(value), [value]);
+
+  useEffect(() => {
+    let stale = false;
+    ipc.previewName(text).then(
+      (s) => {
+        if (stale) return;
+        setSample(s);
+        setError("");
+        if (text !== value) onChange(text);
+      },
+      (e) => {
+        if (stale) return;
+        setSample("");
+        setError(String(e));
+      },
+    );
+    return () => {
+      stale = true;
+    };
+    // 只跟着输入走：把 value/onChange 也列进来，保存后的回读会再触发一轮。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [text]);
+
+  return (
+    <TextRow
+      label="产物文件名"
+      hint={
+        error ? (
+          <span className="text-destructive">{error}</span>
+        ) : (
+          <>
+            可用 <span className="font-mono">{"{name}"}</span>、
+            <span className="font-mono">{"{srcext}"}</span>，须以{" "}
+            <span className="font-mono">{".{ext}"}</span> 结尾。目录层级不受模板影响
+            {sample && (
+              <>
+                {" · "}
+                <span className="font-mono">IMG_0001.HEIC → {sample}</span>
+              </>
+            )}
+          </>
+        )
+      }
+      value={text}
+      placeholder="{name}.{ext}"
+      invalid={!!error}
+      onChange={setText}
+    />
   );
 }
 

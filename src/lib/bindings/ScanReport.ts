@@ -7,7 +7,11 @@ import type { SkipGroup } from "./SkipGroup";
 /**
  * 扫描报告。
  */
-export type ScanReport = { roots: Array<string>, 
+export type ScanReport = { 
+/**
+ * 这次扫描落下的任务 id。处理计划已经写进库了，按「开始」就是跑它。
+ */
+job_id: number, roots: Array<string>, 
 /**
  * 遍历到的普通文件总数（含非媒体）。
  */
@@ -20,6 +24,23 @@ media_found: number,
  * 读目录 / 读属性失败的次数。数值大通常意味着权限不足（R16）。
  */
 errors: number, hardlinks_skipped: number, cancelled: boolean, 
+/**
+ * 下面三个数只在**镜像模式**下有意义：它们是源目录里有、而输出目录里
+ * 不会有的东西（ADR-021 §13）。界面据此告诉用户「输出目录不是源目录的
+ * 完整副本」——不说清楚，用户对着输出目录点头再删源盘，丢的就是这些。
+ *
+ * 扩展名不认识的普通文件：文档、压缩包、工程文件。
+ */
+non_media_files: number, 
+/**
+ * 边车文件：`.xmp` / `.aae` 这类紧挨着照片的编辑记录。最要紧的一类——
+ * 它们依附于被压缩的那些照片，丢了就是丢了人家的调色参数。
+ */
+sidecar_files: number, 
+/**
+ * 整个跳过的包目录：`.photoslibrary` / `.fcpbundle` / `.app`。
+ */
+bundles_skipped: number, 
 /**
  * 将要处理的文件数与源字节。**不含跳过项**。
  */

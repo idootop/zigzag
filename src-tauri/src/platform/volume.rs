@@ -96,6 +96,23 @@ pub fn probe(path: &Path) -> Volume {
     Volume { mount_point, fs_type, medium, read_only, removable: info.removable.unwrap_or(false) }
 }
 
+/// 该路径所在卷的剩余可用字节。路径不存在或不可 stat 时返回 `None`。
+///
+/// 独立成一个函数而不是挂进 [`Volume`]：卷的介质和文件系统探一次能用很久，
+/// 剩余空间却时刻在变，塞进结构体只会让调用方拿到过期的数字还以为是新的。
+///
+/// 用 `f_bavail` 而不是 `f_bfree`：后者含只有 root 能动的预留块，我们不是 root，
+/// 那部分算进来就会高估，而高估正是这个函数最不该犯的错。
+pub fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut buf) } != 0 {
+        return None;
+    }
+    Some(buf.f_bavail * buf.f_bsize as u64)
+}
+
 /// 返回 (挂载点, 文件系统类型, 是否只读, 是否本地卷)。
 fn statfs(path: &Path) -> Option<(PathBuf, String, bool, bool)> {
     use std::os::unix::ffi::OsStrExt;
@@ -234,5 +251,35 @@ mod tests {
     fn missing_path_does_not_panic() {
         let v = probe(Path::new("/nonexistent-zigzag-volume"));
         assert_eq!(v.medium, Medium::Unknown);
+    }
+
+    #[test]
+    fn reads_real_free_space_and_agrees_with_df() {
+        let got = free_bytes(Path::new("/")).expect("根卷一定 stat 得到");
+        assert!(got > 0, "根卷剩余空间不可能是 0");
+
+        // 和 df 对一遍，防止 f_bavail × f_bsize 的单位搞错——这个错误不会
+        // 让任何测试变红，只会让预检的门槛差上几个数量级。
+        let out = std::process::Command::new("df").args(["-k", "/"]).output().unwrap();
+        let df_kb: u64 = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .nth(3)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let df = df_kb * 1024;
+        // 两次读之间盘还在动，给 1% 的容差。
+        let diff = got.abs_diff(df);
+        assert!(diff * 100 < df.max(1), "free_bytes={got} 与 df={df} 差得太多，单位多半错了");
+    }
+
+    #[test]
+    fn free_space_of_a_missing_path_is_none_not_zero() {
+        // 返回 0 会被预检读成「盘满了」，从而挡下一个本来能跑的任务。
+        // 「不知道」必须和「没有」区分开。
+        assert_eq!(free_bytes(Path::new("/nonexistent-zigzag-volume")), None);
     }
 }

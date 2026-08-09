@@ -16,7 +16,7 @@ import {
   type ToolStatus,
 } from "@/lib/ipc";
 
-export type View = "home" | "queue" | "settings";
+export type View = "home" | "queue" | "dedup" | "settings";
 
 interface AppState {
   view: View;

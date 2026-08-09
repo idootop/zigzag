@@ -3,8 +3,10 @@
 pub mod clonefile;
 pub mod imageio;
 pub mod power;
+pub mod quicklook;
 pub mod tcc;
+pub mod trash;
 pub mod volume;
 
 pub use tcc::{Access, RootAccess};
-pub use volume::{probe as probe_volume, Medium, Volume};
+pub use volume::{free_bytes, probe as probe_volume, Medium, Volume};

@@ -66,7 +66,8 @@ pub struct Report {
 /// 是否改为原样拷贝一份由调用方按输出模式决定——那是目录结构的事，不是压缩的事。
 pub fn compress(src: &Path, dst: &Path, cfg: &Profile) -> Result<Report> {
     let src_size = std::fs::metadata(src)?.len();
-    let staged = Staged::new(dst)?.inherit_times_from(src);
+    // 原地模式下原文件在提交那一刻进回收站（§8）；镜像模式下这一行是空操作。
+    let staged = Staged::new(dst)?.inherit_times_from(src).replaces(src, cfg);
 
     let (width, height, route) = if is_animated(src) {
         let (w, h) = animate(src, staged.path(), cfg)?;

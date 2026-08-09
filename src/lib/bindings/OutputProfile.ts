@@ -27,4 +27,11 @@ min_file_kb: number,
  * 处理 RAW。默认关——转码 RAW 等于不可逆地销毁底片（R5），
  * 这是排除清单里唯一「开了就可能毁数据」的一项，所以单独给开关而不是藏起来。
  */
-include_raw: boolean, };
+include_raw: boolean, 
+/**
+ * 产物文件名模板，见 [`crate::fsops::naming`]。默认 `{name}.{ext}`。
+ *
+ * 只管文件名，管不到目录——目录由镜像规则定死。非法模板在 [`Profile::sanitized`]
+ * 里回落默认值，不会让任务跑不起来。
+ */
+name_template: string, };

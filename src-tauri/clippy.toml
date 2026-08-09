@@ -1,0 +1,12 @@
+# 删除一律走 crate::platform::trash::to_trash。
+#
+# trash crate 在 macOS 上默认用 Finder（osascript + AppleScript），代价是：每删一个
+# 文件起一个子进程、要「自动化」权限（第一次弹「zigzag 想要控制"访达"」，拒绝后
+# 整条删除路径永久失效）、还有声音。platform 那层包装显式换成了 NsFileManager。
+#
+# 这条规则是因为查重那条路曾经绕开包装直接调 `trash::delete`，在发布前验收基准
+# （基准 22）里才被那个授权弹窗撞出来。理由详见 platform/trash.rs 的模块文档。
+disallowed-methods = [
+    { path = "trash::delete", reason = "会走 Finder 并触发自动化授权，改用 crate::platform::trash::to_trash" },
+    { path = "trash::delete_all", reason = "同上，改用 crate::platform::trash::to_trash" },
+]

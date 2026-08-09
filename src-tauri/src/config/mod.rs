@@ -242,6 +242,11 @@ pub struct OutputProfile {
     /// 处理 RAW。默认关——转码 RAW 等于不可逆地销毁底片（R5），
     /// 这是排除清单里唯一「开了就可能毁数据」的一项，所以单独给开关而不是藏起来。
     pub include_raw: bool,
+    /// 产物文件名模板，见 [`crate::fsops::naming`]。默认 `{name}.{ext}`。
+    ///
+    /// 只管文件名，管不到目录——目录由镜像规则定死。非法模板在 [`Profile::sanitized`]
+    /// 里回落默认值，不会让任务跑不起来。
+    pub name_template: String,
 }
 
 impl Default for OutputProfile {
@@ -252,6 +257,7 @@ impl Default for OutputProfile {
             min_gain_percent: 20,
             min_file_kb: 100,
             include_raw: false,
+            name_template: crate::fsops::naming::DEFAULT.into(),
         }
     }
 }
@@ -310,6 +316,17 @@ impl Profile {
         clamp_u8("video.hw_quality", &mut self.video.hw_quality, 1, 100);
         clamp_u8("video.vmaf_min", &mut self.video.vmaf_min, 0, 100);
         clamp_u8("output.min_gain_percent", &mut self.output.min_gain_percent, 0, 99);
+
+        // 模板没有「钳到区间」这回事，只能整条退回默认值。带上原因——用户改坏的
+        // 是一行自己写的文本，不告诉他哪里错了就只能瞎试。
+        if let Err(why) = crate::fsops::naming::validate(&self.output.name_template) {
+            fixes.push(format!(
+                "output.name_template: {} → {}（{why}）",
+                self.output.name_template,
+                crate::fsops::naming::DEFAULT
+            ));
+            self.output.name_template = crate::fsops::naming::DEFAULT.into();
+        }
 
         (self, fixes)
     }

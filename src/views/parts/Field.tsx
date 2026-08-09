@@ -107,6 +107,46 @@ export function SwitchRow({
   );
 }
 
+/**
+ * 单行文本输入。
+ *
+ * `invalid` 只染红边框，不弹任何东西——这一行的错误说明写在 `hint` 里，
+ * 一处说清楚就够，两处会打架。
+ */
+export function TextRow({
+  label,
+  hint,
+  value,
+  placeholder,
+  invalid,
+  onChange,
+}: {
+  label: string;
+  hint?: ReactNode;
+  value: string;
+  placeholder?: string;
+  invalid?: boolean;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <Row label={label} hint={hint}>
+      <input
+        className={`w-56 rounded-md border bg-background px-2 py-1 font-mono text-xs outline-none focus-visible:ring-[3px] ${
+          invalid
+            ? "border-destructive ring-destructive/20"
+            : "border-input focus-visible:border-ring focus-visible:ring-ring/50"
+        }`}
+        value={value}
+        placeholder={placeholder}
+        spellCheck={false}
+        autoComplete="off"
+        autoCapitalize="off"
+        onChange={(e) => onChange(e.target.value)}
+      />
+    </Row>
+  );
+}
+
 export function SelectRow<T extends string>({
   label,
   hint,

@@ -6,4 +6,4 @@
  * 全项目共用一份：`as_str()` 会直接写进 `items.skip_reason`，是稳定标识符，
  * 改动等于改数据格式；`message()` 是给人看的，可以随便改。
  */
-export type SkipReason = "disabled" | "raw" | "too_small" | "already_optimal" | "hdr" | "too_large" | "no_gain";
+export type SkipReason = "disabled" | "raw" | "too_small" | "already_optimal" | "hdr" | "too_large" | "no_gain" | "low_quality" | "src_changed" | "src_missing";

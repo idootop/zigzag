@@ -8,6 +8,7 @@ use crate::error::Result;
 use crate::platform::clonefile;
 
 pub mod atomic;
+pub mod naming;
 
 /// 把不处理的原文件放到输出目录，保持镜像树完整（§8 / D-16）。
 ///

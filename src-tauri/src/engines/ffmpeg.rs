@@ -195,6 +195,32 @@ pub fn verify_decodable(path: &Path) -> Result<()> {
     run_sync(&[t("-xerror"), t("-i"), path.to_string_lossy().into_owned(), t("-f"), t("null"), t("-")])
 }
 
+/// 跑一次 ffmpeg，把 stdout 收回来。
+///
+/// 给「产物是一小段字节、不需要落盘」的活儿用——目前只有对比界面的那一帧截图
+/// （见 [`crate::core::compare`]）。走管道而不是临时文件：一张 1600 px 的 JPEG
+/// 也就一百来 KB，为它在磁盘上建一个还要记得删的文件不划算。
+pub async fn run_capture(args: &[String]) -> Result<Vec<u8>> {
+    let exe = ffmpeg_path()?;
+    let out = Command::new(exe)
+        .arg("-nostdin")
+        .arg("-hide_banner")
+        .args(["-loglevel", "error"])
+        .args(args)
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Err(ZzError::ToolFailed {
+            tool: "ffmpeg",
+            code: out.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        });
+    }
+    Ok(out.stdout)
+}
+
 /// 跑 ffprobe 拿 JSON。
 pub async fn probe(path: &Path) -> Result<serde_json::Value> {
     let exe = ffprobe_path()?;

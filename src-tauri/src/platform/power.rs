@@ -1,4 +1,5 @@
-//! 阻止系统在长任务期间休眠。
+//! 电源相关的系统状态：阻止休眠（[`PowerGuard`]）、读热状态与低电量模式
+//! （[`PowerState`]）。
 //!
 //! 归档压缩动辄跑一整夜，机器一睡任务就断（R15）。macOS 的正规做法是
 //! `NSProcessInfo -beginActivityWithOptions:reason:`，比 `caffeinate` 子进程
@@ -51,11 +52,65 @@ impl Drop for PowerGuard {
     }
 }
 
+/// 系统热状态，对应 `NSProcessInfoThermalState`。
+///
+/// 判序有意义（`Nominal < Fair < Serious < Critical`），闸门收窄靠它比大小。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum Thermal {
+    /// 一切正常。
+    #[default]
+    Nominal,
+    /// 温度略高，风扇已经在转。系统还没开始限速。
+    Fair,
+    /// 系统已在降频。**这一档才值得动手**。
+    Serious,
+    /// 系统正在激进降频，只保留必要工作。
+    Critical,
+}
+
+/// 当下的电源状况。取一次是一个快照，[`PowerState::read`] 很便宜（两次 objc 消息）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PowerState {
+    pub thermal: Thermal,
+    /// 用户开了「低电量模式」。**不等于电量低**——这是用户明确表达的「省着点用」。
+    pub low_power_mode: bool,
+}
+
+impl PowerState {
+    pub fn read() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            mac::state()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self::default()
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod mac {
     use objc2::rc::Retained;
     use objc2::runtime::{NSObjectProtocol, ProtocolObject};
-    use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+    use objc2_foundation::{
+        NSActivityOptions, NSProcessInfo, NSProcessInfoThermalState, NSString,
+    };
+
+    use super::{PowerState, Thermal};
+
+    pub fn state() -> PowerState {
+        let info = NSProcessInfo::processInfo();
+        let thermal = match info.thermalState() {
+            NSProcessInfoThermalState::Fair => Thermal::Fair,
+            NSProcessInfoThermalState::Serious => Thermal::Serious,
+            NSProcessInfoThermalState::Critical => Thermal::Critical,
+            // Nominal，以及将来可能新增的取值。往「正常」兜底是安全的一侧：
+            // 认不出的状态不该让工具擅自把自己掐窄。
+            _ => Thermal::Nominal,
+        };
+        PowerState { thermal, low_power_mode: info.isLowPowerModeEnabled() }
+    }
 
     /// `beginActivity` 返回的凭据，`endActivity` 时原样交回。
     ///
@@ -104,6 +159,26 @@ mod tests {
         drop(a); // 先放外层，B 仍应有效
         assert_eq!(b.is_active(), cfg!(target_os = "macos"));
         drop(b);
+    }
+
+    #[test]
+    fn reading_power_state_does_not_crash_and_is_cheap() {
+        // 看门狗每 5 秒调一次，读一次只是两条 objc 消息。这里顺带钉住
+        // 「随时可读、不会 panic」——它跑在任务的热路径旁边。
+        let a = PowerState::read();
+        let b = PowerState::read();
+        assert_eq!(a.thermal, b.thermal, "两次读之间热状态不该跳变");
+        // 基准 14：M1 Max 插电满载 5 分钟也停在 Nominal，见 ADR-018 §2。
+        assert!(a.thermal <= Thermal::Critical);
+    }
+
+    #[test]
+    fn thermal_states_are_ordered_from_calm_to_hot() {
+        // 闸门收窄靠比大小（`>= Serious`），顺序反了就变成越凉越慢。
+        assert!(Thermal::Nominal < Thermal::Fair);
+        assert!(Thermal::Fair < Thermal::Serious);
+        assert!(Thermal::Serious < Thermal::Critical);
+        assert_eq!(Thermal::default(), Thermal::Nominal);
     }
 
     #[test]

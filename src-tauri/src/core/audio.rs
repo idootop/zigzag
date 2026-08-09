@@ -66,7 +66,9 @@ where
     // 之后能预览，不在省空间。拿闸门量它，这条路永远落不了地。
     let staged = Staged::new(&dst)?
         .inherit_times_from(src)
-        .gain_gate(route == Route::Encode);
+        .gain_gate(route == Route::Encode)
+        // 原地模式下原文件在提交那一刻进回收站（§8）；镜像模式下是空操作。
+        .replaces(src, cfg);
     let args = enc::args(src, staged.path(), &source, cfg, route);
     let total = source.duration_us;
     ffmpeg::run_with_progress(&args, |p: &Progress| {

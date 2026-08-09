@@ -12,12 +12,16 @@
  * 4. **什么没动，为什么？** —— 跳过项按原因分组单独列，绝不悄悄混进总数里。
  *    「1,204 个文件已是最优」比一个虚高的总数有用得多。
  */
+import { useState } from "react";
+import { open } from "@tauri-apps/plugin-dialog";
 import { ArrowLeft, FileQuestion, Film, Image, Music, Zap } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { cn, formatBytes, formatCount, formatEta, formatEtaShort, formatSaving } from "@/lib/utils";
 import type { KindGroup, MediaKind, Range, ScanReport } from "@/lib/ipc";
+import { useApp } from "@/store/app";
+import { useJob } from "@/store/job";
 import { useScan } from "@/store/scan";
 
 const KIND_META: Record<MediaKind, { label: string; icon: typeof Image }> = {
@@ -28,6 +32,7 @@ const KIND_META: Record<MediaKind, { label: string; icon: typeof Image }> = {
 
 export function Report({ report }: { report: ScanReport }) {
   const reset = useScan((s) => s.reset);
+  const mirror = useApp((s) => s.profile?.output.mode) === "mirror";
   const nothingToDo = report.planned_files === 0;
 
   return (
@@ -38,10 +43,7 @@ export function Report({ report }: { report: ScanReport }) {
           重新选择
         </Button>
         <div className="flex-1" />
-        {/* 压缩执行是 M2。摆个禁用的按钮把流程说清楚，但不画能点的假入口。 */}
-        <Button size="sm" disabled title="压缩执行将在下一步接入">
-          开始压缩
-        </Button>
+        <StartButton report={report} />
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
@@ -79,9 +81,60 @@ export function Report({ report }: { report: ScanReport }) {
             </Section>
           )}
 
+          {mirror && <Uncopied report={report} />}
+
           <Footnotes report={report} />
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * 「开始压缩」。
+ *
+ * 镜像模式要先选输出目录：**它是在这一步问、而不是在设置里问**——设置里选的
+ * 目录会一直留着，下次换一块盘时很容易忘了改，结果两块盘的产物混进同一棵树。
+ * 目录选完就记进库，跨应用重启续跑时不会再问第二遍。
+ */
+function StartButton({ report }: { report: ScanReport }) {
+  const profile = useApp((s) => s.profile);
+  const setView = useApp((s) => s.setView);
+  const start = useJob((s) => s.start);
+  const error = useJob((s) => s.error);
+  const [busy, setBusy] = useState(false);
+
+  const mirror = profile?.output.mode === "mirror";
+
+  async function go() {
+    setBusy(true);
+    try {
+      let out: string | null = null;
+      if (mirror) {
+        const picked = await open({ directory: true, multiple: false, title: "选择输出目录" });
+        // 用户在选目录时点了取消，那就是取消整件事，不要退回原地模式偷偷动他的文件。
+        if (!picked) return;
+        out = picked;
+      }
+      // 没跑起来就留在这一屏。空间预检不过（§8）是最常见的一种，
+      // 而修它的动作——换个输出目录——恰好就是这个按钮，跳走反而离得更远。
+      if (await start(report.job_id, out)) setView("queue");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="flex items-center gap-3">
+      {error && (
+        <span className="max-w-md text-right text-xs leading-snug text-destructive">
+          {error.message}
+          {error.code === "no_space" && "。可以换一块空间更充裕的盘，或先腾出空间再试。"}
+        </span>
+      )}
+      <Button size="sm" disabled={busy || report.planned_files === 0} onClick={() => void go()}>
+        {mirror ? "选择输出目录并开始" : "开始压缩"}
+      </Button>
     </div>
   );
 }
@@ -306,6 +359,47 @@ function Skipped({ report }: { report: ScanReport }) {
         </div>
       ))}
     </div>
+  );
+}
+
+/**
+ * 「不会进输出目录」——只在镜像模式下出现（ADR-021 §13）。
+ *
+ * 紧挨着「不处理」放，是因为这两件事**长得像、后果相反**：不处理的媒体文件
+ * 会被原样克隆进输出树（D-101），输出目录仍是它们的完整副本；而这里列的东西
+ * 压根不会被复制。用户拿输出目录替换源目录时，丢的就是这一栏。
+ *
+ * 三类分开报而不是合成一个数：`.DS_Store` 之类的系统垃圾根本没进这个统计
+ * （少一个没人在意），而边车文件依附于被压缩的那些照片、包目录动辄几十 GB，
+ * 两者的分量完全不同。一个数都没有时整块不显示——源目录里本来就只有媒体文件
+ * 的话，输出目录确实是它的完整副本，此时再提醒一句只是噪音。
+ */
+function Uncopied({ report }: { report: ScanReport }) {
+  const rows = [
+    { n: report.non_media_files, label: "文档、压缩包等非媒体文件" },
+    { n: report.sidecar_files, label: ".xmp / .aae 等编辑记录（Lightroom、「照片」App）" },
+    { n: report.bundles_skipped, label: "照片图库等包目录（.photoslibrary / .fcpbundle）" },
+  ].filter((r) => r.n > 0);
+  if (rows.length === 0) return null;
+
+  const total = rows.reduce((s, r) => s + r.n, 0);
+  return (
+    <Section title="不会进输出目录" hint={`${formatCount(total)} 个`}>
+      <div className="flex flex-col divide-y divide-border overflow-hidden rounded-lg border border-border">
+        {rows.map((r) => (
+          <div key={r.label} className="flex items-baseline gap-3 bg-card px-3 py-2.5 text-sm">
+            <span className="min-w-0 flex-1 leading-snug">{r.label}</span>
+            <span className="shrink-0 tabular-nums text-xs text-muted-foreground">
+              {formatCount(r.n)} 个
+            </span>
+          </div>
+        ))}
+      </div>
+      <p className="text-xs leading-relaxed text-muted-foreground">
+        输出目录只放媒体文件，目录层级与源目录一一对应。
+        <span className="text-foreground">打算用它替换源目录的话，上面这些要另行备份。</span>
+      </p>
+    </Section>
   );
 }
 

@@ -60,6 +60,19 @@ pub enum Outcome {
 /// 且目标路径由源路径派生），但并发编码时用固定后缀等于把这个假设变成隐患。
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// 临时文件名里的标记。**改它就等于改了孤儿文件的识别规则**——
+/// 上一个版本留在盘上的临时文件从此没人认领，所以别改。
+const TMP_TAG: &str = ".zz-";
+
+/// 这个名字是不是本工具的临时文件。
+///
+/// 崩溃恢复（[`crate::core::recover`]）靠它认孤儿。判据要窄：用户自己的
+/// `.something.tmp` 不能被误删，所以三个条件缺一不可——以点开头（隐藏）、
+/// 含 `.zz-` 标记、以 `.tmp` 结尾。
+pub fn is_tmp_name(name: &str) -> bool {
+    name.starts_with('.') && name.contains(TMP_TAG) && name.ends_with(".tmp")
+}
+
 /// 一个待提交的产物。
 ///
 /// 拿到它就意味着临时文件已经建好；丢掉它（不调用 [`Staged::commit`]）
@@ -74,6 +87,8 @@ pub struct Staged {
     renamed: bool,
     /// 是否用「至少省下 `min_gain_percent`」这把尺子量这次产物。见 [`Staged::gain_gate`]。
     gain_gate: bool,
+    /// 原地模式下要收进回收站的原文件。见 [`Staged::replaces`]。
+    trash: Option<PathBuf>,
 }
 
 impl Staged {
@@ -87,10 +102,29 @@ impl Staged {
 
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let stem = dst.file_name().and_then(|s| s.to_str()).unwrap_or("out");
-        let tmp = dir.join(format!(".{stem}.zz-{}-{seq}.tmp", std::process::id()));
+        let tmp = dir.join(format!(".{stem}{TMP_TAG}{}-{seq}.tmp", std::process::id()));
         // 先建出来占位，Drop 才有东西可删。
         std::fs::File::create(&tmp)?;
-        Ok(Self { tmp, dst, times: None, renamed: false, gain_gate: true })
+        Ok(Self { tmp, dst, times: None, renamed: false, gain_gate: true, trash: None })
+    }
+
+    /// 原地模式：提交前把原文件收进回收站（§8 第 8 步）。镜像模式下是空操作。
+    ///
+    /// 为什么由这一层做，而不是让调用方在拿到结果之后自己删：**产物和原文件
+    /// 经常同名**。`a.mp4` 压完还是 `a.mp4`，rename 一落地原文件就没了，等调用方
+    /// 回过神来已经无处可删——回收站里也不会有副本，用户改了主意就没得回头。
+    /// 唯一能同时满足「原子替换」和「原文件进回收站」的位置，就是 rename 前面
+    /// 这一行。
+    ///
+    /// 顺序上它排在校验和体积闸门**之后**：产物不合格的每一条路径都在这之前
+    /// 返回，原文件一个字节都不会被动。回收站本身失败也一样早退（盘满、
+    /// 只读卷、跨卷的 .Trashes 建不出来），此时 `Drop` 清掉临时文件，
+    /// 目标位置和原文件都保持原样。
+    pub fn replaces(mut self, src: &Path, cfg: &Profile) -> Self {
+        if cfg.output.mode == crate::config::OutputMode::InPlace {
+            self.trash = Some(src.to_path_buf());
+        }
+        self
     }
 
     /// 关掉体积闸门（默认开）。**只有「换容器」那一类操作该关它。**
@@ -205,6 +239,11 @@ impl Staged {
             }
         }
 
+        // 原地模式的原文件在这里进回收站，理由与顺序见 [`Staged::replaces`]。
+        if let Some(orig) = &self.trash {
+            crate::platform::trash::to_trash(orig)?;
+        }
+
         std::fs::rename(&self.tmp, &self.dst)?;
         self.renamed = true;
         if let Some(dir) = self.dst.parent() {
@@ -264,6 +303,28 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    /// 崩溃恢复靠 [`is_tmp_name`] 认孤儿，而孤儿是 [`Staged`] 留下的。
+    /// 两边各改各的就会脱钩——那时临时文件谁也不认领，只能一直躺在盘上。
+    #[test]
+    fn the_names_staged_creates_are_the_names_recovery_looks_for() {
+        let dir = temp_dir("atomic-tmp-name");
+        // 名字里带点、带空格、带中文，全都得认得出来。
+        for stem in ["out.avif", "我的 照片.v2.jpg", "noext"] {
+            let staged = Staged::new(dir.join(stem)).unwrap();
+            let name = staged.tmp.file_name().unwrap().to_str().unwrap();
+            assert!(is_tmp_name(name), "恢复认不出 Staged 造的名字：{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_users_own_dotfiles_are_not_mistaken_for_ours() {
+        // 判据窄一点：宁可漏删自己的临时文件，也不能删用户的。
+        for name in [".notes.tmp", "draft.zz-1-0.tmp", ".photo.zz-1-0.jpg", ".DS_Store"] {
+            assert!(!is_tmp_name(name), "{name} 被当成了本工具的临时文件");
+        }
     }
 
     #[test]
@@ -435,6 +496,109 @@ mod tests {
         staged.write_all(b"content").unwrap();
         assert!(staged.commit(1000, &Profile::default(), ok).is_ok());
         assert!(dst.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 原地模式的配置。
+    fn in_place() -> Profile {
+        let mut p = Profile::default();
+        p.output.mode = crate::config::OutputMode::InPlace;
+        p
+    }
+
+    #[test]
+    fn in_place_replaces_a_same_named_original_and_keeps_a_copy_in_the_trash() {
+        // 这条是原地模式的全部难点：`a.mp4` 压完还叫 `a.mp4`，rename 一落地原文件
+        // 就没了。回收站那一步只能挤在 rename 前面，晚一步就无处可删。
+        let dir = temp_dir("atomic-inplace");
+        let src = dir.join("zigzag-trash-test-a.mp4");
+        std::fs::write(&src, vec![b'x'; 1000]).unwrap();
+
+        let staged = Staged::new(&src).unwrap().replaces(&src, &in_place());
+        staged.write_all(&[0u8; 100]).unwrap();
+        assert_eq!(staged.commit(1000, &in_place(), ok).unwrap(), Outcome::Written { size: 100 });
+
+        assert_eq!(std::fs::metadata(&src).unwrap().len(), 100, "目标位置该是新产物");
+        assert_eq!(leftovers(&dir), ["zigzag-trash-test-a.mp4"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn in_place_takes_the_original_even_when_the_product_has_another_name() {
+        // `a.heic` → `a.avif`：两个名字并存，原文件不收走就等于没省下空间。
+        let dir = temp_dir("atomic-inplace-rename");
+        let src = dir.join("zigzag-trash-test-b.heic");
+        std::fs::write(&src, vec![b'x'; 1000]).unwrap();
+        let dst = dir.join("zigzag-trash-test-b.avif");
+
+        let staged = Staged::new(&dst).unwrap().replaces(&src, &in_place());
+        staged.write_all(&[0u8; 100]).unwrap();
+        staged.commit(1000, &in_place(), ok).unwrap();
+
+        assert!(!src.exists(), "原文件还在，原地模式白跑");
+        assert_eq!(leftovers(&dir), ["zigzag-trash-test-b.avif"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rejected_product_never_touches_the_original() {
+        // 校验不过、没省够、闸门拦下——每一条都排在回收站那一步前面。
+        // 判错方向的代价是把用户的原文件删了却没有替代品。
+        let dir = temp_dir("atomic-inplace-reject");
+        let cfg = in_place();
+
+        let a = dir.join("nogain.mp4");
+        std::fs::write(&a, vec![b'x'; 1000]).unwrap();
+        let staged = Staged::new(&a).unwrap().replaces(&a, &cfg);
+        staged.write_all(&vec![0u8; 990]).unwrap();
+        assert_eq!(staged.commit(1000, &cfg, ok).unwrap(), Outcome::NoGain { dst_size: 990 });
+        assert_eq!(std::fs::metadata(&a).unwrap().len(), 1000, "无收益时原文件必须原封不动");
+
+        let b = dir.join("broken.mp4");
+        std::fs::write(&b, vec![b'x'; 1000]).unwrap();
+        let staged = Staged::new(&b).unwrap().replaces(&b, &cfg);
+        staged.write_all(b"broken").unwrap();
+        assert!(staged.commit(1000, &cfg, |_| Err(ZzError::Other("解不开".into()))).is_err());
+        assert_eq!(std::fs::metadata(&b).unwrap().len(), 1000, "校验不过时原文件必须原封不动");
+
+        let mut sorted = leftovers(&dir);
+        sorted.sort();
+        assert_eq!(sorted, ["broken.mp4", "nogain.mp4"], "两次放弃都不该留下临时文件");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mirror_mode_never_touches_the_original() {
+        // 默认档是镜像，`replaces` 在这里必须是空操作——D-02 的全部承诺就是
+        // 「原文件原封不动，回滚 = 删输出目录」。
+        let dir = temp_dir("atomic-mirror-keeps-src");
+        let src = dir.join("a.jpg");
+        std::fs::write(&src, vec![b'x'; 1000]).unwrap();
+
+        let dst = dir.join("out").join("a.avif");
+        let staged = Staged::new(&dst).unwrap().replaces(&src, &Profile::default());
+        staged.write_all(&[0u8; 100]).unwrap();
+        staged.commit(1000, &Profile::default(), ok).unwrap();
+
+        assert!(src.exists(), "镜像模式动了原文件");
+        assert!(dst.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failing_trash_aborts_the_replacement() {
+        // 回收站进不去（盘满、只读卷、跨卷 .Trashes 建不出来）时，宁可这条失败，
+        // 也不能把原文件直接覆盖掉——那等于绕过了回收站这道保险。
+        // 这里用一个已经不存在的「原文件」制造失败。
+        let dir = temp_dir("atomic-trash-fails");
+        let dst = dir.join("out.avif");
+        let staged = Staged::new(&dst).unwrap().replaces(&dir.join("走丢了.mp4"), &in_place());
+        staged.write_all(&[0u8; 100]).unwrap();
+
+        let err = staged.commit(1000, &in_place(), ok).unwrap_err();
+        assert!(err.to_string().contains("移入回收站失败"), "{err}");
+        assert!(!dst.exists(), "回收站失败之后不该发生替换");
+        assert!(leftovers(&dir).is_empty(), "临时文件也要清干净");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

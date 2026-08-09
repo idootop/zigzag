@@ -89,17 +89,33 @@ pub fn classify(path: &Path) -> Option<Class> {
 /// 低码率代理与缩略图，压它们纯属浪费；`._foo.jpg` 是 AppleDouble 资源叉，
 /// 内容根本不是图片。
 pub fn is_junk(name: &str) -> bool {
+    is_system_junk(name) || is_sidecar(name)
+}
+
+/// 系统自己生成、丢了也没人心疼的那一类。
+///
+/// 和 [`is_sidecar`] 分开是为了**报数**：镜像树里这两类都不会出现，但只有边车
+/// 值得跟用户说一声（ADR-021 §13）——少一个 `.DS_Store` 不是损失，
+/// 少一份 `.xmp` 是把人家的调色参数弄丢了。
+pub fn is_system_junk(name: &str) -> bool {
     // AppleDouble：拷到非 HFS 卷时 Finder 留下的元数据文件。
     if name.starts_with("._") {
         return true;
     }
     let lower = name.to_ascii_lowercase();
     const NAMES: &[&str] = &[".ds_store", "thumbs.db", "desktop.ini", ".localized", "icon\r"];
-    if NAMES.contains(&lower.as_str()) {
-        return true;
-    }
+    NAMES.contains(&lower.as_str())
+}
+
+/// 紧挨着照片放的「编辑记录」：Lightroom 的 `.xmp`、「照片」App 的 `.aae`，
+/// 以及相机生成的代理片与缩略图。
+///
+/// 它们本身不是媒体资产，所以不入队；但它们**依附于**入队的那些照片，
+/// 而镜像树不会把它们搬过去——用户拿输出目录替换源目录时丢的就是这一份。
+/// 所以扫描要单独数它们，界面要单独说它们（ADR-021 §13）。
+pub fn is_sidecar(name: &str) -> bool {
     const SIDECAR_EXT: &[&str] = &["xmp", "aae", "thm", "lrv", "pp3", "dop", "on1", "arp", "sfk"];
-    lower
+    name.to_ascii_lowercase()
         .rsplit_once('.')
         .is_some_and(|(_, ext)| SIDECAR_EXT.contains(&ext))
 }
@@ -124,9 +140,15 @@ pub fn is_skipped_dir(name: &str) -> bool {
         "$recycle.bin",
         "system volume information",
     ];
-    if SYSTEM.contains(&lower.as_str()) {
-        return true;
-    }
+    SYSTEM.contains(&lower.as_str()) || is_bundle(name)
+}
+
+/// 「看起来像目录的文档」。
+///
+/// 单拎出来同样是为了报数：系统目录不进输出树没人会在意，而一个 12 GB 的
+/// `.photoslibrary` 不进输出树，是用户删掉源目录之后才会发现的事（ADR-021 §13）。
+pub fn is_bundle(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
     const BUNDLE_EXT: &[&str] = &[
         "photoslibrary",
         "aplibrary",
@@ -210,6 +232,27 @@ mod tests {
         // GoPro 的低码率代理片，扩展名不像垃圾但压它没有意义。
         assert!(is_junk("GX010001.LRV"));
         assert!(!is_junk("IMG_0001.JPG"));
+    }
+
+    #[test]
+    fn sidecars_and_system_junk_are_two_different_things() {
+        // 报数要分开：镜像树里两类都不会出现，但只有边车值得跟用户说一声
+        // （ADR-021 §13）。混成一档，用户就会看到「有 3000 个文件不会被复制」
+        // 而其中 2999 个是 `.DS_Store`——这条提示当场变成噪音。
+        assert!(is_sidecar("IMG_0001.xmp") && !is_system_junk("IMG_0001.xmp"));
+        assert!(is_sidecar("IMG_0001.AAE"));
+        assert!(is_system_junk(".DS_Store") && !is_sidecar(".DS_Store"));
+        assert!(is_system_junk("._IMG_0001.JPG"), "AppleDouble 归系统垃圾，不是边车");
+        assert!(!is_sidecar("IMG_0001.JPG") && !is_system_junk("IMG_0001.JPG"));
+    }
+
+    #[test]
+    fn bundles_are_told_apart_from_system_directories() {
+        // 同上：`.Trashes` 不进输出树没人在意，一个 12 GB 的图库不进输出树，
+        // 是用户删掉源目录之后才会发现的事。
+        assert!(is_bundle("个人照片.photoslibrary") && is_skipped_dir("个人照片.photoslibrary"));
+        assert!(!is_bundle(".Trashes") && is_skipped_dir(".Trashes"));
+        assert!(!is_bundle("DCIM"));
     }
 
     #[test]

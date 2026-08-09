@@ -4,8 +4,14 @@
 //! 也方便日后换个壳（CLI / 服务）复用。UI 相关的一切都在 `commands/` 里。
 
 pub mod audio;
+pub mod compare;
+pub mod dedup_session;
 pub mod estimate;
 pub mod image;
+pub mod job;
 pub mod orchestrator;
+pub mod plan;
 pub mod policy;
+pub mod precheck;
+pub mod recover;
 pub mod video;
