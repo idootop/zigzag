@@ -4,17 +4,14 @@
 
 # ZigZag
 
-**体积更小，画质如初**
-
 把硬盘里的照片和视频批量压小，画面几乎看不出差别。<br/>
 照片能小到原来的 1/7，视频 1/5，拍摄时间、地点和相机信息一并保留。
 
+[![最新版本](https://img.shields.io/github/v/release/idootop/zigzag?label=release)](https://github.com/idootop/zigzag/releases/latest)
 ![Platform](https://img.shields.io/badge/platform-macOS%20(Apple%20芯片)-black)
 [![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB)](https://tauri.app)
 [![Rust](https://img.shields.io/badge/Rust-000000?logo=rust)](https://www.rust-lang.org)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-
-**[下载最新版本](https://github.com/idootop/zigzag/releases)** · 免费开源 · macOS 12 及以上（Apple 芯片）
 
 <img src="website/img/compare.jpg" alt="压前压后对比：同一张照片 5.9 MB 压到 466 KB，画面看不出差别" />
 
@@ -23,7 +20,7 @@
 ## 它能做什么
 
 硬盘里归档的照片和视频，是最占空间的一类文件——早年设备的格式效率低，
-新相机的原图又动辄几十上百 MB。ZigZag 把它们批量压小，画面看不出差别，原文件一个都不碰。
+新相机的原图又动辄几十上百 MB。ZigZag 把它们批量压小，画面看不出差别，照片能小到原来的 1/7，视频 1/5，拍摄时间、地点和相机信息一并保留。
 
 - **先看能省多少** — 开始前先扫一遍，告诉你能腾出多少空间、要花多久，觉得划算再开始
 - **压完当场对比** — 拖动分割线看压前压后，放大看细节也行
@@ -34,8 +31,11 @@
 
 ## 安装
 
+> [!TIP]
+> 暂不支持 Intel 芯片的 Mac、Windows 和 Linux。
+
+
 到 [Releases](https://github.com/idootop/zigzag/releases) 下载 `.dmg`，拖进「应用程序」。
-暂不支持 Intel 芯片的 Mac、Windows 和 Linux。
 
 首次打开如果提示「已损坏，无法打开」，不是真的坏了——这个应用没有向苹果交费做认证，
 macOS 会先拦一下。打开「终端」执行一次即可，之后正常双击：
