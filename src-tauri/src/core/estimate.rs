@@ -185,12 +185,29 @@ impl Estimate {
         self.seconds = self.wall_clock();
     }
 
+    /// 两条队列**各自折过并发之后**要跑多久（视频, 轻活）。
+    ///
+    /// 视频闸门 2，实测只换来 1.21×（x265 本来就吃满六七个核，第二路填的是零头）；
+    /// 轻活闸门 `ncpu-2`，实测近线性（8 路 6.58×）。
+    ///
+    /// 和 [`Estimate::video_seconds`] / [`Estimate::light_seconds`] 是**两种口径**：
+    /// 那两个是串行、未折并发的原始工作量，这两个是折完并发的实际占用——只有这一对
+    /// 与 [`Estimate::seconds`] 合得起来（软编相加、硬编取 max），界面要在同一屏上
+    /// 既显示分条又显示总计时，必须用这一对，否则分条加起来对不上总计。
+    pub fn lane_walls(&self) -> (Range, Range) {
+        let g = gates();
+        let video = self
+            .video_seconds
+            .div(if self.hw_video || g.video <= 1 { 1.0 } else { VIDEO_CONCURRENCY });
+        let light = self.light_seconds.div((g.light as f64).powf(LIGHT_SCALING_EXP));
+        (video, light)
+    }
+
     /// 把两条队列的串行耗时折算成墙钟。
     ///
     /// 两步，各有一条实测依据：
     ///
-    /// 1. **各自折并发**。视频闸门 2，实测只换来 1.21×（x265 本来就吃满六七个
-    ///    核，第二路填的是零头）；轻活闸门 `ncpu-2`，实测近线性（8 路 6.58×）。
+    /// 1. **各自折并发**，见 [`Estimate::lane_walls`]。
     /// 2. **再合成**。软编时两条队列抢的是同一批核，墙钟是**相加**——基准 12
     ///    实测混跑 34.2 s、拆成两阶段跑 35.2 s，差 3%，功是守恒的。只有视频走
     ///    媒体引擎时才是两块独立的硅，那时才取 max（这才是 D-42 成立的前提）。
@@ -198,11 +215,7 @@ impl Estimate {
     /// 这一步以前不存在：调度器还没实现时按「单线程串行求和」报数，图片多的
     /// 任务会把 ETA 报大六七倍。
     fn wall_clock(&self) -> Range {
-        let g = gates();
-        let video = self
-            .video_seconds
-            .div(if self.hw_video || g.video <= 1 { 1.0 } else { VIDEO_CONCURRENCY });
-        let light = self.light_seconds.div((g.light as f64).powf(LIGHT_SCALING_EXP));
+        let (video, light) = self.lane_walls();
         if self.hw_video {
             video.max(light)
         } else {

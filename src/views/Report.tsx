@@ -6,19 +6,36 @@
  *
  * 1. **能省多少？** —— 头条数字，外加上下界。只报一个光秃秃的「418 MB」是在
  *    假装精确；预估本身就有正负一倍的不确定度，把范围写出来反而更可信。
- * 2. **要跑多久？** —— 分 CPU 与媒体引擎两条队列显示。两者是独立硅片、并行
- *    执行，总耗时取较慢的一条而不是相加（D-07 / D-42）。
+ * 2. **要跑多久？** —— 分重活（视频）与轻活（图片 + 音频）两条队列显示。两条
+ *    怎么合成总计**取决于视频走哪条通道**：软编时抢的是同一批核，墙钟相加；
+ *    只有走媒体引擎才是两块独立的硅，那时才取较慢的一条（D-07 / D-42）。
  * 3. **动了我哪些东西？** —— 按类型、按目录两个维度铺开。
  * 4. **什么没动，为什么？** —— 跳过项按原因分组单独列，绝不悄悄混进总数里。
  *    「1,204 个文件已是最优」比一个虚高的总数有用得多。
+ *
+ * ### 一条贯穿全页的规矩：屏幕上任意两个数必须加得起来
+ *
+ * 这一屏出过两次「自己打自己脸」：耗时那节把两条队列的**串行**耗时和折过并发的
+ * 总计并排放（68 分 + 1 分 = 57 分），头条把同一个量拆成一个配角一个主角。
+ * 所以现在：耗时分条一律用 `*_wall`（折过并发的口径，加得起来），串行口径只在
+ * footer 里作为「并发省了多少」的参照系出现；体积的前后两态由一条 {@link SplitBar}
+ * 同时表达，不再靠用户自己做减法。
  */
 import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { FileQuestion, Film, Image, Music, Zap } from "lucide-react";
+import { FileQuestion, Film, Image, Music } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
-import { cn, formatBytes, formatCount, formatEta, formatEtaShort, formatSaving } from "@/lib/utils";
+import {
+  cn,
+  formatBytes,
+  formatCount,
+  formatEta,
+  formatEtaShort,
+  formatSaving,
+  formatShare,
+} from "@/lib/utils";
 import type { KindGroup, MediaKind, Range, ScanReport } from "@/lib/ipc";
 import { useJob } from "@/store/job";
 
@@ -44,10 +61,10 @@ export function Report({ report }: { report: ScanReport }) {
         {!nothingToDo && (
           <>
             <Section title="按类型">
-              <KindTable groups={report.groups} />
+              <KindTable groups={report.groups} total={report.planned_bytes} />
             </Section>
 
-            <Section title="耗时" hint="两条队列并行，总耗时取较慢的一条">
+            <Section title="耗时" hint={laneNote(report)}>
               <Lanes report={report} />
             </Section>
           </>
@@ -124,28 +141,73 @@ export function ReportActions({ report }: { report: ScanReport }) {
   );
 }
 
-/** 头条：能省多少。 */
+/**
+ * 头条：能省多少。
+ *
+ * 「10.7 GB → 1.2 GB」这个前后关系由**一条总量条**表达，不再拆成两个统计格
+ * ——从前 `10.7 GB` 是「待处理」格的副标题、`1.2 GB` 是隔壁格的主标题，同一个
+ * 量的两态一个当配角一个当主角，用户得自己在脑子里把它们连起来（真机截图上
+ * 就有人拿红笔在这两个数之间画了根箭头）。条画出来了，箭头就不必写。
+ *
+ * 全区**只出现一个百分比**。从前「约为原来的 12%」和「省 89%」并存，两个数
+ * 四舍五入的方向相反，加起来是 101%。
+ */
 function Headline({ report }: { report: ScanReport }) {
   const saved = report.saved_bytes;
   return (
-    <div className="flex flex-col items-center gap-1 pt-4 text-center">
-      <span className="text-sm text-muted-foreground">预计可省</span>
-      <span className="text-5xl font-semibold tracking-tight text-good">
-        {formatBytes(saved.mid)}
-      </span>
-      <span className="text-sm text-muted-foreground">
-        {formatBytes(saved.low)} ~ {formatBytes(saved.high)}
-      </span>
+    <div className="flex flex-col gap-5 pt-4">
+      <div className="flex flex-col items-center gap-1 text-center">
+        <span className="text-sm text-muted-foreground">预计可省</span>
+        <span className="text-5xl font-semibold tracking-tight text-good">
+          {formatBytes(saved.mid)}
+        </span>
+        <span className="text-sm text-muted-foreground">
+          省掉 {formatSaving(report.planned_bytes, report.out_bytes.mid)} 体积
+        </span>
+      </div>
 
-      <div className="mt-5 grid w-full grid-cols-3 gap-px overflow-hidden rounded-lg border border-border bg-border">
-        <Stat label="待处理" value={`${formatCount(report.planned_files)} 个`} sub={formatBytes(report.planned_bytes)} />
+      <div className="flex flex-col gap-2">
+        <SplitBar src={report.planned_bytes} out={report.out_bytes.mid} className="h-3" />
+        {/* 两个标签用颜色认领条上的两段，代替一行小圆点图例。区间挂在「释放」
+            这一端——它一直就是 `saved_bytes` 的上下界，从前孤零零一行灰字，
+            没说是什么的范围。 */}
+        <div className="flex items-baseline justify-between gap-3 text-sm">
+          <span className="text-muted-foreground">
+            压缩后 <span className="font-medium tabular-nums text-primary">{formatBytes(report.out_bytes.mid)}</span>
+          </span>
+          <span className="text-muted-foreground">
+            释放{" "}
+            <span className="font-medium tabular-nums text-good">
+              {formatBytes(saved.low)} ~ {formatBytes(saved.high)}
+            </span>
+          </span>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border border-border bg-border">
         <Stat
-          label="压缩后"
-          value={formatBytes(report.out_bytes.mid)}
-          sub={`约为原来的 ${Math.round((report.out_bytes.mid / Math.max(report.planned_bytes, 1)) * 100)}%`}
+          label="待处理"
+          value={`${formatCount(report.planned_files)} 个`}
+          sub={`现在共 ${formatBytes(report.planned_bytes)}`}
         />
         <Stat label="预计耗时" value={formatEta(report.seconds.mid)} sub={rangeEta(report.seconds)} />
       </div>
+    </div>
+  );
+}
+
+/**
+ * 「压缩前 → 压缩后」的一条：整条是现在的体积，实心段是压完还剩的，空出来的
+ * 那段就是省下的空间。
+ *
+ * 头条和「按类型」共用同一个组件、同一套配色：用户在头条上认过一次
+ * 「实心 = 留下、浅色 = 释放」，下面每一行就不必再解释一遍。
+ */
+function SplitBar({ src, out, className }: { src: number; out: number; className?: string }) {
+  const kept = src > 0 ? Math.min(100, (out / src) * 100) : 0;
+  return (
+    <div className={cn("h-2 w-full overflow-hidden rounded-full bg-good/25", className)}>
+      <div className="h-full rounded-full bg-primary/70" style={{ width: `${kept}%` }} />
     </div>
   );
 }
@@ -180,9 +242,17 @@ function NothingToDo({ report }: { report: ScanReport }) {
   );
 }
 
-/** 按类型：每行一条「源 → 产物」的条，绿色段就是省下来的部分。 */
-function KindTable({ groups }: { groups: KindGroup[] }) {
-  const max = Math.max(...groups.map((g) => g.src_bytes), 1);
+/**
+ * 按类型：每行一条满宽的「源 → 产物」，实心段是压完还剩的部分。
+ *
+ * **条不再表达体量，只表达压缩比。** 从前条长 = 该类型占最大类型的比例，
+ * 在归档盘上必然失效——图片和视频天然差两三个数量级，29.1 MB 比 10.7 GB 是
+ * 0.27%，在这一栏的宽度里只剩 3 px，而那 3 px 本来要说的正是它自己的「省 66%」。
+ * 体量差异改由行首的「占 0.3%」承担，一个数字胜过一根看不见的条。
+ */
+function KindTable({ groups, total }: { groups: KindGroup[]; total: number }) {
+  // 只有一种类型时占比恒为 100%，那个标签纯属噪音。
+  const showShare = groups.length > 1;
   return (
     <div className="flex flex-col gap-3">
       {groups.map((g) => {
@@ -194,56 +264,66 @@ function KindTable({ groups }: { groups: KindGroup[] }) {
               <Icon className="size-4 shrink-0 self-center text-muted-foreground" strokeWidth={1.75} />
               <span className="font-medium">{meta.label}</span>
               <span className="text-muted-foreground">{formatCount(g.files)} 个</span>
+              {showShare && (
+                <span className="tabular-nums text-xs text-muted-foreground">
+                  占 {formatShare(g.src_bytes, total)}
+                </span>
+              )}
               <div className="flex-1" />
               <span className="tabular-nums text-muted-foreground">
                 {formatBytes(g.src_bytes)} → {formatBytes(g.out_bytes.mid)}
               </span>
-              <span className="w-10 text-right font-medium tabular-nums text-good">
-                {formatSaving(g.src_bytes, g.out_bytes.mid)}
+              {/* 带上「省」字：这一行现在有两个百分比，光靠颜色分不清谁是谁。 */}
+              <span className="w-14 shrink-0 text-right font-medium tabular-nums text-good">
+                省 {formatSaving(g.src_bytes, g.out_bytes.mid)}
               </span>
             </div>
-            {/* 外层宽度 = 该类型占最大类型的比例，内层实心段 = 压完还剩的部分。 */}
-            <div className="h-2 w-full">
-              <div
-                className="flex h-full overflow-hidden rounded-full bg-good/25"
-                style={{ width: `${(g.src_bytes / max) * 100}%` }}
-              >
-                <div
-                  className="h-full rounded-full bg-primary/70"
-                  style={{ width: `${Math.min(100, (g.out_bytes.mid / Math.max(g.src_bytes, 1)) * 100)}%` }}
-                />
-              </div>
-            </div>
+            <SplitBar src={g.src_bytes} out={g.out_bytes.mid} />
           </div>
         );
       })}
-      <p className="text-xs text-muted-foreground">
-        <span className="mr-1 inline-block size-2 rounded-full bg-primary/70 align-middle" />
-        压缩后保留
-        <span className="mr-1 ml-3 inline-block size-2 rounded-full bg-good/25 align-middle" />
-        释放出来
-      </p>
     </div>
   );
+}
+
+/**
+ * 两条队列怎么合成总计，取决于视频走哪条通道。
+ *
+ * 这不是措辞问题，是后端 `estimate::Estimate::wall_clock` 的两个分支：软编时
+ * 两条队列抢的是同一批核，基准 12 实测混跑 34.2 s、拆成两阶段跑 35.2 s，功是
+ * 守恒的，墙钟相加；只有视频走媒体引擎才是两块独立的硅，那时才取较慢的一条。
+ * 而默认档正是软编（D-24），从前这里一律写「取较慢的一条」，对默认档是错的。
+ */
+function laneNote(report: ScanReport): string {
+  return report.profile.video.lane === "media_engine"
+    ? "视频走媒体引擎，和图片音频是两块独立的硅，总耗时取较慢的一条"
+    : "两条队列同时跑，但软编时抢的是同一批核心，总耗时相加";
 }
 
 /**
  * 两条队列——就是调度器真正的那两个派发循环（`core::orchestrator`）：
  * 重活（视频）一条，轻活（图片 + 音频）一条。
  *
- * 条形长度是「串行跑完要多久」，总计是折过并发之后的墙钟，所以两条**不会**
- * 加起来等于总计。这个差额正是并发省下的时间，值得明说一句。
+ * 分条的数字用 `*_wall`（**折过队列内并发**的口径），于是它们和总计合得起来。
+ * 从前用的是 `*_seconds`（串行、未折并发），屏幕上就出现过「68 分 + 1 分，
+ * 总计 57 分」，而那一行自己的说明还写着「同时跑 2 件」——数字和它的注解互相
+ * 矛盾，用户没有任何线索知道这是两种口径。串行口径退到 footer 里当参照系，
+ * 它回答的是另一个问题：并发到底省了多少。
  */
 function Lanes({ report }: { report: ScanReport }) {
-  const video = report.video_seconds.mid;
-  const light = report.light_seconds.mid;
+  const hw = report.profile.video.lane === "media_engine";
+  const video = report.video_wall.mid;
+  const light = report.light_wall.mid;
   const max = Math.max(video, light, 1);
-  const serial = video + light;
+  // 完全不并发的参照系。
+  const serial = report.video_seconds.mid + report.light_seconds.mid;
+  const files = (kind: MediaKind) => report.groups.find((g) => g.kind === kind)?.files ?? 0;
+  const lightFiles = files("image") + files("audio");
   return (
     <div className="flex flex-col gap-3">
       <Lane
         label="视频"
-        hint="同时跑 2 件"
+        hint={`${formatCount(files("video"))} 件 · ${hw ? "媒体引擎逐个转码" : "2 路并发"}`}
         seconds={video}
         ratio={video / max}
         tone="primary"
@@ -251,21 +331,30 @@ function Lanes({ report }: { report: ScanReport }) {
       />
       <Lane
         label="图片与音频"
-        hint="铺满剩余核心"
+        hint={`${formatCount(lightFiles)} 件 · 铺满剩余核心`}
         seconds={light}
         ratio={light / max}
         tone="good"
         idle={light <= 0}
       />
+      {/* 「约」只出现一次：formatEta 自带，formatEtaShort 不带。从前这里写成
+          「省下约 {formatEta(...)}」，屏幕上就是「省下约 约 12 分钟」。 */}
       <p className="text-xs text-muted-foreground">
         总计 {formatEta(report.seconds.mid)}
-        {serial > report.seconds.mid * 1.1 &&
-          `——两条队列并发处理，比一件件排队跑省下约 ${formatEta(serial - report.seconds.mid)}`}
+        {serial - report.seconds.mid >= 60 &&
+          ` · 一件件排队跑要 ${formatEtaShort(serial)}，并发省下 ${formatEtaShort(serial - report.seconds.mid)}`}
       </p>
     </div>
   );
 }
 
+/**
+ * 一条队列。
+ *
+ * **不给图标**：这两条是流水线，不是媒体类型（轻活那条装的是图片 + 音频），
+ * 给了图标反而诱导用户以为它和上面「按类型」一一对应。从前只有轻活那条有个
+ * ⚡、视频那条留着个 `size-4` 的空格占位，左边就是一个洞。
+ */
 function Lane({
   label,
   hint,
@@ -284,19 +373,16 @@ function Lane({
   return (
     <div className="flex flex-col gap-1.5">
       <div className="flex items-baseline gap-2 text-sm">
-        {tone === "good" ? (
-          <Zap className={cn("size-4 self-center", idle ? "text-muted-foreground/40" : "text-good")} strokeWidth={1.75} />
-        ) : (
-          <span className="size-4" />
-        )}
         <span className={cn("font-medium", idle && "text-muted-foreground")}>{label}</span>
-        <span className="text-xs text-muted-foreground">{hint}</span>
+        {!idle && <span className="text-xs text-muted-foreground">{hint}</span>}
         <div className="flex-1" />
         <span className={cn("tabular-nums", idle ? "text-muted-foreground" : "font-medium")}>
           {idle ? "未使用" : formatEta(seconds)}
         </span>
       </div>
-      <div className="ml-6 h-2 overflow-hidden rounded-full bg-muted">
+      {/* 这里的共享比例尺是对的：两条量的是同一件事（时间），而「视频是长杆」
+          正是这一节要说的。给非空的一条留 2% 保底，免得整行看着像没排上。 */}
+      <div className="h-2 overflow-hidden rounded-full bg-muted">
         <div
           className={cn("h-full rounded-full", tone === "good" ? "bg-good" : "bg-primary/70")}
           style={{ width: `${Math.max(ratio * 100, idle ? 0 : 2)}%` }}

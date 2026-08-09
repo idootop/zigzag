@@ -35,6 +35,22 @@ export function formatSaving(src: number, dst: number): string {
   return `${Math.round((1 - dst / src) * 100)}%`;
 }
 
+/**
+ * 占比，`29.1 MB / 10.7 GB` 得 `0.3%`。整体为 0 时返回 `—`。
+ *
+ * **保留一位小数**，不像 {@link formatSaving} 那样取整。归档盘里图片和视频
+ * 天然差两三个数量级，取整会把 0.27% 印成 0%（等于告诉用户「这类不存在」），
+ * 把 99.73% 印成 100%（于是同一列加起来 100.3%）。一位小数两头都保得住。
+ * 小于 0.1% 的用 `<0.1%`——那是「有，但很少」，不是「没有」。
+ */
+export function formatShare(part: number, whole: number): string {
+  if (whole <= 0) return "—";
+  const pct = (part / whole) * 100;
+  if (pct > 0 && pct < 0.1) return "<0.1%";
+  // 去掉末尾的 .0：整数占比写成 `12%` 比 `12.0%` 干净。
+  return `${Number(pct.toFixed(1))}%`;
+}
+
 /** 秒数 → `1:23:45` / `2:05`。 */
 export function formatDuration(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "—";

@@ -76,7 +76,7 @@ function DedupActions() {
   if (phase === "review") {
     return (
       <Button variant="ghost" size="sm" onClick={() => void discard()}>
-        丢弃结果
+        重新选择
       </Button>
     );
   }

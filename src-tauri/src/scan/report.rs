@@ -133,6 +133,16 @@ pub struct ScanReport {
     /// 两条**不必**加起来等于 `seconds`——那正是并发省下来的部分。
     pub video_seconds: Range,
     pub light_seconds: Range,
+    /// 同样两条队列，但**已折过队列内并发**（`estimate::Estimate::lane_walls`）。
+    ///
+    /// 和上面那对是两种口径，界面上一次只该用一种：
+    /// - 想说「分头跑各自要多久」，用这一对——软编时它俩相加、硬编时取较大的一条，
+    ///   正好等于 `seconds`，分条与总计对得上。
+    /// - 想说「并发到底省了多少」，用上面那对——它们是完全不并发的参照系。
+    ///
+    /// 混用就会出现「两条各写 68 分钟和 1 分钟、总计却写 57 分钟」这种自相矛盾。
+    pub video_wall: Range,
+    pub light_wall: Range,
 
     pub groups: Vec<KindGroup>,
     pub skipped: Vec<SkipGroup>,
@@ -254,6 +264,8 @@ impl Aggregator {
         // 条数多的排前面：用户最想知道「为什么这么多文件没被处理」。
         skipped.sort_by(|a, b| b.files.cmp(&a.files).then_with(|| a.reason.as_str().cmp(b.reason.as_str())));
 
+        let (video_wall, light_wall) = self.total.lane_walls();
+
         ScanReport {
             // 聚合器不认识数据库，任务 id 由 `scan::session` 扫完回填。
             job_id: 0,
@@ -274,6 +286,8 @@ impl Aggregator {
             seconds: self.total.seconds,
             video_seconds: self.total.video_seconds,
             light_seconds: self.total.light_seconds,
+            video_wall,
+            light_wall,
             groups,
             skipped_files: self.by_reason.values().map(|(n, _)| n).sum(),
             skipped_bytes: self.by_reason.values().map(|(_, b)| b).sum(),
@@ -353,6 +367,7 @@ fn top_dirs(map: HashMap<PathBuf, (String, u64, u64)>) -> Vec<DirGroup> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Lane;
     use crate::core::policy::kind::Class;
 
     fn root() -> PathBuf {
@@ -401,6 +416,39 @@ mod tests {
         let kinds: Vec<_> = r.groups.iter().map(|g| g.kind).collect();
         assert_eq!(kinds, [MediaKind::Image, MediaKind::Video, MediaKind::Audio], "顺序必须固定，否则界面每次刷新都在跳");
         assert_eq!(r.planned_files, 3);
+    }
+
+    #[test]
+    fn lane_walls_add_up_to_the_reported_total() {
+        // 报告要在同一屏上既列两条队列、又给总计。这三个数必须自洽，否则用户
+        // 看到的就是「68 分 + 1 分 = 57 分」——一屏之内自己打自己的脸。
+        // `video_seconds` / `light_seconds` 是**串行口径**，加起来不等于总计是
+        // 应该的；能对上的只有折过并发的 `*_wall`。
+        let mut sw = agg();
+        sw.add(&root().join("照片/a.jpg"), &jpeg(4 << 20));
+        sw.add(&root().join("视频/v.mp4"), &video(200 << 20));
+        let r = sw.finish();
+        assert!(
+            (r.video_wall.mid + r.light_wall.mid - r.seconds.mid).abs() < 0.5,
+            "软编两条队列抢同一批核，分条相加应等于总计：{:?} + {:?} vs {:?}",
+            r.video_wall,
+            r.light_wall,
+            r.seconds
+        );
+
+        let mut cfg = Profile::default();
+        cfg.video.lane = Lane::MediaEngine;
+        let mut hw = Aggregator::new(cfg, vec![root()]);
+        hw.add(&root().join("照片/a.jpg"), &jpeg(4 << 20));
+        hw.add(&root().join("视频/v.mp4"), &video(200 << 20));
+        let r = hw.finish();
+        assert!(
+            (r.video_wall.mid.max(r.light_wall.mid) - r.seconds.mid).abs() < 1e-9,
+            "硬编是两块独立的硅，总计应取较慢的一条：{:?} / {:?} vs {:?}",
+            r.video_wall,
+            r.light_wall,
+            r.seconds
+        );
     }
 
     #[test]

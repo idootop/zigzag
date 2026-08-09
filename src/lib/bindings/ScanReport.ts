@@ -63,4 +63,15 @@ seconds: Range,
  * 视频队列串行跑完要多久（未折并发）。下面这条是图片与音频。
  * 两条**不必**加起来等于 `seconds`——那正是并发省下来的部分。
  */
-video_seconds: Range, light_seconds: Range, groups: Array<KindGroup>, skipped: Array<SkipGroup>, skipped_files: number, skipped_bytes: number, dirs: Array<DirGroup>, };
+video_seconds: Range, light_seconds: Range, 
+/**
+ * 同样两条队列，但**已折过队列内并发**（`estimate::Estimate::lane_walls`）。
+ *
+ * 和上面那对是两种口径，界面上一次只该用一种：
+ * - 想说「分头跑各自要多久」，用这一对——软编时它俩相加、硬编时取较大的一条，
+ *   正好等于 `seconds`，分条与总计对得上。
+ * - 想说「并发到底省了多少」，用上面那对——它们是完全不并发的参照系。
+ *
+ * 混用就会出现「两条各写 68 分钟和 1 分钟、总计却写 57 分钟」这种自相矛盾。
+ */
+video_wall: Range, light_wall: Range, groups: Array<KindGroup>, skipped: Array<SkipGroup>, skipped_files: number, skipped_bytes: number, dirs: Array<DirGroup>, };
