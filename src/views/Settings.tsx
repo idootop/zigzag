@@ -24,10 +24,12 @@ import {
   DialogDescription,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { cn } from "@/lib/utils";
 import { ipc, type Profile } from "@/lib/ipc";
 import { useApp } from "@/store/app";
 
 import { NumberRow, Section, SelectRow, SwitchRow, TextRow } from "./parts/Field";
+import { PRESET_LABELS } from "./parts/PresetPicker";
 
 /** 短边上限的档位。0 放在最前面表示「不缩放」。 */
 const EDGE_STEPS = [0, 720, 1080, 1440, 2160, 4320];
@@ -73,8 +75,99 @@ export function SettingsSheet({
   );
 }
 
+/**
+ * 面板顶部的档位切换。
+ *
+ * 首页那排卡片只在「还没开始扫描」那一屏出现，进了报告或队列就没了；而改参数的
+ * 需求恰恰经常发生在看完报告之后。所以这块面板自己得能换档，不然用户为了换一档
+ * 要先把整条流程退回去。
+ *
+ * **「自定义」不是第五个预设，是一份快照。** `activePreset` 是后端拿 profile 逐字段
+ * 比对算出来的（`Preset::detect`），没有「自定义」这个值可以设——改动下面任何一项
+ * 使它不再等于四档中的任何一档，它自然就亮了。所以这一档能不能点，取决于**有没有
+ * 东西可恢复**（`lastCustom`）：没有就 disabled，硬做成可点会是一个点了没反应的按钮。
+ */
+function PresetRow() {
+  const { presets, activePreset, applyPreset, lastCustom, patchProfile } = useApp();
+  const custom = activePreset === null;
+
+  return (
+    <section className="space-y-1">
+      <h2 className="px-1 pb-1 text-xs font-semibold tracking-wide text-muted-foreground">
+        预设
+      </h2>
+      <div className="flex items-center gap-0.5 rounded-lg bg-track p-0.5">
+        {presets.map((p) => (
+          <Seg
+            key={p.id}
+            selected={activePreset === p.id}
+            title={p.description}
+            onClick={() => void applyPreset(p.id)}
+          >
+            {PRESET_LABELS[p.id] ?? p.id}
+          </Seg>
+        ))}
+        <Seg
+          selected={custom}
+          disabled={!custom && lastCustom === null}
+          title={
+            custom
+              ? "下面的参数已经不等于任何一档预设"
+              : lastCustom
+                ? "回到你上次调的那份参数"
+                : "改动下面任意一项，就会变成自定义"
+          }
+          onClick={() => lastCustom && void patchProfile(() => lastCustom)}
+        >
+          自定义
+        </Seg>
+      </div>
+      {/* 选中档的说明放这儿，不放在每个分段的 title 里——鼠标不悬停就看不见的
+          文案等于没有。自定义时改说规则，因为这时候没有哪一档的描述是成立的。 */}
+      <p className="px-1 pt-1 text-xs leading-snug text-muted-foreground">
+        {custom
+          ? "当前为自定义。点上面任意一档可随时回到标准参数，改动会被记住"
+          : (presets.find((p) => p.id === activePreset)?.description ?? "")}
+      </p>
+    </section>
+  );
+}
+
+function Seg({
+  selected,
+  disabled,
+  title,
+  onClick,
+  children,
+}: {
+  selected: boolean;
+  disabled?: boolean;
+  title: string;
+  onClick: () => void;
+  children: string;
+}) {
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      title={title}
+      onClick={onClick}
+      className={cn(
+        "flex-1 rounded-md px-2 py-1 text-[13px] font-medium transition-colors",
+        selected
+          ? "bg-track-active text-foreground shadow-xs"
+          : disabled
+            ? "text-muted-foreground/50"
+            : "text-muted-foreground hover:text-foreground",
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
 function Settings() {
-  const { profile, activePreset, patchProfile, applyPreset, fixes, clearFixes } = useApp();
+  const { profile, patchProfile, applyPreset, fixes, clearFixes } = useApp();
   if (!profile) return null;
 
   const set = <K extends keyof Profile>(key: K, patch: Partial<Profile[K]>) =>
@@ -86,9 +179,9 @@ function Settings() {
       <header className="flex shrink-0 items-center justify-between border-b border-border py-3 pr-12 pl-5">
         <div>
           <DialogTitle className="text-[15px] font-semibold">压缩参数</DialogTitle>
-          <DialogDescription className="mt-0.5">
-            {activePreset ? "当前使用预设" : "已偏离预设，当前为自定义"}
-          </DialogDescription>
+          {/* 「当前是哪一档」由下面那排分段自己说，这里不重复第二遍——同一块 100px
+              里把档位名写两回是噪音。这行只交代这块面板是干什么的。 */}
+          <DialogDescription className="mt-0.5">四档预设，支持自定义</DialogDescription>
         </div>
         <Button variant="ghost" size="sm" onClick={() => void applyPreset("balanced")}>
           <RotateCcw className="size-3.5" />
@@ -101,6 +194,8 @@ function Settings() {
         tabIndex={-1}
         className="max-h-[70vh] space-y-6 overflow-y-auto px-5 py-5 outline-none"
       >
+        <PresetRow />
+
         {fixes.length > 0 && (
           <div className="rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 text-xs">
             <div className="mb-1 font-medium">以下取值超出范围，已自动修正：</div>

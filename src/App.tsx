@@ -9,6 +9,7 @@ import { useEffect } from "react";
 
 import { Toolbar } from "@/components/Toolbar";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { onMenu } from "@/lib/ipc";
 import { useApp } from "@/store/app";
 import { useDedup } from "@/store/dedup";
 import { useJob } from "@/store/job";
@@ -40,30 +41,24 @@ export default function App() {
     void checkResumable();
   }, [bootstrap, resumeDedup, checkResumable]);
 
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      // 只认纯 ⌘。⌥⌘1 之类是别人的组合键，别抢。
-      if (!e.metaKey || e.ctrlKey || e.altKey) return;
-      const ui = useUI.getState();
-      if (e.key === ",") {
-        e.preventDefault();
-        ui.setSettingsOpen(!ui.settingsOpen);
-        return;
-      }
-      // 面板开着时不换线：换了当场也看不见，等关掉面板才发现自己已经不在原来
-      // 那条线上了。Esc 关面板是 Radix 自带的。
-      if (ui.settingsOpen) return;
-      if (e.key === "1") {
-        e.preventDefault();
-        ui.setLane("compress");
-      } else if (e.key === "2") {
-        e.preventDefault();
-        ui.setLane("dedup");
-      }
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  // 快捷键在原生菜单上（`src-tauri/src/commands/menu.rs`），这儿只接它派下来的
+  // 动作。**不要**在这儿补一份 `keydown` 兜底：菜单吃掉的按键根本不会传到
+  // webview，那份兜底平时永远不触发，等到哪天触发就是双份。
+  useEffect(
+    () =>
+      onMenu((action) => {
+        const ui = useUI.getState();
+        if (action === "settings") {
+          ui.setSettingsOpen(!ui.settingsOpen);
+          return;
+        }
+        // 面板开着时不换线：换了当场也看不见，等关掉面板才发现自己已经不在原来
+        // 那条线上了。Esc 关面板是 Radix 自带的。
+        if (ui.settingsOpen) return;
+        ui.setLane(action === "lane-dedup" ? "dedup" : "compress");
+      }),
+    [],
+  );
 
   return (
     <TooltipProvider delayDuration={300}>

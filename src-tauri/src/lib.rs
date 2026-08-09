@@ -48,6 +48,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
+        // 三个快捷键住在菜单里而不是网页的 keydown 上，理由见 `commands::menu`。
+        .menu(commands::menu::build)
+        .on_menu_event(commands::menu::on_event)
         .setup(move |app| {
             let state = build_state(app, log_path.clone())?;
             app.manage(state);

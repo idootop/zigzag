@@ -270,6 +270,22 @@ export function onDedupApply(handlers: {
   ]);
 }
 
+/** 事件名与后端 `commands::menu` 里的常量一一对应，改名必须两边一起改。 */
+const MENU_ACTION = "menu://action";
+
+/** 原生菜单里的菜单项 id，和 `commands::menu` 的三个常量一一对应。 */
+export type MenuAction = "settings" | "lane-compress" | "lane-dedup";
+
+/**
+ * 订阅原生菜单的动作，返回退订函数。
+ *
+ * 三个快捷键（⌘, / ⌘1 / ⌘2）都在菜单上，网页这边**不要**再自己听 `keydown`
+ * ——理由见 `src-tauri/src/commands/menu.rs` 的模块文档。
+ */
+export function onMenu(handler: (action: MenuAction) => void): () => void {
+  return subscribe([listen<MenuAction>(MENU_ACTION, (e) => handler(e.payload))]);
+}
+
 /**
  * 把 invoke 抛出的东西收敛成 IpcError。
  *

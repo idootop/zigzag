@@ -17,6 +17,7 @@ use crate::store::{repo::JobProgress, Db};
 pub mod compare;
 pub mod dedup;
 pub mod job;
+pub mod menu;
 pub mod scan;
 pub mod thumb;
 

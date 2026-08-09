@@ -31,13 +31,13 @@ const MODES: { id: DedupMode; icon: typeof Copy; label: string; hint: string }[]
     id: "exact",
     icon: Copy,
     label: "完全相同",
-    hint: "逐字节一模一样的文件。结论确定，可以放心删。",
+    hint: "逐字节一模一样的文件，可以放心删。",
   },
   {
     id: "perceptual",
     icon: Images,
     label: "相似图片",
-    hint: "长得像但不完全一样：改过尺寸、重新导出、加过滤镜。只找图片，需要你自己过目。",
+    hint: "长得像但不完全一样，需要你自己过目。",
   },
 ];
 
@@ -152,7 +152,7 @@ function DedupPicker() {
               <div className="min-w-0 flex-1">
                 <div className="text-[13px]">相似程度</div>
                 <div className="text-xs leading-snug text-muted-foreground">
-                  往左更严（只找几乎一样的），往右更松（会带出更多误判）
+                  值越小越严格（只找几乎一样的），越打越松（会带出更多误判）
                 </div>
               </div>
               <Slider

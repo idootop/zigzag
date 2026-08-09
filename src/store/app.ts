@@ -23,6 +23,18 @@ interface AppState {
   presets: PresetInfo[];
   tools: ToolStatus | null;
 
+  /**
+   * 上一份自定义参数，用来让设置面板顶部那个「自定义」档可以被点回来。
+   *
+   * `activePreset` 是后端**算出来的**（`Preset::detect` 拿 profile 逐字段比对四个
+   * 预设），不是一个存着的标记——所以「自定义」这一档本身没有值，点它必须有东西
+   * 可恢复。没有这份快照的话，调了半天参数再顺手点一下「均衡」，那份自定义就
+   * 连同磁盘上的配置一起没了，且没有任何撤销。
+   *
+   * 只活在这一次运行里：配置文件只存一份 profile，为了记住第二份而改后端不值当。
+   */
+  lastCustom: Profile | null;
+
   /** 上一次保存时被钳位的字段说明，界面上提示完就清掉。 */
   fixes: string[];
   clearFixes: () => void;
@@ -42,6 +54,7 @@ export const useApp = create<AppState>((set, get) => ({
   activePreset: null,
   presets: [],
   tools: null,
+  lastCustom: null,
 
   fixes: [],
   clearFixes: () => set({ fixes: [] }),
@@ -59,7 +72,16 @@ export const useApp = create<AppState>((set, get) => ({
         ipc.listPresets(),
         ipc.checkTools(),
       ]);
-      set({ profile, activePreset, presets, tools, ready: true });
+      // 上次退出时就是自定义的话，这份就是「自定义」档的初值——不然用户开机第一件
+      // 事点了「均衡」，昨天调的参数当场无处可退。
+      set({
+        profile,
+        activePreset,
+        presets,
+        tools,
+        lastCustom: activePreset === null ? profile : null,
+        ready: true,
+      });
     } catch (e) {
       set({ error: toIpcError(e), ready: true });
     }
@@ -84,7 +106,14 @@ export const useApp = create<AppState>((set, get) => ({
     try {
       const { profile, fixes } = await ipc.setProfile(next);
       const activePreset = await ipc.getActivePreset();
-      set({ profile, activePreset, fixes });
+      // 改到不再等于任何一个预设，这一份就是当前的「自定义」。改回去正好等于某个
+      // 预设时**不清空**快照：那只是路过，用户多半还想退回自己那份。
+      set({
+        profile,
+        activePreset,
+        fixes,
+        ...(activePreset === null && { lastCustom: profile }),
+      });
     } catch (e) {
       set({ error: toIpcError(e), profile: current });
     }
