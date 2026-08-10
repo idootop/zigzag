@@ -1,0 +1,112 @@
+# 打一个 v 开头的 tag 就发版。
+name: Release
+
+# 流程：断言版本号一致 → 装工具链 → 取 sidecar → 打包 → 建 GitHub Release。
+#
+#     git tag -a v1.0.0 -m "ZigZag 1.0.0" && git push origin v1.0.0
+#
+# runner 必须是 arm64：随包的 ffmpeg / ffprobe 只有 `aarch64-apple-darwin` 一份
+# （D-10 单目标），`macos-latest` 现在指向 macos-15-arm64。
+#
+# 故意只挂 tag 触发，不加 workflow_dispatch：从分支手动跑的话 `github.ref_name`
+# 是分支名，tauri-action 会照着建一个叫 `main` 的 release。真要试跑，push 一个
+# tag 再删掉即可（删 tag 和删 release 都是可逆的）。
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # tauri-action 要建 release、传附件
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false # 发版跑到一半不能被后来者掐掉
+
+jobs:
+  release:
+    runs-on: macos-latest
+    # 3 vCPU 的 runner 上跑 `lto = true` + `codegen-units = 1`（本机 3m53s）会慢很多，
+    # 默认 6 小时太宽、60 分钟又可能不够，取 120。
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 版本号散在三个文件里，漏改一个的表现是「发出去的包版本号不对」，而那时候
+      # 已经烧掉半小时编译。所以这一条放在最前面：要红就在头一分钟红。
+      # 用 runner 预装的 node 解析 JSON，比 sed 抠字符串稳。
+      - name: 断言 tag 与三处版本号一致
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          conf="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          pkg="$(node -p "require('./package.json').version")"
+          crate="$(sed -n '/^\[package\]/,/^\[/p' src-tauri/Cargo.toml \
+                   | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+          echo "tag=$tag  tauri.conf.json=$conf  package.json=$pkg  Cargo.toml=$crate"
+          for v in "$conf" "$pkg" "$crate"; do
+            if [ "$v" != "$tag" ]; then
+              echo "::error::版本号对不上：tag 是 $tag，但有一处写着 $v。三个文件一起改完再打 tag。"
+              exit 1
+            fi
+          done
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.0.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # sidecar 约 126 MB，不进 git。key 取 fetch-sidecars.sh 的哈希：脚本里写死了
+      # 上游 build id 和两个 SHA256，脚本不变就等于 sidecar 不变——这个 key 是精确的。
+      - uses: actions/cache@v4
+        with:
+          path: src-tauri/binaries
+          key: sidecars-${{ hashFiles('scripts/fetch-sidecars.sh') }}
+
+      - run: pnpm install --frozen-lockfile
+
+      # 命中缓存时它只校验 SHA256 跳过下载，但自检照跑（libx265 / hevc_videotoolbox /
+      # aac_at / libaom-av1 / libsvtav1 / libvmaf / 纯静态链接），等于每次发版白得一道
+      # sidecar 完整性闸门。缺了它连 `cargo check` 都过不去——tauri-build 的构建脚本
+      # 会去拷 externalBin，路径不存在直接 `resource path ... doesn't exist` 报错。
+      - run: pnpm sidecars
+
+      # 两件事：删掉写给维护者看的 HTML 注释块（渲染出来虽然是隐形的，但点「编辑
+      # release」的人会看见一段跟读者无关的话），再把 {{VERSION}} 换成 tag 里的版本号。
+      - name: 生成发版说明
+        id: notes
+        run: |
+          set -euo pipefail
+          {
+            echo 'body<<ZZ_EOF'
+            sed -e '/^<!--$/,/^-->$/d' \
+                -e "s/{{VERSION}}/${GITHUB_REF_NAME#v}/g" \
+                .github/release-notes.md
+            echo 'ZZ_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: ZigZag ${{ github.ref_name }}
+          releaseBody: ${{ steps.notes.outputs.body }}
+          releaseDraft: false
+          prerelease: false
+          args: --target aarch64-apple-darwin
+          # 没配 updater，别让它生成一个没人用的 latest.json。
+          uploadUpdaterJson: false
+          # dmg 那一步会调 osascript 摆 Finder 窗口，无头 runner 上偶发失败，给它一次重试。
+          retryAttempts: 1

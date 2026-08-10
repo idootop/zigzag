@@ -861,6 +861,22 @@ zigzag/
       日期 /「删掉」/「只留这张」；⑭点开细看窗，标题右边有「只留右边这张」，按下即回到
       并排屏且其余几格变成「删掉」；⑮并排窗和细看窗左右都留得出空隙，不再贴着窗口边**
 - [x] 查清「⌘ 快捷键打不开设置」（ADR-023 §14）：**真因是首页那句「按 ⌘ 查看完整参数」漏了逗号**，用户按的是光杆 Command（D-180，改成 `⌘ + ,` 键帽）；同轮把三个快捷键搬进原生菜单（D-179），真机硬件注入验过 ⌘, / ⌘1 / ⌘2 与「面板开着不换线」守卫
+- [ ] **发布 1.0 + 打 tag 就出包**（ADR-033）：版本号四处一起推到 `1.0.0`，新增
+      `.github/workflows/ci.yml`（typecheck / clippy `-D warnings` / `cargo test --lib`）、
+      `.github/workflows/release.yml`（v-tag → 版本断言 → sidecar → 打包 → 建 release）、
+      `.github/release-notes.md`（Gatekeeper + 系统要求 + ffmpeg GPLv3 源码提供）与
+      `LICENSE`（D-225~D-230）。**实验钉死一条**：缺了 sidecar 连 `cargo check` 都过不去
+      （`tauri-build` 的构建脚本要拷 externalBin），所以门禁那条也必须先 `pnpm sidecars`。
+      本地门禁已过（typecheck 通过 / clippy 零告警 / **497 项通过**），1.0.0 的包已本地
+      打出并逐条验过（`ZigZag_1.0.0_aarch64.dmg` 62.68 MiB / `Signature=adhoc` +
+      `flags=…(adhoc,runtime)` / `--verify --deep --strict` 通过 / `Contents/MacOS/` 有
+      ffmpeg+ffprobe / `CFBundleShortVersionString` = 1.0.0）。**剩下三条只有 tag 推上去
+      才验得到，待用户走**：①Actions 里 `Release` 绿灯（3 vCPU 上跑 fat LTO 是本轮最大
+      未知数），且版本号不一致时应在**头一分钟**就红 ②Releases 页出现 `ZigZag v1.0.0`、
+      附件是 `ZigZag_1.0.0_aarch64.dmg`、正文里 Gatekeeper 那段和 `xattr` 命令渲染正确
+      ③**从 Releases 下载**（不是本地产物，要走真实 quarantine 路径）拖进「应用程序」，
+      先双击确认确实被拦，再按说明跑 `xattr -dr` 后能正常打开，并跑一遍扫描+压缩确认
+      CI 打的包里 sidecar 也找得到
 
 #### v2 候选（明确不进 v1）
 - ~~感知去重（pHash/dHash 找相似图）~~ → **已提前进 v1 M5**（用户决策 2026-08-09）
@@ -5052,6 +5068,161 @@ D-224 改完拿重新构建的那份 CSS 在 WKWebView 里复量（1000×723）�
 
 ---
 
+## 2026-08-10 · 发布 1.0 + 打 tag 就出包（ADR-033）
+
+v1 的功能与验收早就做完了（M6 九项 + 基准 22），仓库里却还写着 `0.1.0`、没有一个 tag、
+没有一条 release、没有任何 CI——README 顶上那个「下载」徽章点进去是空的。这一轮把 1.0
+真正发出去，并把「打一个 `v` 开头的 tag 就出包」固定成工作流，往后发版不再靠本机手搓。
+
+三条前提本轮不重开：**只做 Apple Silicon**（D-10，sidecar 只有 `aarch64-apple-darwin`
+一份）、**ad-hoc 自签名不做公证**（D-17，用户决策）、**Gatekeeper 只写文档不做代码规避**
+（D-155）。
+
+### 1. 动手之前先把事实查清（其中一条用实验钉死）
+
+| 事实 | 怎么知道的 |
+|---|---|
+| **缺了 sidecar 连 `cargo check` 都过不去**，不是只有 `tauri build` 才要 | 实验，见下 |
+| 默认档 `cargo test` **不碰 `fixtures/`** | `testutil.rs` 头注释，用素材的用例一律 `#[ignore]` |
+| `macos-latest` = `macos-15-arm64`，**3 vCPU / 7 GB** | GitHub runner 文档；这是唯一可用的 arm64 runner |
+| 仓库是 **public**，macOS runner 分钟数免费 | `api.github.com/repos/idootop/zigzag` → `"private": false` |
+| `tauri-action` 现在是 **`@v1`**，要用的 8 个输入都存在 | 拉它发布的 `action.yml` 逐个对过；7 个 action ref 全部 HTTP 200 |
+| 随包 ffmpeg 是 **GPLv3+**，分发时有源码提供义务 | `fetch-sidecars.sh` 头注释 + D-30 |
+| 本机 `gh` 未登录 | `gh repo view` 报 `gh auth login`，故推 tag 交给用户 |
+
+**那条实验**：把 `src-tauri/binaries/` 临时挪开跑一次 `cargo check`，得到
+
+```
+error: failed to run custom build command for `zigzag v1.0.0`
+       resource path `binaries/ffmpeg-aarch64-apple-darwin` doesn't exist
+```
+
+链条在 `tauri-build-2.6.3/src/lib.rs:62` 的 `for src in binaries { let src = src?; }`——
+`tauri-utils-2.9.3/src/resources.rs:188` 的 `resource_from_path` 对不存在的路径返回
+`ResourcePathNotFound`，而这是**构建脚本**，于是 `check` / `build` / `test` / `clippy`
+**全都过不去**，不是打包那一步才报。**这条直接决定了 ci.yml 的形状**：门禁那条流水线
+也必须先 `pnpm sidecars`，否则连编译都开始不了。只读源码本来也推得出来，但按 CLAUDE.md
+的规矩，动手前用实验把它钉死了再写。
+
+### 2. 版本号：文件为准，CI 只负责断言（D-225）
+
+**D-225：版本号的事实来源是仓库里那三个文件，tag 只是引用；CI 第一步断言两者一致，
+不写发版脚本。** 四处一起改到 `1.0.0`：`package.json`、`src-tauri/tauri.conf.json`
+（**这一处决定 `.dmg` 的文件名**）、`src-tauri/Cargo.toml`、`Cargo.lock`（跑一次 cargo
+自动跟上）。三处散着必然会漏，兜底放在 release.yml 的第一步——纯 shell 十来行，把
+`${GITHUB_REF_NAME#v}` 与三处逐个比，不等就 `exit 1` 并打印四个值。
+
+放在**最前面**是有讲究的：漏改一处的表现是「发出去的包版本号不对」，而那时候已经烧掉
+半小时编译。要红就得在头一分钟红。空跑验过两向：`v1.0.0` 打印四个 `1.0.0` 后放行，
+`v9.9.9` 正确地红。另外 `node -p "require('./x.json').version"` 在 `"type": "module"`
+的仓库里**照样能用**（Node 24 的 `--print` 输入默认按 CommonJS 走），这条也当场试了，
+没敢直接写进去。
+
+**不写 `scripts/release.sh`**：一年发几次的事，拿一个必须长期维护的脚本换一次手改，
+不值（大道至简）。
+
+### 3. 两条流水线，各管一段（D-226 / D-227）
+
+**D-226：门禁（`ci.yml`）与发版（`release.yml`）拆开，发版不重复跑门禁。** ci.yml 挂
+`push` / `pull_request` 到 `main`，跑 `pnpm typecheck` + `cargo clippy --all-targets
+-- -D warnings` + `cargo test --lib`；release.yml 由 tag 触发，只做「断言 → 取 sidecar →
+打包 → 建 release」。理由是 tag 指向的 commit 早在 push 到 main 时就被门禁过了一遍，
+再跑一遍等于让每次发版白等一轮 debug 编译。
+
+两条都只能跑 macOS 且只能是 arm64：`platform/` 那一层是 CGImageSource / AudioToolbox /
+NSFileManager，换个系统根本编不过；sidecar 也只有 arm64 一份。
+
+`-D warnings` 不是洁癖：`clippy.toml` 里 `trash::delete` 那条 `disallowed-methods` 护栏
+（D-164，那个 bug 差点把删除路径永久搞坏）**只有在告警变成错误时才拦得住 CI**。
+`--ignored` 那批（真实编解码、基准）不进 CI——要 200 MB 素材，且基准要专机才有意义。
+
+**D-227：release.yml 只挂 tag 触发，不加 `workflow_dispatch`。** 从分支手动跑的话
+`github.ref_name` 是**分支名**，tauri-action 会照着建一个叫 `main` 的 release。真要试跑，
+push 一个 tag 再删掉即可——删 tag 和删 release 都是可逆的，而误建一条 release 不是。
+
+### 4. sidecar 的缓存 key 取脚本哈希（D-228）
+
+**D-228：`actions/cache@v4` 缓存 `src-tauri/binaries`，key 取
+`hashFiles('scripts/fetch-sidecars.sh')`。** 两条流水线共用同一个 key。这个 key
+**是精确的不是近似的**：脚本里写死了上游 build id（`1785863997_9.0`）和两个 SHA256，
+脚本不变就等于 sidecar 不变。
+
+命中缓存时 `pnpm sidecars` 只校验 SHA256 跳过下载，**但自检照跑**（libx265 /
+hevc_videotoolbox / aac_at / libaom-av1 / libsvtav1 / libvmaf / 纯静态链接），等于每次
+发版白得一道 sidecar 完整性闸门。126 MB 不进 git 这件事因此没有代价。
+
+### 5. 发版说明单独成文件（D-229）
+
+**D-229：`.github/release-notes.md` 单独一个文件，`{{VERSION}}` 占位，工作流里替换。**
+不内联进 YAML：这是面向用户的产品文案，和 README 同一类东西——内联进去以后改一句话就
+要动 CI，缩进错一格还会把工作流弄坏；单独放着改完下次发版自动生效，不用重打 tag。
+生成那一步顺手把顶格的 HTML 注释块删掉（`sed '/^<!--$/,/^-->$/d'`），免得点「编辑
+release」的人看见一段跟读者无关的话。
+
+正文四段，**Gatekeeper 那段是这次用户点名要的**：
+
+- 说清**不是坏了**——没交每年 99 美元做开发者认证和公证（D-17 的明确取舍），系统那句
+  「已损坏」是措辞问题，真正的意思是「我不认识这个开发者」。
+- **别再教人「右键 → 打开」**：macOS 15 已经移除这条路，实测弹窗只有 [完成] /
+  [移到废纸篓]（ADR-021 §14）。给出唯一有效的那条命令，与 README 完全一致：
+  `xattr -dr com.apple.quarantine /Applications/ZigZag.app`，并说清它在做什么（删掉
+  「从网上下载」的标记）、**只对自己确认过来源的应用这么做**；不放心就自己从源码构建，
+  命令一并给出。
+- **随包 ffmpeg 的 GPLv3+ 与源码获取方式**——这是**分发义务不是客气话**（D-30）。
+- 这一版是什么，三行，指向 README 与本文件。
+
+本地空跑过生成那一步：占位符残留 0、注释块残留 0、heredoc 收尾恰好一处，且正文里那个
+`ZigZag_1.0.0_aarch64.dmg` 与真实产物**逐字相同**（见下一节——这个名字动手时还是推断）。
+
+### 6. 补一个 LICENSE（D-230）
+
+**D-230：补 `LICENSE`（MIT），并在文件末尾写清随包 ffmpeg 是 GPLv3+。** 此前 README 顶上
+挂着 MIT 徽章、§许可证写着 MIT、发版说明也写着 MIT，**仓库里却没有 LICENSE 文件**，
+`api.github.com` 报 `license: null`——等于对外声明了一个许可却没有给出授权文本。这不是
+新决策，是让仓库和它自己已经公开声明的东西对上。**MIT 只管本仓库的代码**：安装包里那
+两个 ffmpeg / ffprobe 是第三方静态构建、按 GPLv3+ 分发，ZigZag 以子进程调用属于聚合而非
+链接，两者各管各的那一部分——这句话写进 LICENSE 文件本身，比只写在发版说明里可靠。
+
+### 7. 不等 CI，本地先打一遍 1.0.0 的包
+
+提醒 24：「打包这件事里，配置是两行，验证是全部」。`pnpm tauri build --target
+aarch64-apple-darwin` 跑完（exit 0）逐条查：
+
+| 查什么 | 结果 |
+|---|---|
+| dmg 存在且体积正常 | `ZigZag_1.0.0_aarch64.dmg`，**62.68 MiB**（基准 20 的基线是 61.7 MiB，`.app` 仍是 144 MB） |
+| 签名 | `Signature=adhoc`、`flags=0x10002(adhoc,runtime)`、`TeamIdentifier=not set`、`Mach-O thin (arm64)` |
+| `codesign --verify --deep --strict` | 通过 |
+| `Contents/MacOS/` 有没有 sidecar | 有：`ffmpeg` 66.3 MB / `ffprobe` 66.2 MB / `zigzag` 17.9 MB |
+| `Info.plist` 版本 | `CFBundleShortVersionString` = `CFBundleVersion` = **1.0.0**，`LSMinimumSystemVersion` = 12.0 |
+
+**dmg 的名字动手时是推断**（取自 `productName` + `version`，而旧包叫
+`zigzag_0.1.0_aarch64.dmg`，`productName` 后来改过大小写），打完包拿到真名一对——
+`ZigZag_1.0.0_aarch64.dmg`，与发版说明里写的**恰好一致，不用回填**。这条运气好，但
+「先打包再定稿文案」这个顺序不能省：名字错了的发版说明会让每一个下载的人先愣三秒。
+
+### 8. 门禁
+
+`pnpm typecheck` 通过；`cargo clippy --all-targets -- -D warnings` **exit 0、零告警**；
+`cargo test --lib` **497 项通过 / 0 失败 / 56 忽略**（7.54 s）。两个工作流过
+`yaml.safe_load`（`actionlint` 本机没装，跳过）。
+
+**剩下三件只有推上去才验得到**，故 §12 那条留着不打勾：CI 真跑绿（尤其 3 vCPU 上的
+`lto = true` + `codegen-units = 1`）、Releases 页真出现附件、以及**从 Releases 下载的那份**
+（不是本地产物，要走真实的 quarantine 路径）按说明能打开。
+
+### 9. 已知风险（先说在前面）
+
+- **3 vCPU / 7 GB 的 runner 上跑 fat LTO**：本机 3m53s，runner 上估计 30~60 分钟，内存
+  峰值有撞上 7 GB 的可能，`timeout-minutes` 因此放到 120。真 OOM 的退路是给 CI 单独一个
+  `lto = "thin"` 的 profile——**但不预先改**：那等于拿一个没验证过的猜测换掉一个已验证
+  过的 profile，先让它跑，按实际结果决定。
+- **DMG 打包在无头 runner 上偶发失败**（tauri 的 dmg bundler 会调 `osascript` 摆 Finder
+  窗口）。已给 `retryAttempts: 1`；真过不去就把 CI 上的 `bundle.targets` 收成 `app`、
+  改传 `.app.tar.gz`。
+
+---
+
 ## CHANGELOG
 
 | 日期 | 内容 |
@@ -5103,6 +5274,7 @@ D-224 改完拿重新构建的那份 CSS 在 WKWebView 里复量（1000×723）�
 | 2026-08-10 | **ADR-029 + ADR-030**：**剩余时间换口径 + 「处理中」独立成栏 + 跑完显示总耗时**（schema v5、`store/repo.rs`、`scan/report.rs`、`scan/session.rs`、`core/estimate.rs`、`core/job.rs`、`src/views/Queue.tsx`），`cargo test --lib` 481 → **496 项通过 / 0 失败 / 56 忽略**，clippy 零告警，typecheck 通过。决议 D-204~D-210，提醒 49~52。**ADR-029**：用户报「过程中不显示剩余时间了」和「待处理那一栏是空的」，查下去是同一个毛病——界面上的数和界面上的列表不是同一个口径。剩余时间的两个缺陷从 v1 起就在：`ETA_MIN_SAMPLES = 8` 让**少于 9 个文件的任务从头到尾一个数字都不给**（而核心用例恰恰是一趟十几个大视频），且分母是**件数**——一张 4.8 MB 的照片和一个 665 MB 的视频算等价的一件，实测 24 图 + 1 视频那一趟跑到 24/25 时报「剩余不到 1 分钟」而那个视频真跑了 **73 秒**（日志 14:14:44 → 14:15:57），**差约 20 倍且方向恒定**（越到收尾越乐观，因为剩下的永远是最重的）。**按字节加权是歧路**（D-207，同一批数据否掉）：图片 202~236 B/ms、视频 5192 B/ms，视频每字节快 **23 倍**。真正该用的数据早就算好了又被扔掉——`estimate::item()` 逐件算出了耗时并标了队列，`Aggregator` 只留汇总（提醒 49：丢弃中间量之前先问一句下游用不用得上）。改法：schema v5 存 `items.est_secs`（D-204，旧库全是 0 时 ETA 显示为空，不做兼容层），提取 `estimate::wall_seconds()` 让扫描期与运行期共用同一个折算模型，ETA 改成「剩余工作量外推 + 实测校准」并删掉 `ETA_MIN_SAMPLES`（D-205），**两条队列各校各的**（D-206）——全局系数会被在飞的活污染，实测 24 张图跑完那一刻视频已烧掉 8 秒机器而它的工作量还挂在「剩余」里没进分母，系数算成 4.3、剩余报 **980 s** 而真实只剩约 **106 s**，长 9 倍。新公式里**根本没有墙上时间**，暂停冻住成了自然结果，专为此存在的 `PauseClock` 一并删掉。界面侧 `JobUpdate` 加 `running`、「待处理」徽标改成 `pending - running`、「处理中」单列一栏（D-208，`pending` 语义一个字不动，所以进度条与文案不用改也就不会被改错），恒等式 `pending − running == 库里 status='pending' 的条数` 由单测逐步比库钉住（提醒 50：一个数字和它旁边的列表若来自两条路，迟早对不上；判据要写成「徽标 == 那一栏的行数」才可测）。**ADR-030**：上一轮我把「认领了还没开跑的也算处理中」当成设计写进注释还劝后来人别动，用户直接否掉——「处理中的是正在进行的并发的窗口任务，待处理应该是 pending 等待排队中的任务」。根因量出来了：`claim_pending_of` 把取出的**整批**当场置 `running`，每条队列 `CLAIM_BATCH=32` + `QUEUE_DEPTH=32`、两条队列 ⇒ 最多 **64 条**同时挂 running，25 个文件的任务开跑那一瞬间**每一行都是 running**，于是待处理 0 / 处理中 25。**关键佐证**：派发循环是**先拿闸门许可、再 `recv()`**（`orchestrator.rs` 的 `select!`），收到与 `Event::Started` 之间几乎没有间隙——那 64 条差的不是「刚收到还没开始」，而是**还躺在缓冲里根本没被收到**，「显示延迟」的解释就此排除。三个更省事的改法都不行（只改前端管不着 SQL 查出来的列表；调小 `CLAIM_BATCH` 到 1 仍有约 14/25 是错的且提交次数 ×32；新加 `'queued'` 状态会逼 `list_items`/`count_items` 从直查退化成拼 `IN (...)`）。**D-209**：库里的 `running` 只表示「此刻真的在编码」，由闸门放行那一刻经已有的批量落库通道写入（SQL 带 `AND status='pending'` 守卫，迟到/重复的 `Started` 拖不回已落定的一件）；认领退化成 `take_pending_of()` 纯 SELECT，**一趟之内靠单调游标去重**而不再靠状态位（退回队列只发生在收尾，而每趟都新建 `Feed`、游标从 0 起，所以被退回的下一趟照样取得到）。**写库次数不变**（旧「认领 UPDATE + 结果 UPDATE」→ 新「Started UPDATE + 结果 UPDATE」，同在一个批处理里）——这是该改法成立的前提，否则就是拿吞吐换显示效果。顺带变准三处：`recover_interrupted` / `release_running` / 启动扫孤儿 `.zz-*.tmp` 的目录集合从此只面对真在编码的那几件。**D-210**：跑完显示总耗时，`JobUpdate.elapsed_secs` 记在内存 `WorkClock` 里不落库（为一个展示用的数字每 100 ms 写库不值当），暂停期间不走表、收工那一帧停表冻住，代价是中途退出应用再回来只算这一次接手之后的时间（已写进字段注释）；格式复用 `formatDuration`，不新增第四个时间格式化函数。**真机 GUI 七条由用户自己逐条走过**（25 文件那一趟 + 3 文件的小目录，全部对上；10 核机上「处理中」是 8~10 而不再是 25）——这一轮不再由我截图 + `zzclick` 驱动，上一轮那么干时两次 ⌘⇧G 因为 Go-to 面板还没出来就把路径打进了别处，用户一句「草你自己截图点击太浪费时间了，直接告诉我怎么做我自己点」（提醒 52：判据在日志/库里就脚本化，判据在屏幕上就写成点击清单交给用户——我截一张图要好几秒，人一眼就看完了） |
 | 2026-08-10 | **ADR-031**：**默认阈值踩进了假配对里——64 位指纹量不了裁边，加宽到 256 位；分组加并排大图**（`dedup/perceptual.rs`、`commands/dedup.rs`、`store/dedup.ts`、`views/Dedup.tsx`、`views/parts/DedupReview.tsx`、新增 `views/parts/GroupCompare.tsx`），`cargo test --lib` 496 → **497 项通过 / 0 失败 / 56 忽略**，clippy 零告警，typecheck 通过。决议 D-211~D-219，提醒 53~54，**基准 23**。用户截图一组「相差 10」的重复：一张火锅桌、一张披萨，**完全不相干**。**先量再改**——把语料换成他自己那 51 张照片（`ZZ_DEDUP_CORPUS`，前 12 张各造 6 类变体 ⇒ 123 张 / 252 对真配对 / 7251 对假配对，全部真落盘真走生产解码路径）：64 位 aHash 下同一张图裁掉 5% 边要差 **14** 位，而两张毫不相干的照片能近到 **10** 位，**含裁边的干净区间根本不存在**；而基准 16 的默认值 12 正是冲着覆盖裁边定的（它在合成小块语料上量出裁边 9 < 假 15，以为区间存在，取中点 12），**在真实照片上 12 已经越过了假配对最小值 10**。用户看到的 10 就是这 7251 对里假配对的最小值，探针复现的数与界面显示的一模一样。压低默认到 6~9 能分开这一对，但裁边整类丢失，且余量只有 **4.0σ**（256 位下默认 16 是 **5.6σ**）——尾巴还会随图库规模往下走。加宽管用的机制也量出来了：真配对距离由重采样噪声决定、几乎不随位宽长（非裁边 2 → 5，2.5×），假配对距离由位宽决定（10 → 62，6.2×），所以 16×16 才第一次有干净区间 **`5..=61`（含裁边）**。**其余三条更省事的改法也逐条否掉**：只收滑杆上限够不着 10（默认值本身就在误判区里）；换 64 位 pHash（`Median`+DCT，真实照片上其实是 64 位唯一含裁边还干净的 `2..=15`——**基准 16 判它「分不开两类」是那份合成语料的产物**）余量只有 2 位且到 256 位直接重叠（98 > 96），分离度不跟位宽长；叠第二把尺子（颜色直方图/EXIF）是拿复杂度换本该由位宽解决的事。改法：`Fingerprint` `u64` → `[u8; 32]`、`hash_size(16,16)`、**`FINGERPRINT_ALGO` 必须同步升 `ahash16-128px-v2`**（D-212，`SqliteHashCache::new` 按 `WHERE algo` 取快照，不升就是新旧指纹混算、**分组静默全错**；库不用迁移，`hash` 列本来就是 `TEXT`，只是十六进制串 16 → 64 字符），默认阈值 **16**（非裁边实测最大 5，留 3.2× 余量；假配对最小 62，留 3.9× 且在均值下方 5.6σ），滑杆 **`4..=56` 步长 4** 且**在后端 `clamp`**（D-214，前端只是遥控器），缩略长边**仍是 128**（D-215，重扫后 128 与 256/512 的区间宽度差 57 vs 59 落在噪声里；新数据点是下界抬高——16 px / 32 px 现在够不着默认值 16）。**默认值有意不覆盖裁边**（D-114 补注）：256 位下裁边 34/54 对其余全部 ≤5，覆盖它就要把默认推到 56，那是把误判风险按在所有人头上换少数人才要的召回；想要的人推滑杆，D-113 保证一条都不预勾。**顺带修正 D-113 的碰撞概率**：那条按均匀随机指纹算，而真实照片的指纹是扎堆的（实测假配对 σ=6.5 对随机模型 4.0，256 位下 20.0 对 8.0），7251 对里必然出现 ≤12 的一对而模型预测期望仅 0.0017 对，**差约 600 倍**——规则不变，依据更硬。**标定语料两个坑入档**：一是**基准 16 的 3×3 小块语料两个方向都不代表真实照片**（D-216，64 位下真实照片假配对最小 10 比小块的 15 **更近**＝偏乐观，正是误判溜过护栏的原因；256 位下小块↔真实照片最近 50 比真实照片两两的 62 **更近**＝偏保守），所以有真实语料时一块都不掺；二是**第一次跑出「假配对最小 0」**，`shasum -a 256` 一查是 `fixtures/image/iphone.jpg` 与语料里 `IMG_7592.JPG` **字节完全相同**（那张 fixture 当初就是从这个相册拿的），造出一个幽灵假配对——它长得跟「算法坏了」一模一样（提醒 54：标定语料先 `shasum \| sort \| uniq -d` 查同源）。提醒 53：**一个阈值怎么调都有代价时，先问尺子够不够细，别在那条刻度上继续挪**——判据是把「真·非裁边 / 真·裁边 / 假·最小」分三列并排打出来，「哪一类越了界」当场可见；**汇总成一个「真配对最大」会把这件事藏起来**，基准 16 定出 12 就是因为只看了汇总值。基准断言也随之换成三条独立的回归护栏（非裁边真配对最大 < 默认值、`MAX_DISTANCE` < 假配对最小、默认值落在滑杆两端之间），往后动位宽/算法/长边/任一阈值常量都会红。界面侧新增 `GroupCompare.tsx`：点组头摊开整组大图（走 `media_preview(720)` 而非 `Thumb`——后者 `MAX_PX` 写死 96；data URL 而非资源协议，理由同 ADR-022），**元信息里必须有分辨率**（D-218，体积小可能是压得狠也可能是被裁小了，只看体积会留错），加「只留这张」一键把同组其余勾成删掉（D-219，中途失败重读整页而不猜断点——部分成功的勾选状态若和库不一致，用户看到的「还剩几份」就是假的，而那正是删除前唯一的护栏）。**真机 GUI 十二条待用户逐条走过**，判据是 `IMG_7036` 与 `IMG_7039` 不再同组 |
 | 2026-08-10 | **ADR-032**：**并排大图被 WebKit 压成 81 px**（`views/parts/GroupCompare.tsx`、`components/Compare.tsx`），typecheck 通过 / `pnpm build` 通过，Rust 未改。决议 D-220~D-224，**提醒 55~56**。用户截图 ADR-031 那个并排对比窗：12 个格子只剩一条被压扁的图，路径、体积、分辨率、日期、「删掉」勾选框和「只留这张」按钮**整排不见**。**第一版猜想是错的**——「`max-h-[72vh]` 把行压了」在 Chromium 上一量就翻车：格子 440 px、`scrollHeight` 2703 > `clientHeight`，**正常滚动**。差别在引擎：应用跑的是 **WKWebView**。拿 30 行 Swift 起一个 `WKWebView`（`loadFileURL` + `evaluateJavaScript` 读 `getBoundingClientRect`）把同一份用例喂给两个引擎，五个变体一轮分完：WebKit 现状 **81 px / 网格不可滚（`scrollHeight` 547 == `clientHeight`）/ 元信息不可见**（与用户截图上量到的每行 ≈83 px 对得上，是同一个东西）；格子改 `overflow: visible` → 446 / 2739 / 可见；网格加 `grid-auto-rows: max-content` → 446 / 2739 / 可见；而 `flex-shrink: 0` 与 `align-content: start` **都不管用**（前者管格子内部的 flex 分配、后者管行排完之后怎么摆，都够不着「行有多高」这一步）；Chromium 151 上改前改后都是 446 / 2739 / 可见。链条是：网格行默认 `auto`，`auto` 的下限取自格子的自动最小尺寸，而格子带 `overflow-hidden`（圆角裁图要它）会把这个下限塌成 0，于是 `max-h-[72vh]` 一约束，**WebKit 把六行一起压进去**而不是溢出滚动，图片区从 355 px 压到 81 px 以内，下面那 89 px 的元信息+按钮行被 `overflow-hidden` 自己裁掉。改法：网格写死 `auto-rows-max` 保住 `overflow-hidden`（D-220），一个类解决且 Chromium 前后完全一致——不是拿另一个引擎的正确性换这一个；`pnpm build` 后在产物 CSS 里 `grep` 到 `grid-auto-rows:max-content`，确认 Tailwind 真发了这条。同轮把「只留这张」加进细看窗，做成 `Compare` 的 **`action` 插槽**而不是把去重逻辑写进 `Compare`（D-221，这一屏压缩队列和去重复核两处都用，「留哪张」只在去重那边成立）——**看清楚的那一刻就是拿定主意的那一刻**，还要求人关窗、退回并排屏、再找回刚才那一格，等于把判断和动作硬拆成两步；两侧都有图时按钮写「只留**右边**这张」，因为窗口标题显示的是 `src` 也就是**代表**的文件名，只写「只留这张」会指向错的那一张；按完关掉细看窗回并排屏，结果（其余几格变成「删掉」）要回那一屏才看得见。**提醒 55：布局 bug 要在 WKWebView 里量，不能在浏览器里量**——浏览器 devtools 在这一类 bug 上会给出「一切正常」，且改法必须 WebKit 修好**且** Chromium 不回归，否则只是把 bug 挪了个窝。**用户看到修好的界面之后又提两条，同轮做掉**：一、格子 `aspect-[4/3]` → **`aspect-video`（16/9）仍 `object-contain`**（D-222，「4/3 太高了」；这一格是用来认出「这是哪张」的，竖格子把一屏能并排的张数砍掉一半，而并排对比要的正是一眼扫过去；**不能改 `cover`**——裁掉的边正是「这两张构图一不一样」的证据）。二、**弹窗宽度占满整个窗口**（D-223）：根因是 **tailwind-merge 的同属性覆盖**——基线本有 `max-w-[calc(100%-2rem)]` 这道留边闸门，而 `Compare` 传 `max-w-5xl`、`GroupCompare` 传 `max-w-6xl`，同一个 `max-width` 属性**后者把前者整个丢掉**，留边跟着没了；窗口 1000 px 时 72rem 根本够不着，`w-full` 于是真的铺满、两边各剩 4 px。改成调用方给 `w-[64rem]` / `w-[72rem]`（同宽，但占 `width` 那一格，不和留边的 `max-width` 打架），基线留边同时 2rem → 4rem；`Settings` 早就是 `w-[600px]` 的写法，这次是把它变成规矩。WKWebView 实测 1000×760 下弹窗 936 px、**四边留边 32/32/68/67**，1600×1000 下按 72rem 封顶 1152 px。**一般形式：基线组件里凡是「兜底闸门」性质的类，都可能被调用方同属性的类静默顶掉**，而 `tsc` / clippy / 构建全绿——给这类类加注释说清「要覆盖请改用哪个属性」，比指望下一个人记得 tailwind-merge 的规则可靠。另：产物 CSS 里逐条 `grep` 过 `grid-auto-rows:max-content` / `aspect-ratio:var(--aspect-video)` / `calc(100% - 4rem)`——**构建成功不等于 Tailwind 真发了这个类**。**改完 16/9 用户又报「图片错乱」——D-222 那一改把一个一直都在的 bug 从隐形变成了显形**（D-224）。这次不再手写 CSS 复现：**把编译出来的 `dist/assets/*.css` 链进去、用产品里一模一样的类名渲染真实 DOM**，再喂 WKWebView，一次量出——**图片区 588 px 宽而格子只有 443 px**。链条是：图在流内时它的 `height: 100%` 解不出来（父级高度要由 `aspect-ratio` 反推，对 WebKit 是不定高），退回 `height: auto` 取图片自己的比例撑出 331 px，**父级高度反过来被这张图撑出来、`aspect-video` 整个失效**，而 `aspect-ratio` 只剩一个方向还生效：由高 331 反推出宽 588，比格子宽 145 px，压到路径和体积上面。改法是大图一律 **`absolute inset-0 size-full object-contain`**——绝对定位把图移出流，高度才轮得到 `aspect-video` 说了算；**这正是 `Compare.tsx` 一直以来的写法**，不是新发明，是把已验过的写法用回来（实测 441×248 = 16/9 整）。顺带证伪两条更顺手的改法：`w-full` 只治宽度（高度仍被图撑成 4:3），`max-h-full` 和 `height:100%` 一样解不出来（反而溢出 83 px）。**提醒 56：量布局要量到最里层那个元素，别停在容器上。** 这个 bug 在 `aspect-[4/3]` 时期就存在，只是语料里的照片正好 1440×1080＝4:3，**图自己撑出来的高度和 4/3 算出来的分毫不差**，屏幕上看不出任何异常；**而 D-222 那一轮的验证本来能抓住它，却量了 `.img` 容器没量里面的 `<img>`**——容器比例 1.78 没错，里面的图早就不听话了。这是提醒 42「素材必须能把两种做法区分开」在布局上的同一副面孔。**这一类缺陷任何自动化门禁都抓不到**，验收并进 §12 那条的第 ⑬⑭⑮ 项 |
+| 2026-08-10 | **ADR-033**：**发布 1.0 + 打 tag 就出包**（版本号四处 `0.1.0` → **`1.0.0`**；新增 `.github/workflows/ci.yml`、`.github/workflows/release.yml`、`.github/release-notes.md`、`LICENSE`）。决议 **D-225~D-230**，零新增运行期依赖。起因是 v1 的功能与验收早已做完（M6 九项 + 基准 22），仓库里却还写着 `0.1.0`、没有 tag、没有 release、没有任何 CI，README 顶上的「下载」徽章点进去是空的。**动手前用实验钉死了一条会决定方案形状的事实**：把 `src-tauri/binaries/` 挪开跑 `cargo check`，报的是 `resource path 'binaries/ffmpeg-aarch64-apple-darwin' doesn't exist`——链条在 `tauri-build-2.6.3/src/lib.rs:62` 的 `for src in binaries { let src = src?; }`，而它是**构建脚本**，于是缺 sidecar 时 `check`/`build`/`test`/`clippy` **全都过不去**，不是打包那一步才报；**门禁那条流水线因此也必须先 `pnpm sidecars`**。方案：**版本号以文件为准、tag 只是引用**，CI 第一步纯 shell 断言 `${GITHUB_REF_NAME#v}` 与三处逐个相等，不等就 `exit 1`（D-225）——放最前面是因为漏改一处的表现是「发出去的包版本号不对」，而那时候已经烧掉半小时编译，**要红就得在头一分钟红**；空跑两向验过（`v1.0.0` 放行 / `v9.9.9` 正确地红），顺带试出 `node -p "require('./x.json').version"` 在 `"type": "module"` 仓库里照样能用。**不写 `release.sh`**：一年发几次，拿一个必须长期维护的脚本换一次手改不值。**门禁与发版拆成两条**（D-226），tag 指向的 commit 早在 push 到 main 时过过一遍门禁，发版再跑一遍等于白等一轮 debug 编译；`-D warnings` 不是洁癖——`clippy.toml` 里 `trash::delete` 那条护栏（D-164）只有在告警变成错误时才拦得住 CI。**release.yml 故意只挂 tag、不加 `workflow_dispatch`**（D-227）：从分支手动跑时 `github.ref_name` 是**分支名**，tauri-action 会照着建一个叫 `main` 的 release，而删 tag 可逆、误建 release 不可逆。sidecar 走 `actions/cache@v4`，**key 取 `hashFiles('scripts/fetch-sidecars.sh')`**（D-228）——脚本里写死了上游 build id 和两个 SHA256，脚本不变即 sidecar 不变，这个 key 是精确的；命中缓存时 `pnpm sidecars` 只校验 SHA 跳过下载但**自检照跑**，等于每次发版白得一道 sidecar 完整性闸门。**发版说明单独成文件 + `{{VERSION}}` 占位**（D-229，改文案不用重打 tag，也不会因缩进弄坏 YAML；生成时顺手删掉顶格注释块），其中 **Gatekeeper 那段是用户点名要的**：说清「已损坏」是措辞问题不是真坏了（D-17 不做公证）、**别再教人「右键 → 打开」**（macOS 15 已移除，实测弹窗只有 [完成]/[移到废纸篓]，ADR-021 §14）、给出唯一有效的 `xattr -dr com.apple.quarantine` 并说清它在做什么 + 只对确认过来源的应用这么做 + 不放心就自己构建，另附随包 ffmpeg 的 **GPLv3+ 与源码获取方式**（**分发义务不是客气话**，D-30）。补 `LICENSE`（D-230）：此前 README 徽章、README §许可证、发版说明三处都写着 MIT，**仓库里却没有授权文本**、`api.github.com` 报 `license: null`；文件里同时写清 MIT 只管本仓库、随包 ffmpeg 按 GPLv3+ 各管各的那一部分。**不等 CI 本地先打了一遍 1.0.0**（提醒 24「配置是两行，验证是全部」）：`ZigZag_1.0.0_aarch64.dmg` **62.68 MiB**、`Signature=adhoc` + `flags=0x10002(adhoc,runtime)`、`--verify --deep --strict` 通过、`Contents/MacOS/` 下 ffmpeg+ffprobe 俱在、`CFBundleShortVersionString` = 1.0.0——**dmg 的名字动手时还是推断**（旧包叫 `zigzag_0.1.0_…`，`productName` 后来改过大小写），打完包一对恰好与文案一致、不用回填，但「先打包再定稿文案」这个顺序不能省。本地门禁：typecheck 通过 / clippy exit 0 零告警 / `cargo test --lib` **497 项通过 0 失败 56 忽略**；两个工作流过 `yaml.safe_load`。**最大未知数是 3 vCPU / 7 GB 的 runner 上跑 `lto = true` + `codegen-units = 1`**（本机 3m53s，估计 30~60 min，且内存峰值可能撞 7 GB），`timeout-minutes` 放到 120，真 OOM 的退路是 CI 单独一个 `lto = "thin"` 但**不预先改**——那等于拿没验证过的猜测换掉已验证过的 profile。tag 由**用户本人推**（本机 `gh` 未登录，且推上去就是公开发布），CI 绿灯 / Releases 页 / 真机下载走 quarantine 三条验收并进 §12 那条 |
  
 ---
 
@@ -5115,7 +5287,7 @@ D-224 改完拿重新构建的那份 CSS 在 WKWebView 里复量（1000×723）�
 - **ADR-002 的 §3~§12 是活文档** —— 它们是当前设计的唯一事实来源，被后续 ADR 推翻时**就地更新**并标注来源（如「(D-13)」「ADR-003 修订」）。宁可就地改，也不要留下半篇过期的架构描述让人踩坑。
 - **每次工作结束前必须更新**：§12 勾选状态 + 文末 CHANGELOG 追加一行。
 
-**当前状态**：**v1 已交付**——**M0 ~ M6 全部完成**（ADR-007~ADR-021），交付后又做了三轮：**首页布局与交互链路重做**（ADR-023）、**试用反馈修复**（ADR-024，`tasks.md` 六条）、**扫描报告页重做**（ADR-025），后两轮的十四项真机 GUI 验证已于 **ADR-026** 全部跑完（一项验出来是坏的，已修）。§12 任务清单**无未勾选项**。三条压缩管线都已闭环并汇到同一个原子提交出口（校验 → no-gain 闸门 → 时间戳继承 → rename → fsync 父目录），上面接了调度器，再上面接了界面——**扫描 → 报告 → 开始 → 队列 → 重试这条主链路已经能整条走通**：
+**当前状态**：**v1 已交付**——**M0 ~ M6 全部完成**（ADR-007~ADR-021），交付后又做了三轮：**首页布局与交互链路重做**（ADR-023）、**试用反馈修复**（ADR-024，`tasks.md` 六条）、**扫描报告页重做**（ADR-025），后两轮的十四项真机 GUI 验证已于 **ADR-026** 全部跑完（一项验出来是坏的，已修）。**版本号已推到 1.0.0，发版流水线已就位**（ADR-033）。§12 任务清单**还剩两条没勾**，都在等真机/真环境验收：ADR-031~032 那条并排对比的十五项 GUI 走查，和 ADR-033 那条发版的三项（CI 绿灯 / Releases 页 / 下载后走 quarantine）——**代码侧的门禁两条都已经过了，缺的只是人去点**。三条压缩管线都已闭环并汇到同一个原子提交出口（校验 → no-gain 闸门 → 时间戳继承 → rename → fsync 父目录），上面接了调度器，再上面接了界面——**扫描 → 报告 → 开始 → 队列 → 重试这条主链路已经能整条走通**：
 
 - **图片**：静态图（`image` 解码，失败转 ImageIO 兜底 → 朝向烘焙 → 短边缩放 → 进程内 libavif + ICC/EXIF/XMP 注入）与动图（ffmpeg 9.0 转动画 AVIF）。
 - **视频**：ffprobe 探一次 → 按字幕定容器 → x265 / VideoToolbox 编码 → **VMAF 抽样门禁** → 提交。
@@ -5135,15 +5307,17 @@ D-224 改完拿重新构建的那份 CSS 在 WKWebView 里复量（1000×723）�
 
 **M6-8 顺带修掉的那个 bug 值得单独看一眼**（ADR-021 §16）：「退出后可续跑」这条写在 README 首页的承诺，此前在界面上**根本不存在**——`resumable_job()` 在 DB 层做好了、有单测、有注释说明用途，但没有命令、没有 IPC 绑定、启动时没人问，于是崩溃或退出之后队列页一律显示「还没有任务」，用户只能重扫。补上那一跳之后，崩溃退出与正常退出两条路都已在打包好的 `.app` 上实跑验过。
 
-**打好的包在 `src-tauri/target/aarch64-apple-darwin/release/bundle/`**：`macos/zigzag.app`（144 MB）与 `dmg/zigzag_0.1.0_aarch64.dmg`（61.7 MiB）。**Gatekeeper 会拒绝**（ad-hoc 签名，D-17 不做公证），且 macOS 15 已移除「右键 → 打开」——要跑打包产物先 `xattr -dr com.apple.quarantine <path>`，否则会以为应用坏了。改动过 sidecar 相关代码之后，**别只跑单测就宣布打包没问题**：ffmpeg/ffprobe 在 `.app` 里的路径与 dev 下不同，那一段只有拿 `.app` 实跑才测得到（ADR-021 §14）。
+**打好的包在 `src-tauri/target/aarch64-apple-darwin/release/bundle/`**：`macos/ZigZag.app`（144 MB）与 `dmg/ZigZag_1.0.0_aarch64.dmg`（62.68 MiB）。**Gatekeeper 会拒绝**（ad-hoc 签名，D-17 不做公证），且 macOS 15 已移除「右键 → 打开」——要跑打包产物先 `xattr -dr com.apple.quarantine <path>`，否则会以为应用坏了。改动过 sidecar 相关代码之后，**别只跑单测就宣布打包没问题**：ffmpeg/ffprobe 在 `.app` 里的路径与 dev 下不同，那一段只有拿 `.app` 实跑才测得到（ADR-021 §14）。
 
-`cargo test` **476 项通过**（默认档）+ `--ignored` 47 项真实素材，另有 8 项基准单列；clippy 零告警，`tsc --noEmit` 与 `vite build` 通过，应用实机启动无报错。
+**发版走 CI，不要在本机手搓**（ADR-033）：三处版本号（`package.json` / `tauri.conf.json` / `Cargo.toml`）一起改完再 `git tag -a vX.Y.Z && git push origin vX.Y.Z`，`.github/workflows/release.yml` 会断言 tag 与三处一致（不一致头一分钟就红）、取 sidecar、打包、建 release。发版说明的正文在 `.github/release-notes.md`（`{{VERSION}}` 会被替换），**改它不用重打 tag**。另注意：**缺了 `src-tauri/binaries/` 连 `cargo check` 都过不去**（`tauri-build` 的构建脚本要拷 externalBin），所以新克隆的仓库第一件事是 `pnpm sidecars`，不是 `cargo test`。
+
+`cargo test` **497 项通过 / 56 忽略**（默认档，7.5 s；忽略的是要真实素材那批）；clippy `-D warnings` 零告警，`tsc --noEmit` 与 `vite build` 通过，应用实机启动无报错。这三道现在也是 `.github/workflows/ci.yml` 的内容，push / PR 到 `main` 会自动跑。
 
 **跑测试的三档**（ADR-016）：`cargo test`（7 s，不碰素材）／`cargo test -- --ignored --skip bench_`（46 s，真实编解码）／`cargo test --release -- --ignored bench_`（约 16 min，基准 11/12/13）。素材在仓库的 `fixtures/`（不进 git，`ZIGZAG_MEDIA` 可改指），**缺件即红灯**。
 
-**没有必做项。** ADR-024 §7 的六项与 ADR-025 §6 的八项 GUI 验证已于 2026-08-09 全部跑完（ADR-026），其中 ADR-024 #2 验出来是坏的、已修并补了回归测试（D-194）。**唯一挂着的一笔是 D-195**：整页重载之后界面回不到正在跑的任务（`commands/job.rs:136` 的 `job_resumable` 见到本进程有任务就返回 `None`），本轮判定为**留档不修**——触发器在产品包里只剩 WebKit 渲染进程崩溃，而正经修法是给前端补一条「重新挂载」的路，不是把那个 `return None` 删掉（删了会把正在跑的任务显示成可续跑，点「继续」被后端顶回来，比现在更糟）。接手的 agent 要动手之前先看 §12 的「v2 候选（明确不进 v1）」，那是唯一有共识的待办池；另外 ADR-021 §17.11（D-163，按像素预算限流）记着一个**有意不做**的改进和它该被重新提起的信号。改动任何代码之前，先跑一遍下面「跑测试的三档」确认基线是绿的。
+**没有必做的代码项，但有两笔挂在人身上**：§12 末尾那两条未勾选项（ADR-031~032 的十五项并排对比 GUI 走查；ADR-033 的三项发版验收）都只能由用户在真机上点/推，**不要替他打勾，也不要因为「本地门禁全绿」就当它们过了**——这两轮各自的根因（WebKit 压行、`<img>` 撑父级）恰恰都是自动化门禁抓不到的那一类。ADR-024 §7 的六项与 ADR-025 §6 的八项 GUI 验证已于 2026-08-09 全部跑完（ADR-026），其中 ADR-024 #2 验出来是坏的、已修并补了回归测试（D-194）。**唯一挂着的一笔是 D-195**：整页重载之后界面回不到正在跑的任务（`commands/job.rs:136` 的 `job_resumable` 见到本进程有任务就返回 `None`），本轮判定为**留档不修**——触发器在产品包里只剩 WebKit 渲染进程崩溃，而正经修法是给前端补一条「重新挂载」的路，不是把那个 `return None` 删掉（删了会把正在跑的任务显示成可续跑，点「继续」被后端顶回来，比现在更糟）。接手的 agent 要动手之前先看 §12 的「v2 候选（明确不进 v1）」，那是唯一有共识的待办池；另外 ADR-021 §17.11（D-163，按像素预算限流）记着一个**有意不做**的改进和它该被重新提起的信号。改动任何代码之前，先跑一遍下面「跑测试的三档」确认基线是绿的。
 
-决议编号已用到 **D-224**，新决议从 D-225 起；**ADR 已用到 ADR-032，新的从 ADR-033 起**；**提醒已用到 56**（44 起的几条只作为各自 ADR 里的引用块存在，没有回填到文末那份 1~43 的清单）；风险编号已用到 **R22（已结案）**；基准测试编号已用到 **23**（基准 8 的规格在 §12.1，执行结果落为**基准 22**，见 ADR-021 §17；**基准 23** 是感知指纹的重标定，见 ADR-031）。
+决议编号已用到 **D-230**，新决议从 D-231 起；**ADR 已用到 ADR-033，新的从 ADR-034 起**；**提醒已用到 56**（44 起的几条只作为各自 ADR 里的引用块存在，没有回填到文末那份 1~43 的清单）；风险编号已用到 **R22（已结案）**；基准测试编号已用到 **23**（基准 8 的规格在 §12.1，执行结果落为**基准 22**，见 ADR-021 §17；**基准 23** 是感知指纹的重标定，见 ADR-031）。
 
 **无阻塞项。留给后续里程碑的提醒**：
 1. ADR-010 §5 实测「已被 WebP 压实的图转 AVIF 反向膨胀 113%」——no-gain 在归档盘上是**常态路径**而非边角情况。三条管线现在都接了这道闸门（视频侧另加 VMAF 门禁）。

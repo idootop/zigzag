@@ -1,0 +1,67 @@
+# 每次 push / PR 到 main 都跑的门禁。
+name: CI
+
+# 三道：前端类型、clippy、Rust 单测。
+#
+# 跑在 macOS 上不是图省事：`platform/` 那一层是 CGImageSource / AudioToolbox /
+# NSFileManager，换个系统根本编不过。runner 只能是 arm64（`macos-latest`）。
+#
+# 发版那条流水线（release.yml）不重复这三道——它由 tag 触发，而 tag 指向的 commit
+# 早在 push 到 main 时就被这里过了一遍；再跑一遍等于让每次发版白等一轮 debug 编译。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.0.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # 和 release.yml 用同一个 key，两条流水线共享同一份缓存。
+      - uses: actions/cache@v4
+        with:
+          path: src-tauri/binaries
+          key: sidecars-${{ hashFiles('scripts/fetch-sidecars.sh') }}
+
+      - run: pnpm install --frozen-lockfile
+
+      # 这一步不是只有打包才需要：tauri-build 的构建脚本会把 externalBin 拷进
+      # target/，路径不存在就直接报 `resource path 'binaries/ffmpeg-…' doesn't exist`，
+      # 于是**连 `cargo check` 都过不去**。实测确认过（ADR-033）。
+      - run: pnpm sidecars
+
+      - run: pnpm typecheck
+
+      # `-D warnings` 是必须的：clippy.toml 里 `trash::delete` 那条 disallowed-methods
+      # 护栏（D-164，那个 bug 差点把删除路径永久搞坏）只有在告警变成错误时才拦得住 CI。
+      - run: cargo clippy --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+      # 默认档不碰 fixtures/（200 MB 素材不进 git，用素材的用例一律 #[ignore]），
+      # 所以 CI 上跑得动。`--ignored` 那批真实编解码和基准要专机，不进 CI。
+      - run: cargo test --lib --manifest-path src-tauri/Cargo.toml
