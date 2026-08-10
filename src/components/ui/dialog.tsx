@@ -35,7 +35,10 @@ function DialogContent({
       <DialogPrimitive.Content
         data-slot="dialog-content"
         className={cn(
-          "fixed top-1/2 left-1/2 z-50 flex w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 flex-col gap-4 rounded-xl border bg-background p-4 shadow-lg duration-150 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
+          // 留边靠 `max-w-[calc(100%-4rem)]`：调用方要放宽请给 `w-[Nrem]`（Settings
+          // 就是这么写的），**别给 `max-w-*`**——tailwind-merge 会把同一属性的前一个类
+          // 整个丢掉，于是这道留边的闸门跟着一起没了，弹窗贴着窗口两边（ADR-032）。
+          "fixed top-1/2 left-1/2 z-50 flex w-full max-w-[calc(100%-4rem)] -translate-x-1/2 -translate-y-1/2 flex-col gap-4 rounded-xl border bg-background p-4 shadow-lg duration-150 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
           className
         )}
         {...props}

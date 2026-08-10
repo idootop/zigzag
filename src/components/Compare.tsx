@@ -51,6 +51,7 @@ export function Compare({
   src,
   dst,
   mode = "compress",
+  action,
   onClose,
 }: {
   /** 左边那个文件的绝对路径。 */
@@ -58,6 +59,14 @@ export function Compare({
   /** 右边那个；没有第二个文件时传 `null`，退化成单图。 */
   dst: string | null;
   mode?: CompareMode;
+  /**
+   * 标题右边的动作按钮，没有就不画。
+   *
+   * 做成插槽而不是把「只留这张」直接写进来：这一屏在压缩队列和去重复核两处都用，
+   * 而「留哪张」只在去重那边成立。看清楚之后要能当场落地，否则人得记着刚才看到
+   * 了什么、关掉窗、再回列表里找回那一行——判断和动作隔得越远，越容易点错。
+   */
+  action?: React.ReactNode;
   onClose: () => void;
 }) {
   const labels = LABELS[mode];
@@ -105,12 +114,19 @@ export function Compare({
 
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="max-w-5xl gap-3">
-        <div className="pr-8">
-          <DialogTitle className="truncate font-mono">{basename(src)}</DialogTitle>
-          <DialogDescription className="mt-1">
-            {error ? "读不出来" : caption(data, labels)}
-          </DialogDescription>
+      {/* `w-[64rem]` 而不是 `max-w-5xl`：同宽，但不会顶掉基线上那条留边的
+          `max-w-[calc(100%-4rem)]`（ADR-032）。 */}
+      <DialogContent className="w-[64rem] gap-3">
+        {/* `pr-8` 给右上角那颗关闭按钮让位；动作按钮 `shrink-0`，否则长文件名
+            会把它挤没。 */}
+        <div className="flex items-start gap-3 pr-8">
+          <div className="min-w-0 flex-1">
+            <DialogTitle className="truncate font-mono">{basename(src)}</DialogTitle>
+            <DialogDescription className="mt-1">
+              {error ? "读不出来" : caption(data, labels)}
+            </DialogDescription>
+          </div>
+          {action && <div className="shrink-0">{action}</div>}
         </div>
 
         {error ? (
