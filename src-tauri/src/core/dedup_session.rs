@@ -297,13 +297,30 @@ mod tests {
         assert_eq!(second.groups, first.groups, "命中缓存不能改变结论");
     }
 
+    /// 一张合成的小 PNG。
+    ///
+    /// **这条路要的只是「一张解得开的图」，不是照片内容**：两份拷贝字节相同，
+    /// 指纹必然相同、距离必然是 0，画的是什么都不影响结论。所以不借
+    /// `fixtures/` 的真素材——那样这条用例就得挂 `#[ignore]`（ADR-016），
+    /// 而它守的是 D-113 那条**数据安全**规矩，正是最该在 CI 上每次都跑的一类。
+    fn png_bytes() -> Vec<u8> {
+        let img = image::RgbImage::from_fn(256, 256, |x, y| {
+            image::Rgb([x as u8, y as u8, (x + y) as u8])
+        });
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        buf.into_inner()
+    }
+
     #[test]
     fn perceptual_never_preselects_anything() {
         // D-113：感知相似是概率判断，机器不该替用户勾任何一条。
         let d = tmp("perceptual");
-        let src = crate::testutil::media("image/iphone.jpg");
-        fs::copy(&src, d.0.join("one.jpg")).unwrap();
-        fs::copy(&src, d.0.join("two.jpg")).unwrap();
+        let png = png_bytes();
+        put(&d, "one.png", &png);
+        put(&d, "two.png", &png);
 
         let db = Db::open_in_memory().unwrap();
         let r = run(

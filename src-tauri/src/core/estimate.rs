@@ -548,7 +548,32 @@ mod tests {
         }
         let serial = one.seconds.mid * 96.0;
         assert!(est.light_seconds.mid > serial - 1e-6, "分项耗时保持单线程口径，供界面显示");
-        assert!(est.seconds.mid < serial / 2.0, "墙钟必须折掉并发：串行 {serial:.1}s vs 预估 {:.1}s", est.seconds.mid);
+        // 折多少取决于**这台机器**的闸门宽度，所以拿 `gates()` 算，不写死倍数。
+        // 原先写的是「至少快一半」，那是把开发机的核数偷偷写进了断言：闸门是
+        // `ncpu-2`，3 核的 CI runner 上它等于 1，`1^0.9 = 1`，**不折才是对的**
+        // ——一个工人本来就是串行，模型没错，错的是断言。4 核也一样过不去
+        // （闸门 2 → `2^0.9 = 1.87`，只快 46%）。
+        let expect = serial / (gates().light as f64).powf(LIGHT_SCALING_EXP);
+        assert!(
+            (est.seconds.mid - expect).abs() < 1e-6,
+            "墙钟必须按闸门宽度折并发：闸门 {} / 串行 {serial:.1}s / 预估 {:.1}s / 应为 {expect:.1}s",
+            gates().light,
+            est.seconds.mid
+        );
+    }
+
+    #[test]
+    fn a_wide_light_gate_folds_the_wall_clock_by_a_lot() {
+        // 上一条在窄机器上会退化成恒等式（闸门 1 时 expect == serial），于是
+        // **CI 上恰恰盖不住 96 张照片那个场景**。所以这里把「闸门宽的时候到底
+        // 折掉多少」单独钉死，纯算术，不看跑在哪台机器上。
+        //
+        // 基准 13：8 路并跑时一盘照片的墙钟约是串行的 1/6.5。ETA 报大六七倍
+        // 那个回归，症状就是这个折算因子退回 1。
+        let fold = |gate: usize| (gate as f64).powf(LIGHT_SCALING_EXP);
+        assert!((fold(8) - 6.498).abs() < 0.01, "十核机（闸门 8）该折约 6.5 倍，实为 {}", fold(8));
+        assert!((fold(1) - 1.0).abs() < 1e-9, "闸门 1 就是串行，一点都不该折");
+        assert!(fold(2) < 2.0, "折算带次线性衰减，不是理想的线性加速");
     }
 
     #[test]

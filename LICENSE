@@ -24,6 +24,11 @@ SOFTWARE.
 
 本仓库自身按 MIT 分发。**但发布出来的安装包不止有本仓库的代码**：`.app` 里随包的
 `ffmpeg` / `ffprobe` 是第三方静态构建，带 `--enable-gpl --enable-version3`，
-因此那两个二进制按 **GPLv3+** 分发，来源与对应源码见 `scripts/fetch-sidecars.sh`
-的头注释与 `.github/release-notes.md`。ZigZag 以子进程方式调用它们（聚合而非链接），
+因此那两个二进制按 **GPLv3+** 分发。ZigZag 以子进程方式调用它们（聚合而非链接），
 故本仓库的 MIT 与它们的 GPLv3+ 各管各的那一部分。
+
+随包二进制的来源与版本写在 `scripts/fetch-sidecars.sh` 的头注释里（含上游 build id
+与两个 SHA256）：
+
+- 二进制：https://ffmpeg.martin-riedl.de/download/macos/arm64/ （build `1785863997_9.0`）
+- 对应源码：ffmpeg 9.0，https://git.ffmpeg.org/ffmpeg.git

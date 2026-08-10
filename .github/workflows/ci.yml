@@ -26,12 +26,20 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: pnpm/action-setup@v4
+      # action 一律取跑 node24 运行时的那个大版本：checkout / setup-node / cache /
+      # action-setup 的 v4 都还是 `using: node20`，GitHub 已经废弃 node20，跑起来
+      # 每一步都挂一条 deprecation 警告。`Swatinem/rust-cache@v2` 与
+      # `tauri-apps/tauri-action@v1` 在各自的 tag 内已经换成 node24，不用动；
+      # `dtolnay/rust-toolchain` 是 composite，压根没有 node 运行时。
+      #
+      # `node-version: 24` 是另一回事（这是**装给项目用**的 node，不是 action 的运行时），
+      # 24 是当下的 Active LTS——22 已进维护期，26 还没发。
+      - uses: pnpm/action-setup@v6
         with:
           version: 11.0.9
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: pnpm
@@ -43,8 +51,12 @@ jobs:
         with:
           workspaces: src-tauri
 
-      # 和 release.yml 用同一个 key，两条流水线共享同一份缓存。
-      - uses: actions/cache@v4
+      # 和 release.yml 用同一个 key，但**共享是单向的**：GitHub 只让一次运行恢复
+      # 「当前 ref 或默认分支」上创建的缓存，所以 main 上这一条存的，tag 上的发版
+      # 读得到；tag 上存的，main 读不到、下一个 tag 也读不到（实测见 ADR-033 §13）。
+      # 换句话说**缓存是靠这条门禁攒的**，而且它红的时候一份都不会存
+      # （`actions/cache` 的 post 步骤是 `post-if: success()`）。
+      - uses: actions/cache@v6
         with:
           path: src-tauri/binaries
           key: sidecars-${{ hashFiles('scripts/fetch-sidecars.sh') }}

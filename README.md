@@ -37,8 +37,7 @@
 
 到 [Releases](https://github.com/idootop/zigzag/releases) 下载 `.dmg`，拖进「应用程序」。
 
-首次打开如果提示「已损坏，无法打开」，不是真的坏了——这个应用没有向苹果交费做认证，
-macOS 会先拦一下。打开「终端」执行一次即可，之后正常双击：
+首次打开如果提示「已损坏，无法打开」，打开「终端」执行一次即可，之后正常双击：
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/ZigZag.app

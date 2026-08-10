@@ -31,7 +31,7 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # 版本号散在三个文件里，漏改一个的表现是「发出去的包版本号不对」，而那时候
       # 已经烧掉半小时编译。所以这一条放在最前面：要红就在头一分钟红。
@@ -52,10 +52,11 @@ jobs:
             fi
           done
 
-      - uses: pnpm/action-setup@v4
+      # action 版本的选取口径见 ci.yml 里那段注释：一律取跑 node24 运行时的大版本。
+      - uses: pnpm/action-setup@v6
         with:
           version: 11.0.9
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: pnpm
@@ -69,7 +70,7 @@ jobs:
 
       # sidecar 约 126 MB，不进 git。key 取 fetch-sidecars.sh 的哈希：脚本里写死了
       # 上游 build id 和两个 SHA256，脚本不变就等于 sidecar 不变——这个 key 是精确的。
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: src-tauri/binaries
           key: sidecars-${{ hashFiles('scripts/fetch-sidecars.sh') }}
