@@ -604,7 +604,7 @@ mod tests {
         let run = db.create_dedup_run(&[], "perceptual", Some(12)).unwrap();
         let g = SimilarGroup {
             seed: cand("/seed.jpg", 300, 1),
-            seed_fingerprint: crate::dedup::perceptual::Fingerprint(0x0123_4567_89ab_cdef),
+            seed_fingerprint: crate::dedup::perceptual::Fingerprint([0xab; 32]),
             others: vec![(cand("/near.jpg", 200, 2), 3), (cand("/far.jpg", 100, 3), 11)],
         };
         db.save_dedup_groups(run, &[(&g).into()]).unwrap();

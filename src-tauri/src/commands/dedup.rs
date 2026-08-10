@@ -74,6 +74,16 @@ pub struct PendingRemovals {
 /// 最多往 `notes` 里塞几条。
 const MAX_NOTES: usize = 20;
 
+/// 把界面传来的阈值夹回标定过的范围里（基准 23）。
+///
+/// 滑杆的两端在前端也写了一份，但那份只是遥控器：常量哪天飘了、或者有人直接调
+/// 这个命令，都不该有办法把分组赶进噪声区——[`MAX_DISTANCE`] 之上就是实测的
+/// 假配对区间，越过去就会把毫不相干的照片凑成一组（ADR-031）。
+fn clamp_threshold(v: Option<u32>) -> u32 {
+    use crate::dedup::perceptual::{DEFAULT_MAX_DISTANCE, MAX_DISTANCE, MIN_DISTANCE};
+    v.unwrap_or(DEFAULT_MAX_DISTANCE).clamp(MIN_DISTANCE, MAX_DISTANCE)
+}
+
 /// 开始查重。立刻返回，进度走事件。
 #[tauri::command]
 pub fn dedup_start(
@@ -91,7 +101,7 @@ pub fn dedup_start(
     };
 
     let db = state.db.clone();
-    let threshold = threshold.unwrap_or(crate::dedup::perceptual::DEFAULT_MAX_DISTANCE);
+    let threshold = clamp_threshold(threshold);
     // 用阻塞线程而不是 async 任务：查重全是同步的 CPU/IO，丢进 async 运行时
     // 会把它的工作线程占死，其他命令跟着一起卡住。
     std::thread::spawn(move || {
@@ -344,6 +354,16 @@ mod tests {
         let t = Throttle::new();
         assert!(t.ready(), "第一条必须立刻放行");
         assert!(!t.ready(), "紧接着的要被拦住");
+    }
+
+    #[test]
+    fn a_threshold_from_the_ui_cannot_reach_the_noise_floor() {
+        use crate::dedup::perceptual::{DEFAULT_MAX_DISTANCE, MAX_DISTANCE, MIN_DISTANCE};
+        assert_eq!(clamp_threshold(None), DEFAULT_MAX_DISTANCE, "没给就用标定过的默认值");
+        assert_eq!(clamp_threshold(Some(DEFAULT_MAX_DISTANCE)), DEFAULT_MAX_DISTANCE);
+        // 越界的一律夹回来。往上越界最要命：MAX_DISTANCE 之上就是实测的假配对区间。
+        assert_eq!(clamp_threshold(Some(0)), MIN_DISTANCE);
+        assert_eq!(clamp_threshold(Some(u32::MAX)), MAX_DISTANCE);
     }
 
     #[test]

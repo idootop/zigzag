@@ -40,11 +40,25 @@ const PAGE = 100;
 
 const NOTHING_PENDING: PendingRemovals = { count: 0, bytes: 0 };
 
+/**
+ * 相似度滑杆的三个数，单位是 256 位指纹上的汉明距离。
+ *
+ * 全部由基准 23 在真实照片上标定（`dedup/perceptual.rs`，后端还会再夹一道）：
+ *
+ * - `default` 16：缩放/重编码/提亮这类「同一张图的另一个版本」实测最多差 5 位，
+ *   留了 3 倍余量；离实测的假配对最小值 62 还差 3.9 倍。
+ * - `min` 4：再严也没意义，上面那几类一位都不会漏。
+ * - `max` 56：刚够到「裁掉一圈边」那一类（实测最大 54），且仍在 62 之下。
+ *   推到头也不该出现两张不相干的照片成组——那正是 ADR-031 修掉的毛病。
+ * - `step` 4：256 位刻度上一位一格没有意义，14 格好拖。
+ */
+export const THRESHOLD = { min: 4, max: 56, step: 4, default: 16 } as const;
+
 interface DedupState {
   phase: DedupPhase;
   roots: string[];
   mode: DedupMode;
-  /** 感知模式的汉明距离阈值。精确模式不用。 */
+  /** 感知模式的汉明距离阈值（256 位指纹上的位数）。精确模式不用。 */
   threshold: number;
 
   progress: DedupProgress | null;
@@ -73,6 +87,8 @@ interface DedupState {
   resume: () => Promise<void>;
   loadMore: () => Promise<void>;
   toggleKeep: (memberId: number, keep: boolean) => Promise<void>;
+  /** 只留这一条，同组其余的全勾成「删掉」。并排对比里挑完就是这一步。 */
+  keepOnly: (groupId: number, memberId: number) => Promise<void>;
   choosePolicy: (policy: Policy) => Promise<void>;
   apply: () => Promise<void>;
   discard: () => Promise<void>;
@@ -97,7 +113,9 @@ export const useDedup = create<DedupState>((set, get) => ({
   phase: "idle",
   roots: [],
   mode: "exact",
-  threshold: 10,
+  // 这几个数都由基准 23 标定，后端 `clamp_threshold` 才是权威，这里只是初值。
+  // 改之前先跑 `bench_perceptual_calibration`：它会红。
+  threshold: THRESHOLD.default,
 
   progress: null,
   report: null,
@@ -212,6 +230,37 @@ export const useDedup = create<DedupState>((set, get) => ({
     } catch (e) {
       // 落库失败就把本地改回去，别让界面显示一个库里没有的状态。
       set((s) => ({ groups: patchMember(s.groups, memberId, { keep: !keep }), error: toIpcError(e) }));
+    }
+  },
+
+  keepOnly: async (groupId, memberId) => {
+    const { run, groups } = get();
+    if (!run) return;
+    const group = groups.find((g) => g.id === groupId);
+    if (!group) return;
+    // 已经处置过的不碰：它的文件早就不在原处了，再改勾选只会让界面说谎。
+    const changes = group.members
+      .filter((m) => m.disposal === null && m.keep !== (m.id === memberId))
+      .map((m) => ({ id: m.id, keep: m.id === memberId }));
+    if (changes.length === 0) return;
+
+    set((s) => ({
+      groups: changes.reduce((gs, c) => patchMember(gs, c.id, { keep: c.keep }), s.groups),
+    }));
+    try {
+      // 串行落库：一组撑死几条，而并发写同一张表只会让失败时更难说清改到哪儿了。
+      for (const c of changes) await ipc.dedupSetKeep(c.id, c.keep);
+      set({ pending: await ipc.dedupPending(run.id), policy: "manual" });
+    } catch (e) {
+      // 中途失败时本地已经全改了、库里只改了一半。以库为准重读这一整页，
+      // 别去猜断在哪一条上——勾选状态说错就等于把删除范围说错。
+      try {
+        const fresh = await ipc.dedupGroups(run.id, Math.max(PAGE, groups.length), 0);
+        set({ groups: fresh, pending: await ipc.dedupPending(run.id) });
+      } catch {
+        /* 重读也失败就只剩下报错，下面那行会说 */
+      }
+      set({ error: toIpcError(e) });
     }
   },
 

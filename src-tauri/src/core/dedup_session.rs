@@ -320,7 +320,12 @@ mod tests {
         let groups = db.list_dedup_groups(r.run_id, 50, 0).unwrap();
         assert!(groups[0].members.iter().all(|m| m.keep), "一条都不该被预先勾掉");
         assert!(db.dedup_plans(r.run_id).unwrap().is_empty(), "所以也没有任何删除计划");
-        assert_eq!(db.latest_dedup_run().unwrap().unwrap().threshold, Some(12));
+        // 用常量而不是字面量：阈值是标定出来的（基准 23），会随语料重标，
+        // 这条用例守的是「跑了哪个阈值就记哪个」，不是那个数本身。
+        assert_eq!(
+            db.latest_dedup_run().unwrap().unwrap().threshold,
+            Some(perceptual::DEFAULT_MAX_DISTANCE)
+        );
     }
 
     #[test]

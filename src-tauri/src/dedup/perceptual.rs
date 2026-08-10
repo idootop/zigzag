@@ -24,48 +24,82 @@ use image_hasher::{HashAlg, HasherConfig};
 use super::exact::Candidate;
 use crate::error::Result;
 
-/// 一张图的感知指纹，64 bit。
+/// 一张图的感知指纹，256 bit。
 ///
-/// 8×8 的哈希在实测里已经够用（基准 16），再大只是让阈值更难标定。
+/// 曾经是 8×8＝64 位。基准 23 在真实照片上量出来，64 位下**真假两类是重叠的**：
+/// 同一张图裁掉 5% 边要差到 14 位，而两张毫不相干的照片能近到 10 位——中间没有
+/// 任何一个阈值能把它们分开。16×16 之后同样两类是 54 与 62，才第一次有了干净区间。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Fingerprint(pub u64);
+pub struct Fingerprint(pub [u8; BYTES]);
+
+/// 指纹的字节数。`HASH_SIZE² / 8`。
+pub const BYTES: usize = 32;
 
 impl Fingerprint {
     /// 汉明距离：两份指纹有多少个 bit 不同。0 = 视觉上完全一致。
     pub fn distance(self, other: Self) -> u32 {
-        (self.0 ^ other.0).count_ones()
+        self.0.iter().zip(other.0.iter()).map(|(a, b)| (a ^ b).count_ones()).sum()
     }
 
     /// 十六进制，落库用。
     pub fn to_hex(self) -> String {
-        format!("{:016x}", self.0)
+        use std::fmt::Write;
+        self.0.iter().fold(String::with_capacity(BYTES * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
     }
 
     pub fn from_hex(s: &str) -> Option<Self> {
-        u64::from_str_radix(s, 16).ok().map(Fingerprint)
+        if s.len() != BYTES * 2 {
+            return None;
+        }
+        let mut out = [0u8; BYTES];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+        }
+        Some(Fingerprint(out))
     }
 }
 
-/// 默认阈值。由基准 16 §1 标定，见 PROGRESS.md ADR-020 §3。
+/// 默认阈值，256 位里的 16 位。由基准 23 标定，见 PROGRESS.md ADR-031。
 ///
-/// 实测干净区间是 `10..=14`（真配对最大 10、假配对最小 15），取中点 12，
-/// 两边各留 2 位余量。
+/// 挑这个数的依据是「同一张图的另一个版本」这一类实测要差多少位。语料是 51 张
+/// 真实照片（`ZZ_DEDUP_CORPUS`），其中 12 张各造 6 个变体，7251 对假配对：
 ///
-/// **别把这个 5 位的间隔当成安全垫。** 它是在 20 张底图、9310 对假配对上量的。
-/// 换到真实规模，64 位指纹在阈值 12 下的随机碰撞概率是 2.28e-7，于是（基准 16 §3，
-/// 随机指纹实测 1124 组 vs 理论 1142 对，对得上）：
+/// | 变体（中位/最大） | 8×8＝64 bit | 16×16＝256 bit |
+/// |---|---|---|
+/// | 缩到 50% / 25% | 0 / 0 | 0·1 / 0·1 |
+/// | JPEG q50 / q25 缩 50% | 1 / 1 | 1·3 / 0·5 |
+/// | 提亮 20 | 1 | 1·3 |
+/// | 非裁边真配对**最大** | **2** | **5** |
+/// | **裁掉 5% 边** | 5 / **14** | 34 / **54** |
+/// | 假配对最小 | **10** | **62** |
+/// | 假配对均值±σ | 31.9±6.5 | 127.7±20.0 |
 ///
-/// | 图库规模 | 纯靠巧合的误配 |
-/// |---|---|
-/// | 1 万 | 11 对 |
-/// | 10 万 | 1142 对 |
-/// | 100 万 | 114165 对 |
+/// 64 位那一列里 14 > 10，两类重叠，任何阈值都救不了；256 位第一次有了干净区间
+/// 5..=61。除裁边外全部 ≤5 位，所以 16 有 3× 余量；离假配对最小值 62 还有 3.9×
+/// （在假配对均值下方 5.6σ）。
 ///
-/// 也就是说十万张的盘上，**必然**有上千组「看着像其实无关」的提议。
-/// 这不是阈值没调好，是 64 位指纹的信息量就这么多。所以感知去重永远只
-/// 「提议」不「执行」：界面不预勾选、把距离标出来让人判断（见模块头注释）。
-/// 阈值调大只是多翻几屏，调小才会真漏。
-pub const DEFAULT_MAX_DISTANCE: u32 = 12;
+/// **裁边那一类吃掉了几乎全部阈值预算**，它不进默认值——想找裁过的版本，把滑杆
+/// 往上推到 [`MAX_DISTANCE`]。这也是 64 位时代那个 12 的由来：基准 16 把裁边算进
+/// 真配对，阈值被顶到 12，于是十万张的盘上必然有上千组纯属巧合的提议。
+///
+/// 感知去重仍然只「提议」不「执行」：界面不预勾选、把距离标出来让人判断
+/// （见模块头注释）。阈值调大只是多翻几屏，调小才会真漏。
+pub const DEFAULT_MAX_DISTANCE: u32 = 16;
+
+/// 滑杆的下限。再严也没有意义：上表里除裁边外的变体全在 5 位以内。
+pub const MIN_DISTANCE: u32 = 4;
+
+/// 滑杆的上限。刚好够到裁边那一类的最大值 54，且仍低于实测假配对最小值 62。
+///
+/// 只剩 6 位余量，所以它是**用户主动推到头**才到的位置，不是默认值：推到这儿
+/// 意味着「连裁过边的也帮我找出来」，代价是语料一大就可能开始有巧合。
+///
+/// 两端都由后端夹住（[`crate::commands::dedup`]），前端滑杆只是遥控器：
+/// 界面上的常量哪天飘了，也不该有办法把分组赶进噪声区。
+pub const MAX_DISTANCE: u32 = 56;
 
 /// 一组「看起来一样」的图。至少两条。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,13 +197,24 @@ pub fn of_image(img: &image::DynamicImage) -> Fingerprint {
 const ALG: HashAlg = HashAlg::Mean;
 const DCT: bool = false;
 
+/// 哈希网格的边长。16×16 = 256 位，理由见 [`Fingerprint`] 与 [`DEFAULT_MAX_DISTANCE`]。
+const HASH_SIZE: u32 = 16;
+
 fn hash_with(img: &image::DynamicImage, alg: HashAlg, dct: bool) -> Fingerprint {
+    hash_sized(img, alg, dct, HASH_SIZE)
+}
+
+/// [`hash_with`] 的可变宽度版本，给基准 23 跨宽度比对用。
+///
+/// `size` 不是 [`HASH_SIZE`] 时，返回的指纹只填了前 `size²/8` 个字节，后面是 0
+/// ——这在比较**同一宽度**的两份指纹时没有影响（都是 0，异或掉），跨宽度比才没意义。
+fn hash_sized(img: &image::DynamicImage, alg: HashAlg, dct: bool, size: u32) -> Fingerprint {
     // 每次都重建 Hasher：`HasherConfig::to_hasher` 只是准备几张查找表，
     // 相对一次解码可以忽略，换来这个函数没有任何共享状态、可以随便并行。
-    let cfg = HasherConfig::with_bytes_type::<[u8; 8]>().hash_size(8, 8).hash_alg(alg);
+    let cfg = HasherConfig::with_bytes_type::<[u8; BYTES]>().hash_size(size, size).hash_alg(alg);
     let cfg = if dct { cfg.preproc_dct() } else { cfg };
     let bytes = cfg.to_hasher().hash_image(img);
-    Fingerprint(u64::from_le_bytes(*bytes.as_bytes().first_chunk::<8>().expect("8 字节指纹")))
+    Fingerprint(*bytes.as_bytes().first_chunk::<BYTES>().expect("32 字节指纹"))
 }
 
 /// 把带指纹的候选分成「看起来一样」的组。
@@ -224,12 +269,12 @@ pub fn is_hashable(path: &Path) -> bool {
 
 /// 指纹缓存的算法标签，写进 `hash_cache.algo`。
 ///
-/// **改了 [`ALG`]、`DCT` 或 [`THUMB_PX`] 就必须改它。** 否则库里用旧算法算出的
+/// **改了 [`ALG`]、`DCT`、[`HASH_SIZE`] 或 [`THUMB_PX`] 就必须改它。** 否则库里用旧算法算出的
 /// 指纹会被当成新算法的结果直接复用，而两套算法的指纹之间求汉明距离毫无意义
 /// ——分组会**静默地**全错，没有任何一处会报错。
 ///
 /// `fingerprint_is_stable` 那条用例就是这道闸：指纹一变它就红，逼你到这里来。
-pub const FINGERPRINT_ALGO: &str = "ahash8-128px-v1";
+pub const FINGERPRINT_ALGO: &str = "ahash16-128px-v2";
 
 /// 一批路径 → 一批指纹，算不出来的丢掉。缓存命中的不再解码。
 pub fn fingerprints(
@@ -308,8 +353,12 @@ mod tests {
         Tmp(dir)
     }
 
+    /// 拿低 64 位造一份指纹，高位补 0。分组逻辑只看汉明距离，用得着的位数越少
+    /// 用例越好读——所以这些用例在指纹从 64 位加宽到 256 位时一个字都没改。
     fn fp(bits: u64) -> Fingerprint {
-        Fingerprint(bits)
+        let mut out = [0u8; BYTES];
+        out[..8].copy_from_slice(&bits.to_le_bytes());
+        Fingerprint(out)
     }
 
     #[test]
@@ -317,15 +366,20 @@ mod tests {
         assert_eq!(fp(0).distance(fp(0)), 0);
         assert_eq!(fp(0).distance(fp(0b1011)), 3);
         assert_eq!(fp(u64::MAX).distance(fp(0)), 64);
+        assert_eq!(Fingerprint([0xff; BYTES]).distance(Fingerprint([0; BYTES])), 256);
     }
 
     #[test]
     fn hex_round_trips() {
         // 指纹要落库，跨次运行比对全靠这一步不丢信息。
         let f = fp(0x0123_4567_89ab_cdef);
-        assert_eq!(f.to_hex(), "0123456789abcdef");
+        assert_eq!(f.to_hex(), "efcdab8967452301".to_owned() + &"00".repeat(24));
+        assert_eq!(f.to_hex().len(), BYTES * 2);
         assert_eq!(Fingerprint::from_hex(&f.to_hex()), Some(f));
         assert_eq!(Fingerprint::from_hex("不是十六进制"), None);
+        // 长度不对的一律拒掉：旧算法留在库里的 16 字符指纹要是被当成新指纹补零
+        // 收下，它和新指纹之间的汉明距离毫无意义，分组会静默出错。
+        assert_eq!(Fingerprint::from_hex("0123456789abcdef"), None, "旧的 64 位指纹不能被收下");
     }
 
     #[test]
@@ -405,8 +459,9 @@ mod tests {
     ///
     /// 两张撑不起「假配对」那一侧，所以把这两张各切成 3×3 九宫格：每一块都是
     /// 一幅独立的画面，而且保留了真实照片的频谱特性——这一点合成图案给不了。
-    /// 同一张照片切出来的九块还共享全局色调，比随便两张照片更难区分，
-    /// 也就是说这个语料对阈值的估计是**偏保守**的一侧。
+    /// 同一张照片切出来的九块还共享全局色调，比随便两张照片更难区分——基准 16
+    /// 据此以为这个语料对阈值的估计是「偏保守的一侧」。**基准 23 证明这句话是错的**，
+    /// 而且两个方向都错，见 [`write_corpus`]：所以有真实语料时一块都不掺。
     const SOURCES: &[&str] = &["image/iphone.jpg", "image/android.jpg"];
 
     /// 测解码成本用的一组文件。这里要的是**格式与体积的多样性**（内容重不重复
@@ -422,6 +477,8 @@ mod tests {
     ];
 
     /// 造底图：整张 + 九宫格里内容足够丰富的那些块。
+    ///
+    /// **基准 23 起这只是没有 `ZZ_DEDUP_CORPUS` 时的兜底**，理由见 [`write_corpus`]。
     fn write_bases(dir: &Path) -> Vec<(String, PathBuf)> {
         let mut out = Vec::new();
         for rel in SOURCES {
@@ -449,16 +506,63 @@ mod tests {
         out
     }
 
-    /// 造标定语料：每张底图 + 它的 6 个变体。返回 `(组号, 标签, 路径)`，
-    /// 组号相同 = 同一张图的不同版本 = 真配对。
+    /// 造多少组变体。每组要往磁盘上落 6 个文件，多了只是让基准变慢——
+    /// 真配对那一侧的读数在十来组上就已经稳了（各类变体的最大值差不到 2 位）。
+    const VARIANT_BASES: usize = 12;
+
+    /// 底图落盘前的长边上限。
+    ///
+    /// 真实语料是相机直出（一张 2.7 MB、12 MP），照原样造 6 个 PNG 变体要好几个 G。
+    /// 而生产只解到 [`THUMB_PX`]＝128 px 才取指纹，1600 还有 12 倍余量，重采样和
+    /// JPEG 噪声该留的都留着。
+    const BASE_MAX_PX: u32 = 1600;
+
+    /// 造标定语料：每组一张「原图」+（前 [`VARIANT_BASES`] 组）它的 6 个变体。
+    /// 返回 `(组号, 标签, 路径)`——组号相同 = 同一张图的不同版本 = 真配对，
+    /// 组号不同 = 假配对。
+    ///
+    /// 有 `ZZ_DEDUP_CORPUS` 时**全用真实照片，一块合成小块都不掺**。基准 16 拿
+    /// 3×3 小块当「两张不同的图」，实测下来它两个方向都偏：64 位时真实照片能近到
+    /// 10 位、比小块之间的 15 位更近（这次误配就是从这个缺口溜过去的）；256 位时
+    /// 小块和真实照片之间又能近到 50 位、比真实照片两两的 62 位更近。所以结论
+    /// 不是「小块偏保守」也不是「偏乐观」，而是**它根本不代表真实照片**。
+    ///
+    /// 顺带还躲开一个坑：`fixtures/image/iphone.jpg` 和语料里的 `IMG_7592.JPG`
+    /// 字节完全相同（素材本来就是从那个目录里挑的），两边混用会凭空多出一对
+    /// 距离 0 的「假配对」，把假配对最小值直接压到 0。
     fn write_corpus(dir: &Path) -> Vec<(usize, String, PathBuf)> {
+        let real = real_corpus();
         let mut out = Vec::new();
-        for (g, (tag, src)) in write_bases(dir).into_iter().enumerate() {
-            for (label, path) in write_variants(dir, &tag, &src) {
-                out.push((g, label, path));
+        if real.is_empty() {
+            println!("⚠ 没设 ZZ_DEDUP_CORPUS，只能退回合成小块语料——那一侧不代表真实照片，读数别当结论");
+            for (g, (tag, src)) in write_bases(dir).into_iter().enumerate() {
+                for (label, path) in write_variants(dir, &tag, &src) {
+                    out.push((g, label, path));
+                }
+            }
+            return out;
+        }
+        for (g, (tag, src)) in real.iter().enumerate() {
+            if g < VARIANT_BASES {
+                let base = shrink(dir, tag, src);
+                for (label, path) in write_variants(dir, tag, &base) {
+                    out.push((g, label, path));
+                }
+            } else {
+                // 其余的只当「另一张图」用，不造变体：假配对那一侧要的只是张数。
+                out.push((g, format!("{tag}/原图"), src.clone()));
             }
         }
         out
+    }
+
+    /// 把底图缩到 [`BASE_MAX_PX`] 以内落成 PNG，当这一组的「原图」。
+    ///
+    /// 走的是生产解码路径而不是 `image::open`——语料里有 HEIC，`image` crate 读不了。
+    fn shrink(dir: &Path, tag: &str, src: &Path) -> PathBuf {
+        let p = dir.join(format!("{tag}-原图.png"));
+        load_at(src, BASE_MAX_PX).save(&p).unwrap();
+        p
     }
 
     /// 按指定缩略长边解码。走的是生产那条 ImageIO 路径。
@@ -490,24 +594,69 @@ mod tests {
         best
     }
 
-    /// `(真配对数, 假配对数, 真·最大距离, 假·最小距离)`。
-    /// 后两个不重叠，就存在一个能把两类完全分开的阈值。
-    fn separation(hs: &[(usize, Fingerprint)]) -> (usize, usize, u32, u32) {
+    /// 一份带标注的指纹。`group` 相同 = 同一张图的不同版本 = 真配对。
+    #[derive(Clone, Copy)]
+    struct Item {
+        group: usize,
+        /// 是不是「裁掉 5% 边」那一类。它单独统计，理由见 [`Sep::plain_max`]。
+        cropped: bool,
+        fp: Fingerprint,
+    }
+
+    /// 真假两类各自的边界。
+    #[derive(Clone, Copy)]
+    struct Sep {
+        tp: usize,
+        fp: usize,
+        /// 真配对里**不涉及裁边**的那部分的最大距离。
+        ///
+        /// 拆出来是基准 23 的核心结论：除裁边外所有变体都只差 0~2 位，而裁边一类
+        /// 要差到几十位——把两者混进一个「真配对最大值」里，阈值就被裁边单独顶上去，
+        /// 顺带把一堆不相干的照片一起带进来（那正是 ADR-031 要修的毛病）。
+        plain_max: u32,
+        /// 真配对里涉及裁边的那部分的最大距离。
+        crop_max: u32,
+        /// 假配对的最小距离。它是天花板：阈值必须低于它。
+        false_min: u32,
+        /// 假配对距离的均值与标准差。用来看阈值离噪声中心有几个 σ
+        /// ——语料只有几千对，光看最小值会低估大图库上的尾巴。
+        false_mean: f64,
+        false_sd: f64,
+    }
+
+    fn separation(hs: &[Item], bits: u32) -> Sep {
         let (mut tp, mut fp) = (0usize, 0usize);
-        let (mut true_max, mut false_min) = (0u32, 64u32);
-        for (i, (ga, ha)) in hs.iter().enumerate() {
-            for (gb, hb) in hs.iter().skip(i + 1) {
-                let d = ha.distance(*hb);
-                if ga == gb {
+        let (mut plain_max, mut crop_max, mut false_min) = (0u32, 0u32, bits);
+        let (mut sum, mut sq) = (0f64, 0f64);
+        for (i, a) in hs.iter().enumerate() {
+            for b in hs.iter().skip(i + 1) {
+                let d = a.fp.distance(b.fp);
+                if a.group == b.group {
                     tp += 1;
-                    true_max = true_max.max(d);
+                    if a.cropped || b.cropped {
+                        crop_max = crop_max.max(d);
+                    } else {
+                        plain_max = plain_max.max(d);
+                    }
                 } else {
                     fp += 1;
                     false_min = false_min.min(d);
+                    sum += d as f64;
+                    sq += (d as f64).powi(2);
                 }
             }
         }
-        (tp, fp, true_max, false_min)
+        let n = fp.max(1) as f64;
+        let mean = sum / n;
+        Sep {
+            tp,
+            fp,
+            plain_max,
+            crop_max,
+            false_min,
+            false_mean: mean,
+            false_sd: (sq / n - mean * mean).max(0.0).sqrt(),
+        }
     }
 
     /// 一块图像的灰度标准差，用来判断它有没有内容。
@@ -538,9 +687,39 @@ mod tests {
     /// 免得改了生产常量却忘了改这里，让护栏断言去守一个没人用的配置。
     const PICKED: &str = "aHash(Mean)";
 
+    /// 待评的哈希宽度。8 是加宽之前的生产值，留着当对照（基准 23 §1）。
+    const SIZES: &[u32] = &[8, HASH_SIZE];
+
+    /// 裁边那一类变体的标签。它在统计里单独一档。
+    const CROP: &str = "裁掉5%边";
+
     /// 一份指纹里有多少个 1。全 0 或全 1 说明取阈的基准选错了，整个哈希是废的。
     fn ones(f: Fingerprint) -> u32 {
-        f.0.count_ones()
+        f.0.iter().map(|b| b.count_ones()).sum()
+    }
+
+    /// 真实照片语料的目录，比如 `ZZ_DEDUP_CORPUS=~/Desktop/每日记忆`。
+    ///
+    /// 这一项是基准 23 相对基准 16 最要紧的改动。基准 16 的「假配对」是同一张照片
+    /// 切出来的 3×3 小块，注释里说这「对阈值的估计是偏保守的一侧」——**实测正好相反**：
+    /// 真实照片之间能近到 10 位（64 位指纹下），比那份合成语料的 15 位还近。
+    /// 合成语料是偏乐观的，误配就是从这个缺口溜过护栏的。
+    ///
+    /// 目录里的图两两都当假配对，所以它必须是「彼此互不相同的照片」。
+    fn real_corpus() -> Vec<(String, PathBuf)> {
+        let Ok(dir) = std::env::var("ZZ_DEDUP_CORPUS") else { return Vec::new() };
+        let Ok(entries) = fs::read_dir(&dir) else {
+            println!("⚠ ZZ_DEDUP_CORPUS={dir} 读不开，这一轮只有合成语料");
+            return Vec::new();
+        };
+        let mut out: Vec<_> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && is_hashable(p))
+            .map(|p| (p.file_stem().unwrap_or_default().to_string_lossy().into_owned(), p))
+            .collect();
+        out.sort();
+        out
     }
 
     /// 造一份变体，落到磁盘上，好让整条链路和生产完全一致（含 ImageIO 缩略解码）。
@@ -576,7 +755,11 @@ mod tests {
         // 阈值实际上完全由它顶出来。留着，因为它是真会发生的：转发时裁水印、
         // 摆正地平线、按打印比例裁一刀，出来的都还是同一张照片。
         // 把它剔掉能让分离度好看得多，但那是把尺子改短，不是把东西量准。
-        put("裁掉5%边", img.crop_imm(w / 20, h / 20, w * 9 / 10, h * 9 / 10), None);
+        //
+        // 基准 23 起它**单独统计**（[`CROP`]），不再混进一个汇总的「真配对最大值」：
+        // 要不要它是一个产品选择，不该由一个统计量替用户做主。默认阈值只覆盖其余五类，
+        // 它留给滑杆。
+        put(CROP, img.crop_imm(w / 20, h / 20, w * 9 / 10, h * 9 / 10), None);
         put("提亮20", img.brighten(20), None);
         out
     }
@@ -585,58 +768,79 @@ mod tests {
     #[ignore = "基准，跑 `cargo test --release -- --ignored bench_`"]
     fn bench_perceptual_calibration() {
         let dir = tmp("calib");
-        let items: Vec<(usize, String, image::DynamicImage)> = write_corpus(&dir.0)
+        let corpus = write_corpus(&dir.0);
+        let n_groups = corpus.last().unwrap().0 + 1;
+        let items: Vec<(usize, String, image::DynamicImage)> = corpus
             .into_iter()
             .map(|(g, label, path)| (g, label, load(&path).expect("生产解码路径要能读它")))
             .collect();
-        let n_bases = items.last().unwrap().0 + 1;
-        println!("\n基准 16 §1 · 感知哈希选型：{n_bases} 张底图 × 7 个版本 = {} 张", items.len());
+        println!("\n基准 23 §1 · 感知哈希选型：{n_groups} 组互不相同的图，共 {} 张", items.len());
 
-        println!(
-            "\n{:<18} {:>8} {:>8} {:>10} {:>10} {:>8} {:>22}",
-            "算法", "真配对", "假配对", "真·最大", "假·最小", "均1位数", "判决"
-        );
         let mut summary = Vec::new();
-        for (name, alg, dct) in ALGS {
-            let hs: Vec<_> = items.iter().map(|(g, _, i)| (*g, hash_with(i, *alg, *dct))).collect();
-            let bits = hs.iter().map(|(_, h)| ones(*h)).sum::<u32>() as f64 / hs.len() as f64;
-            let (tp, fp, true_max, false_min) = separation(&hs);
-            // 有效阈值区间：真配对全进（≥ true_max）且假配对全不进（< false_min）。
-            let verdict = if true_max < false_min {
-                format!("阈值 {}..={} 可用", true_max, false_min - 1)
-            } else {
-                "两类重叠，无干净阈值".into()
-            };
-            println!("{name:<18} {tp:>8} {fp:>8} {true_max:>10} {false_min:>10} {bits:>8.1} {verdict:>22}");
-            summary.push((*name, true_max, false_min));
+        for &size in SIZES {
+            let bits = size * size;
+            println!("\n哈希宽度 {size}×{size} = {bits} 位{}", if size == HASH_SIZE { "（生产）" } else { "" });
+            println!(
+                "{:<18} {:>8} {:>8} {:>10} {:>8} {:>8} {:>14} {:>8} {:>24}",
+                "算法", "真配对", "假配对", "真·非裁边", "真·裁边", "假·最小", "假·均值±σ", "均1位数", "判决"
+            );
+            for (name, alg, dct) in ALGS {
+                let hs: Vec<Item> = items
+                    .iter()
+                    .map(|(g, l, i)| Item {
+                        group: *g,
+                        cropped: l.ends_with(CROP),
+                        fp: hash_sized(i, *alg, *dct, size),
+                    })
+                    .collect();
+                let avg1 = hs.iter().map(|h| ones(h.fp)).sum::<u32>() as f64 / hs.len() as f64;
+                let s = separation(&hs, bits);
+                // 有效阈值区间：非裁边的真配对全进（≥ plain_max）且假配对全不进（< false_min）。
+                // 裁边那一类单列，因为要不要它是产品选择，不是统计结论。
+                let verdict = if s.plain_max >= s.false_min {
+                    "两类重叠，无干净阈值".to_owned()
+                } else if s.crop_max < s.false_min {
+                    format!("阈值 {}..={} 可用（含裁边）", s.plain_max, s.false_min - 1)
+                } else {
+                    format!("阈值 {}..={} 可用（不含裁边）", s.plain_max, s.false_min - 1)
+                };
+                println!(
+                    "{name:<18} {:>8} {:>8} {:>10} {:>8} {:>8} {:>14} {avg1:>8.1} {verdict:>24}",
+                    s.tp,
+                    s.fp,
+                    s.plain_max,
+                    s.crop_max,
+                    s.false_min,
+                    format!("{:.1}±{:.1}", s.false_mean, s.false_sd),
+                );
+                summary.push((*name, size, s));
+            }
         }
 
-        let (best, tmax, fmin) = summary.iter().max_by_key(|(_, t, f)| f.saturating_sub(*t)).unwrap();
-        println!("\n分离度最大：{best}（真最大 {tmax} / 假最小 {fmin}）");
-
         // 底图两两距离：底图要是本来就撞了，上面的「假配对」就是脏的。
-        println!("\n选定算法下的底图两两距离：");
+        // 这里也是那对误配的现场——`IMG_7036 ↔ IMG_7039` 在 64 位下只差 10。
+        println!("\n选定算法（{HASH_SIZE}×{HASH_SIZE}）下的底图两两距离，只列 ≤{MAX_DISTANCE} 的：");
         let bases: Vec<_> = items
             .iter()
             .filter(|(_, l, _)| l.ends_with("/原图"))
             .map(|(_, l, i)| (l, of_image(i)))
             .collect();
-        let mut worst = 64;
+        let mut worst = (BYTES * 8) as u32;
         for (i, (la, ha)) in bases.iter().enumerate() {
             for (lb, hb) in bases.iter().skip(i + 1) {
                 let d = ha.distance(*hb);
                 worst = worst.min(d);
-                if d <= DEFAULT_MAX_DISTANCE {
+                if d <= MAX_DISTANCE {
                     println!("  ⚠ {la} ↔ {lb} = {d}");
                 }
             }
         }
-        println!("  最近的一对相距 {worst} 位");
+        println!("  {} 张互不相同的图，最近的一对相距 {worst} 位", bases.len());
 
         // 逐种变体看谁最难——阈值最终是被最难的那一类顶上去的。
         println!("\n选定算法下各类变体到原图的距离：");
         let mut per_kind: std::collections::BTreeMap<&str, Vec<u32>> = Default::default();
-        for g in 0..bases.len() {
+        for g in 0..n_groups {
             let grp: Vec<_> = items.iter().filter(|(gg, _, _)| *gg == g).collect();
             let (_, _, orig) = grp.iter().find(|(_, l, _)| l.ends_with("/原图")).unwrap();
             let oh = of_image(orig);
@@ -649,7 +853,7 @@ mod tests {
         }
         for (kind, mut ds) in per_kind {
             ds.sort_unstable();
-            println!("  {kind:<14} 中位 {:>2}  最大 {:>2}  {ds:?}", ds[ds.len() / 2], ds.last().unwrap());
+            println!("  {kind:<14} 中位 {:>3}  最大 {:>3}", ds[ds.len() / 2], ds.last().unwrap());
         }
 
         // 这几条是基准的结论，也是回归护栏：换 crate 版本后分不开就该红灯。
@@ -658,15 +862,29 @@ mod tests {
             std::mem::discriminant(palg) == std::mem::discriminant(&ALG) && *pdct == DCT,
             "PICKED（{PICKED}）和生产常量 ALG/DCT 不是同一份配置，基准守错了对象"
         );
-        let (pt, pf) = summary
+        let s = summary
             .iter()
-            .find(|(n, _, _)| *n == PICKED)
-            .map(|(_, t, f)| (*t, *f))
-            .unwrap();
-        assert!(pt < pf, "选定算法必须能把真假配对分开：真最大 {pt} ≥ 假最小 {pf}");
+            .find(|(n, size, _)| *n == PICKED && *size == HASH_SIZE)
+            .map(|(_, _, s)| *s)
+            .expect("PICKED 得在 ALGS 里、HASH_SIZE 得在 SIZES 里");
+
+        // 一、该抓的没漏：缩放/重编码/提亮这些「同一张图的另一个版本」全在默认阈值之内。
         assert!(
-            (pt..pf).contains(&DEFAULT_MAX_DISTANCE),
-            "默认阈值 {DEFAULT_MAX_DISTANCE} 掉出了实测区间 {pt}..{pf}，该改常量了"
+            s.plain_max < DEFAULT_MAX_DISTANCE,
+            "非裁边真配对最大 {} 已经够到默认阈值 {DEFAULT_MAX_DISTANCE}，余量没了",
+            s.plain_max
+        );
+        // 二、滑杆推到头也不进噪声区。这条正是 ADR-031 修的那个洞：
+        //     64 位下 MAX_DISTANCE=16 > 实测假配对最小 10，于是不相干的照片成了组。
+        assert!(
+            MAX_DISTANCE < s.false_min,
+            "滑杆上限 {MAX_DISTANCE} 已经越过实测假配对最小值 {}，推到头就会把不相干的照片凑成一组",
+            s.false_min
+        );
+        // 三、默认值得在滑杆上够得着，否则界面一打开就和后端对不上。
+        assert!(
+            (MIN_DISTANCE..=MAX_DISTANCE).contains(&DEFAULT_MAX_DISTANCE),
+            "默认阈值 {DEFAULT_MAX_DISTANCE} 掉出了滑杆范围 {MIN_DISTANCE}..={MAX_DISTANCE}"
         );
     }
 
@@ -721,7 +939,10 @@ mod tests {
         // 缩略长边取多大才够？标准是**判别力不掉**——真假两类还能分开，
         // 且默认阈值仍落在可用区间里。拿 §1 那份带标注的语料来量，
         // 而不是拿 DECODE_CORPUS（那里面好几个文件其实是同一张图的不同容器）。
-        println!("\n{:<8} {:>10} {:>10} {:>10} {:>22}", "缩略长边", "解码(ms)", "真·最大", "假·最小", "判决");
+        println!(
+            "\n{:<8} {:>10} {:>10} {:>10} {:>28}",
+            "缩略长边", "解码(ms)", "真·非裁边", "假·最小", "判决"
+        );
         let dir = tmp("px");
         let corpus = write_corpus(&dir.0);
         for px in PXS {
@@ -730,16 +951,23 @@ mod tests {
                     std::hint::black_box(load_at(p, px));
                 })
             }) / corpus.len() as f64;
-            let hs: Vec<_> = corpus.iter().map(|(g, _, p)| (*g, of_image(&load_at(p, px)))).collect();
-            let (_, _, tmax, fmin) = separation(&hs);
-            let verdict = if tmax >= fmin {
-                "两类重叠，不够用".into()
-            } else if !(tmax..fmin).contains(&DEFAULT_MAX_DISTANCE) {
-                format!("可分但阈值 {DEFAULT_MAX_DISTANCE} 掉在区间外")
+            let hs: Vec<Item> = corpus
+                .iter()
+                .map(|(g, l, p)| Item {
+                    group: *g,
+                    cropped: l.ends_with(CROP),
+                    fp: of_image(&load_at(p, px)),
+                })
+                .collect();
+            let s = separation(&hs, (BYTES * 8) as u32);
+            let verdict = if s.plain_max >= s.false_min {
+                "两类重叠，不够用".to_owned()
+            } else if !(s.plain_max..s.false_min).contains(&DEFAULT_MAX_DISTANCE) {
+                format!("可分但默认阈值 {DEFAULT_MAX_DISTANCE} 掉在区间外")
             } else {
-                format!("阈值 {tmax}..={} 可用", fmin - 1)
+                format!("阈值 {}..={} 可用", s.plain_max, s.false_min - 1)
             };
-            println!("{px:<8} {cost:>10.2} {tmax:>10} {fmin:>10} {verdict:>22}");
+            println!("{px:<8} {cost:>10.2} {:>10} {:>10} {verdict:>28}", s.plain_max, s.false_min);
         }
 
         // HEIC 的缩略解码比完整解码还慢，怀疑是 `FromImageAlways` 逼着 ImageIO
@@ -784,9 +1012,14 @@ mod tests {
             state ^= state << 17;
             state
         };
+        let mut rand_fp = move || {
+            let mut out = [0u8; BYTES];
+            out.chunks_exact_mut(8).for_each(|c| c.copy_from_slice(&next().to_le_bytes()));
+            Fingerprint(out)
+        };
         for n in [10_000usize, 50_000, 100_000] {
             let items: Vec<_> = (0..n)
-                .map(|i| (stub(&format!("/img/{i:07}.jpg"), 1), Fingerprint(next())))
+                .map(|i| (stub(&format!("/img/{i:07}.jpg"), 1), rand_fp()))
                 .collect();
             let t = Instant::now();
             let g = group(items, DEFAULT_MAX_DISTANCE);
@@ -795,13 +1028,17 @@ mod tests {
         }
 
         // 上面那些「组」全是**噪声**——指纹是随机数，图之间没有任何关系。
-        // 这正好把规模效应量出来：语料只有 20 张底图时假配对最小 15 位，
-        // 看着很安全；十万张图有 5×10⁹ 对，纯靠运气就能凑出成千上万对
-        // 距离 ≤12 的。这是「感知相似一律不预勾选」那条规则的实测依据。
-        let p: f64 = (0..=DEFAULT_MAX_DISTANCE).map(|k| binom(64, k) / 2f64.powi(64)).sum();
-        println!("\n随机指纹在阈值 {DEFAULT_MAX_DISTANCE} 下的碰撞概率 P = {p:.3e}");
+        // 这正好把规模效应量出来。64 位时代这一段是致命的：阈值 12 下随机碰撞
+        // 概率 2.28e-7，十万张就有一千多对纯属巧合的提议（实测 1124 组，对得上
+        // 理论的 1142 对）。加宽到 256 位之后同一个算式的结果小到没有意义
+        // ——**随机碰撞不再是这个功能的瓶颈**，剩下的误配全部来自真实照片之间的
+        // 结构相似（基准 23：实测假配对最小 62 位），那要靠语料量、不能靠算式估。
+        let bits = (BYTES * 8) as u32;
+        let p: f64 =
+            (0..=DEFAULT_MAX_DISTANCE).map(|k| binom(bits, k)).sum::<f64>() / 2f64.powi(bits as i32);
+        println!("\n随机指纹（{bits} 位）在阈值 {DEFAULT_MAX_DISTANCE} 下的碰撞概率 P = {p:.3e}");
         for n in [10_000f64, 100_000., 1_000_000.] {
-            println!("  {n:>9.0} 张 → 期望误配 {:>10.0} 对", p * n * (n - 1.) / 2.);
+            println!("  {n:>9.0} 张 → 期望误配 {:>10.3e} 对", p * n * (n - 1.) / 2.);
         }
     }
 
@@ -820,7 +1057,7 @@ mod tests {
         let f = fingerprint(&crate::testutil::media("image/iphone.jpg")).unwrap();
         assert_eq!(
             f.to_hex(),
-            "430181e1e7e183fb",
+            "c7ff47fe07e8074083fc7ffc7ffc7ffc67f843f803e003e001c003000f30ffff",
             "指纹算法变了。这不一定是错，但**必须同时把 FINGERPRINT_ALGO 改掉**，\
              否则库里旧算法的指纹会被当成新指纹复用，分组会静默全错"
         );
@@ -835,10 +1072,10 @@ mod tests {
         let cache = MemoryCache::default();
         assert!(fingerprints(std::slice::from_ref(&c), &cache).is_empty());
 
-        cache.put(&c.path, c.size, c.mtime, &Fingerprint(0xdead_beef).to_hex());
+        cache.put(&c.path, c.size, c.mtime, &fp(0xdead_beef).to_hex());
         let out = fingerprints(std::slice::from_ref(&c), &cache);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].1, Fingerprint(0xdead_beef));
+        assert_eq!(out[0].1, fp(0xdead_beef));
         assert_eq!(cache.hits(), 1);
     }
 

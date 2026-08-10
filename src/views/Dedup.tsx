@@ -21,7 +21,7 @@ import { Slider } from "@/components/ui/slider";
 import { cn, formatCount } from "@/lib/utils";
 import type { DedupMode } from "@/lib/ipc";
 import { useApp } from "@/store/app";
-import { useDedup } from "@/store/dedup";
+import { THRESHOLD, useDedup } from "@/store/dedup";
 
 import { DedupReview } from "./parts/DedupReview";
 import { Picker } from "./parts/Picker";
@@ -152,15 +152,15 @@ function DedupPicker() {
               <div className="min-w-0 flex-1">
                 <div className="text-[13px]">相似程度</div>
                 <div className="text-xs leading-snug text-muted-foreground">
-                  值越小越严格（只找几乎一样的），越打越松（会带出更多误判）
+                  值越小越严格（只找几乎一样的），越大越松（会带出更多误判）
                 </div>
               </div>
               <Slider
                 className="w-40 shrink-0"
                 value={[threshold]}
-                min={2}
-                max={16}
-                step={1}
+                min={THRESHOLD.min}
+                max={THRESHOLD.max}
+                step={THRESHOLD.step}
                 onValueChange={([v]) => setThreshold(v)}
               />
               <span className="w-8 shrink-0 text-right font-mono text-xs text-muted-foreground">

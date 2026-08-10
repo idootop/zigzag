@@ -15,7 +15,7 @@
  */
 import { useState } from "react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { AlertTriangle, Check, FolderOpen, Layers, Trash2 } from "lucide-react";
+import { AlertTriangle, Check, Columns2, FolderOpen, Layers, Trash2 } from "lucide-react";
 
 import { Compare } from "@/components/Compare";
 import { Thumb } from "@/components/Thumb";
@@ -33,6 +33,7 @@ import { cn, formatBytes, formatCount } from "@/lib/utils";
 import type { Policy, StoredGroup, StoredMember } from "@/lib/ipc";
 import { useDedup } from "@/store/dedup";
 
+import { GroupCompare } from "./GroupCompare";
 import { PathText } from "./PathText";
 
 const POLICIES: { value: Policy; label: string }[] = [
@@ -228,6 +229,7 @@ function Summary() {
 
 /** 一组重复。缩略图排一行，勾选和路径在下面。 */
 function Group({ group }: { group: StoredGroup }) {
+  const [side, setSide] = useState(false);
   const live = group.members.filter((m) => m.disposal === null);
   // 组内的「代表」：距离为 0 的那一个，别的成员都是拿它比出来的。
   // 点开任何一个成员，就是拿它和代表并排比——这是 D-113 要求的人工确认里，
@@ -239,7 +241,12 @@ function Group({ group }: { group: StoredGroup }) {
 
   return (
     <section className="overflow-hidden rounded-lg border border-border bg-card">
-      <div className="flex items-center gap-2 border-b border-border px-3 py-1.5 text-xs text-muted-foreground">
+      {/* 整行就是打开并排对比的按钮。列表里那 40 px 的缩略图只够认出「这是张
+          什么」，认不出「这两张是不是同一张」——而后者才是这一屏要人回答的。 */}
+      <button
+        onClick={() => setSide(true)}
+        className="flex w-full items-center gap-2 border-b border-border px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-secondary focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
+      >
         <Layers className="size-3.5" />
         <span>{group.members.length} 个文件</span>
         {group.reclaimable > 0 && <span>· 可省 {formatBytes(group.reclaimable)}</span>}
@@ -250,7 +257,12 @@ function Group({ group }: { group: StoredGroup }) {
             整组都勾上了，会被跳过
           </span>
         )}
-      </div>
+        <span className="flex items-center gap-1 text-foreground/70">
+          <Columns2 className="size-3.5" />
+          并排对比
+        </span>
+      </button>
+      {side && <GroupCompare group={group} onClose={() => setSide(false)} />}
       <div className="divide-y divide-border">
         {group.members.map((m) => (
           <Member key={m.id} member={m} rep={rep} />
