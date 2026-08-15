@@ -5,7 +5,7 @@
 # ZigZag
 
 把硬盘里的照片和视频批量压小，画面几乎看不出差别。<br/>
-照片能小到原来的 1/7，视频 1/5，拍摄时间、地点和相机信息一并保留。
+照片能小到原来的 1/10，视频 1/5，拍摄时间、地点和相机信息一并保留。
 
 [![最新版本](https://img.shields.io/github/v/release/idootop/zigzag?label=release)](https://github.com/idootop/zigzag/releases/latest)
 ![Platform](https://img.shields.io/badge/platform-macOS%20(Apple%20芯片)-black)
@@ -13,14 +13,14 @@
 [![Rust](https://img.shields.io/badge/Rust-000000?logo=rust)](https://www.rust-lang.org)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-<img src="website/img/compare.jpg" alt="压前压后对比：同一张照片 5.9 MB 压到 466 KB，画面看不出差别" />
+<img src="demo.png" alt="压前压后对比：同一张照片 5.9 MB 压到 466 KB，画面看不出差别" />
 
 </div>
 
-## 它能做什么
+## 简介
 
 硬盘里归档的照片和视频，是最占空间的一类文件——早年设备的格式效率低，
-新相机的原图又动辄几十上百 MB。ZigZag 把它们批量压小，画面看不出差别，照片能小到原来的 1/7，视频 1/5，拍摄时间、地点和相机信息一并保留。
+新相机的原图又动辄几十上百 MB。ZigZag 把它们批量压小，画面看不出差别，照片能小到原来的 1/10，视频 1/5，拍摄时间、地点和相机信息一并保留。
 
 - **先看能省多少** — 开始前先扫一遍，告诉你能腾出多少空间、要花多久，觉得划算再开始
 - **压完当场对比** — 拖动分割线看压前压后，放大看细节也行
@@ -70,6 +70,6 @@ pnpm tauri build     # 打包，产物在 src-tauri/target/release/bundle/
 画质用客观指标验收：照片 SSIMULACRA2 全部 ≥ 79（90 ≈ 视觉无损），视频 VMAF 96.0 ~ 98.8。
 方法、完整数据与可复现脚本见 **[bench/README.md](bench/README.md)**。
 
-## 许可证
+## License
 
-MIT
+MIT License © 2026-PRESENT [Del Wang](https://del.wang)
