@@ -8,19 +8,28 @@ name: Release
 # runner 必须是 arm64：随包的 ffmpeg / ffprobe 只有 `aarch64-apple-darwin` 一份
 # （D-10 单目标），`macos-latest` 现在指向 macos-15-arm64。
 #
-# 故意只挂 tag 触发，不加 workflow_dispatch：从分支手动跑的话 `github.ref_name`
-# 是分支名，tauri-action 会照着建一个叫 `main` 的 release。真要试跑，push 一个
-# tag 再删掉即可（删 tag 和删 release 都是可逆的）。
+# 也可以在 Actions 页面手动跑（Run workflow → 填 tag）：构建中途挂了、或者删了
+# release 想用同一个 tag 重发时，不必再删 tag 重推一遍。
+#
+# 手动跑时不能用 `github.ref_name` —— 从分支触发的话它是分支名（main），
+# tauri-action 会照着建一个叫 `main` 的 release。所以统一收敛到 env.TAG，
+# checkout 也显式切到这个 tag，保证产物来自 tag 那个提交而不是分支最新。
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag，如 v1.0.0（须已存在，且三处版本号与之一致）"
+        required: true
+        type: string
 
 permissions:
   contents: write # tauri-action 要建 release、传附件
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false # 发版跑到一半不能被后来者掐掉
 
 jobs:
@@ -30,8 +39,14 @@ jobs:
     # 默认 6 小时太宽、60 分钟又可能不够，取 120。
     timeout-minutes: 120
 
+    # 两种触发方式的唯一差别收在这一行：tag 触发用 ref_name，手动触发用输入。
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
 
       # 版本号散在三个文件里，漏改一个的表现是「发出去的包版本号不对」，而那时候
       # 已经烧掉半小时编译。所以这一条放在最前面：要红就在头一分钟红。
@@ -39,7 +54,7 @@ jobs:
       - name: 断言 tag 与三处版本号一致
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
+          tag="${TAG#v}"
           conf="$(node -p "require('./src-tauri/tauri.conf.json').version")"
           pkg="$(node -p "require('./package.json').version")"
           crate="$(sed -n '/^\[package\]/,/^\[/p' src-tauri/Cargo.toml \
@@ -92,7 +107,7 @@ jobs:
           {
             echo 'body<<ZZ_EOF'
             sed -e '/^<!--$/,/^-->$/d' \
-                -e "s/{{VERSION}}/${GITHUB_REF_NAME#v}/g" \
+                -e "s/{{VERSION}}/${TAG#v}/g" \
                 .github/release-notes.md
             echo 'ZZ_EOF'
           } >> "$GITHUB_OUTPUT"
@@ -101,8 +116,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: ZigZag ${{ github.ref_name }}
+          # 这里不用 env.TAG：step 的 with 能否读 env context 我没查到确凿依据，
+          # 而这一步跑到时已经烧掉几十分钟编译，不值得赌，直接写表达式。
+          tagName: ${{ inputs.tag || github.ref_name }}
+          releaseName: ZigZag ${{ inputs.tag || github.ref_name }}
           releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: false
           prerelease: false
